@@ -37,6 +37,7 @@ dev = [
   "pandas-stubs",
   "types-requests",
   "types-PyYAML",
+  "playwright>=1.63.0",
 ]
 
 [build-system]
@@ -66,6 +67,7 @@ known-first-party = ["jev_ml", "jev_api"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]
 markers = [
   "e2e: end-to-end tests that run the full API against trained artifacts",
   "slow: tests that train models",
@@ -77,3 +79,4 @@ python_version = "3.12"
 ignore_missing_imports = true
 warn_unused_ignores = true
 files = ["ml/jev_ml", "backend/jev_api"]
+plugins = ["pydantic.mypy"]

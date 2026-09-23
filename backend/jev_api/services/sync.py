@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import insert, select
 from sqlalchemy.orm import Session
 
 from jev_api.config import get_settings
@@ -29,7 +29,7 @@ from jev_ml.paths import PROCESSED_DIR
 from jev_ml.registry import active_version, list_manifests
 
 log = logging.getLogger(__name__)
-_METRIC_KEY = re.compile(r"^(?P<metric>[a-z_]+)@(?P<k>\d+)$")
+_METRIC_KEY = re.compile(r"^(?P<metric>[a-z_][a-z0-9_]*)@(?P<k>\d+)$")
 
 
 def _int_or_none(v: Any) -> int | None:
@@ -53,7 +53,8 @@ def seed_catalog(db: Session, movies_csv: Path | None = None) -> int:
     genres = {name: Genre(name=name) for name in genre_names}
     db.add_all(genres.values())
     db.flush()
-    rows, links = [], []
+    rows: list[dict[str, Any]] = []
+    links: list[dict[str, int]] = []
     for r in df.to_dict("records"):
         directors, cast = split_list(r["directors"]), split_list(r["cast"])
         rows.append(
@@ -78,8 +79,8 @@ def seed_catalog(db: Session, movies_csv: Path | None = None) -> int:
         links.extend(
             {"movie_id": int(r["movie_id"]), "genre_id": genres[g].id} for g in split_list(r["genres"])
         )
-    db.execute(Movie.__table__.insert(), rows)
-    db.execute(MovieGenre.__table__.insert(), links)
+    db.execute(insert(Movie), rows)
+    db.execute(insert(MovieGenre), links)
     db.commit()
     log.info("seeded catalog: %d movies, %d genres", len(rows), len(genres))
     return len(rows)

@@ -178,6 +178,7 @@ def because_you_watched(
         "model_version": engine.version,
         "generated_at": datetime.now(UTC),
         "anchor": MovieBrief.model_validate(anchor) if anchor else None,
+        "anchor_kind": "watched" if recent[0].kind == "watch" else "rated",
     }
 
 
@@ -240,14 +241,15 @@ def history(user: CurrentUser, db: DB, limit: int = Query(50, ge=1, le=200)) -> 
         .order_by(Recommendation.created_at.desc(), Recommendation.rank)
         .limit(limit)
     ).all()
-    fb = dict(
-        db.execute(
+    fb: dict[int | None, str] = {
+        rid: kind
+        for rid, kind in db.execute(
             select(RecommendationFeedback.recommendation_id, RecommendationFeedback.feedback).where(
                 RecommendationFeedback.user_id == user.id,
                 RecommendationFeedback.recommendation_id.in_([r.id for r in rows]),
             )
-        ).all()
-    )
+        )
+    }
     return [
         {
             "id": r.id,

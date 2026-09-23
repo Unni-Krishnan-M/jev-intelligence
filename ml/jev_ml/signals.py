@@ -102,9 +102,9 @@ class UserProfile:
             )
         keys = np.asarray(sorted(merged), dtype=np.int64)
         vals = np.asarray([merged[int(k)] for k in keys], dtype=np.float64)
-        weights, prefs, ts = vals[:, 0], vals[:, 1], vals[:, 2]
-        if recency_half_life_days and ts.max() > 0:
-            age_days = (ts.max() - ts) / 86400.0
+        weights, prefs, stamps = vals[:, 0], vals[:, 1], vals[:, 2]
+        if recency_half_life_days and stamps.max() > 0:
+            age_days = (stamps.max() - stamps) / 86400.0
             decay = np.power(0.5, age_days / recency_half_life_days)
             weights = weights * (0.5 + 0.5 * decay)
             prefs = prefs * (0.5 + 0.5 * decay)
@@ -112,7 +112,7 @@ class UserProfile:
             items=keys,
             weights=weights,
             pref_weights=prefs,
-            timestamps=ts,
+            timestamps=stamps,
             genre_prefs=dict(genre_prefs or {}),
             exclude=np.asarray(sorted(set(exclude)), dtype=np.int64),
             train_user_index=train_user_index,

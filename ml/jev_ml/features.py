@@ -66,7 +66,7 @@ _EXTRA_STOP = {
 }
 STOP_WORDS = frozenset(ENGLISH_STOP_WORDS | _EXTRA_STOP)
 _WORD = re.compile(r"[a-z0-9][a-z0-9'\-]+")
-_WD_GENRE_SUFFIX = re.compile(r"\s+(film|movie|fiction film)$")
+_WD_GENRE_SUFFIX = re.compile(r"\s+(film|movie)$")
 
 # MovieLens genre names -> the same normalized vocabulary as Wikidata genres
 _ML_GENRE_ALIASES = {"sci-fi": "science fiction", "children": "children's", "film-noir": "film noir"}

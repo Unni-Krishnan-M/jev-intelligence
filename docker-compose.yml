@@ -1,0 +1,79 @@
+# JEV full stack.
+#   docker compose up -d --build                    # db, cache, api, web
+#   docker compose --profile train run --rm trainer # download data + train + evaluate (first run)
+# Trained artifacts live in ./models, ./experiments and ./data on the host, so they are reused
+# by the API container and by local (non-Docker) runs alike.
+name: jev
+
+x-api-env: &api-env
+  JEV_ENV: ${JEV_ENV:-development}
+  JEV_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-jev}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-jev}
+  JEV_REDIS_URL: redis://cache:6379/0
+  JEV_JWT_SECRET: ${JEV_JWT_SECRET:?set JEV_JWT_SECRET in .env}
+  JEV_ADMIN_EMAIL: ${JEV_ADMIN_EMAIL:-}
+  JEV_ADMIN_PASSWORD: ${JEV_ADMIN_PASSWORD:-}
+  JEV_CORS_ORIGINS: ${JEV_CORS_ORIGINS:-http://localhost:3000}
+  JEV_COOKIE_SECURE: ${JEV_COOKIE_SECURE:-false}
+  JEV_TRUST_PROXY: "true"
+  JEV_LOG_LEVEL: ${JEV_LOG_LEVEL:-INFO}
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-jev}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-jev}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  cache:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build: { context: ., dockerfile: docker/api.Dockerfile }
+    environment: *api-env
+    volumes:
+      - ./models:/app/models
+      - ./experiments:/app/experiments
+      - ./data:/app/data
+    ports: ["${API_PORT:-8000}:8000"]
+    depends_on:
+      db: { condition: service_healthy }
+      cache: { condition: service_healthy }
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+      args: { JEV_API_URL: http://api:8000 }
+    ports: ["${WEB_PORT:-3000}:3000"]
+    depends_on:
+      api: { condition: service_healthy }
+    restart: unless-stopped
+
+  trainer:
+    profiles: [train]
+    build: { context: ., dockerfile: docker/api.Dockerfile }
+    environment: *api-env
+    volumes:
+      - ./models:/app/models
+      - ./experiments:/app/experiments
+      - ./data:/app/data
+    command: ["sh", "-c", "python scripts/download_data.py && python scripts/preprocess_data.py && python scripts/train_models.py $${TRAIN_ARGS:-}"]
+
+volumes:
+  pgdata:

@@ -68,8 +68,8 @@ class Evaluator:
             users = sorted(rng.choice(users, size=max_users, replace=False).tolist())
         self.users = users
         self.relevant = {
-            int(u): set(item_index.indices_of(g["movie_id"].to_numpy()).tolist())
-            for u, g in rel[rel["user_id"].isin(users)].groupby("user_id")
+            int(g["user_id"].iloc[0]): set(item_index.indices_of(g["movie_id"].to_numpy()).tolist())
+            for _, g in rel[rel["user_id"].isin(users)].groupby("user_id")
         }
         positions = {int(u): i for i, u in enumerate(train_user_ids)}
         src = train[train["user_id"].isin(users)]

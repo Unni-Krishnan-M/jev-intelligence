@@ -35,7 +35,7 @@ class ValidationReport:
     warnings: list[str] = field(default_factory=list)
     stats: dict[str, Any] = field(default_factory=dict)
 
-    def check(self, cond: bool, msg: str, fatal: bool = True) -> None:
+    def check(self, cond: object, msg: str, fatal: bool = True) -> None:
         if not cond:
             (self.errors if fatal else self.warnings).append(msg)
 
@@ -110,7 +110,8 @@ def preprocess(
     movies = pd.read_csv(raw_dir / "movies.csv")
     ratings = pd.read_csv(raw_dir / "ratings.csv")
     tags = pd.read_csv(raw_dir / "tags.csv")
-    links = pd.read_csv(raw_dir / "links.csv", dtype={"imdbId": str, "tmdbId": "Int64"})
+    link_dtypes: dict[str, Any] = {"imdbId": str, "tmdbId": "Int64"}
+    links = pd.read_csv(raw_dir / "links.csv", dtype=link_dtypes)
 
     report = validate_raw(movies, ratings, tags, links)
     for w in report.warnings:

@@ -35,6 +35,41 @@ def _headline(exp: Experiment) -> dict[str, float]:
     }
 
 
+@router.get("/models/active/summary")
+def active_summary(db: DB, request: Request) -> dict[str, Any]:
+    """Public, non-sensitive facts about the serving model (used by the landing page)."""
+    engine = request.app.state.engines.engine
+    if engine is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "no model loaded")
+    m = engine.manifest
+    exp = db.scalar(
+        select(Experiment)
+        .join(ModelVersion, Experiment.model_version_id == ModelVersion.id)
+        .where(ModelVersion.version == engine.version)
+    )
+    comparison: dict[str, dict[str, float]] = {}
+    n_users = None
+    if exp is not None:
+        for mt in exp.metrics:
+            if (
+                mt.protocol == "test"
+                and mt.k == 10
+                and mt.metric in ("ndcg", "recall", "precision", "hit_rate")
+            ):
+                comparison.setdefault(mt.model_name, {})[f"{mt.metric}@10"] = mt.value
+        n_users = (exp.summary.get("n_eval_users") or {}).get("test")
+    return {
+        "model_version": engine.version,
+        "dataset_version": m.get("dataset_version"),
+        "n_items": len(engine.movies),
+        "trained_on_rows": m.get("trained_on_rows"),
+        "trained_at": m.get("created_at"),
+        "split": m.get("split", {}).get("strategy"),
+        "eval_users": n_users,
+        "comparison": comparison,
+    }
+
+
 @router.get("/models", response_model=list[ModelVersionOut])
 def list_models(_: AdminUser, db: DB) -> list[ModelVersion]:
     sync_model_versions(db)
@@ -120,11 +155,12 @@ def stats(_: AdminUser, db: DB) -> dict[str, Any]:
     per_day = db.execute(
         select(day, func.count()).where(Recommendation.created_at >= since).group_by(day).order_by(day)
     ).all()
-    feedback = dict(
-        db.execute(
+    feedback: dict[str, int] = {
+        kind: n
+        for kind, n in db.execute(
             select(RecommendationFeedback.feedback, func.count()).group_by(RecommendationFeedback.feedback)
-        ).all()
-    )
+        )
+    }
     reasons = db.execute(
         select(Recommendation.reason_code, func.count())
         .group_by(Recommendation.reason_code)

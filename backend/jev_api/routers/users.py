@@ -115,7 +115,9 @@ def my_history(
         .order_by(WatchHistory.watched_at.desc(), WatchHistory.id.desc())
     )
     rows, total = _page(q, db, page, page_size)
-    ratings = dict(db.execute(select(Rating.movie_id, Rating.rating).where(Rating.user_id == user.id)).all())
+    ratings: dict[int, float] = {
+        m: r for m, r in db.execute(select(Rating.movie_id, Rating.rating).where(Rating.user_id == user.id))
+    }
     return {
         "items": [
             {

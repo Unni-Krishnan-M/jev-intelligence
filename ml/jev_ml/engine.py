@@ -228,10 +228,10 @@ class RecommendationEngine:
         """Top Bayesian-average rating among movies with at least `min_votes` ratings."""
         score = np.where(self.popularity.user_counts >= min_votes, self.popularity.bayes_rating, -np.inf)
         order = np.lexsort((np.arange(len(score)), -score))
-        order = [i for i in order if np.isfinite(score[i])][offset : offset + k]
+        picked = [int(i) for i in order if np.isfinite(score[i])][offset : offset + k]
         return [
             {"movie_id": int(self._ids[i]), "title": str(self._titles[i]), "score": round(float(score[i]), 4)}
-            for i in order
+            for i in picked
         ]
 
     def health(self) -> dict[str, Any]:

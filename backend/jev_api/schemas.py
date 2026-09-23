@@ -185,6 +185,7 @@ class SimpleRecResponse(BaseModel):
     model_version: str
     generated_at: datetime
     anchor: MovieBrief | None = None
+    anchor_kind: Literal["watched", "rated"] | None = None
 
 
 class FeedbackRequest(BaseModel):
