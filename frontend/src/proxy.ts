@@ -4,7 +4,7 @@ import { NextResponse, type NextRequest } from "next/server";
  * Optimistic route guard: only checks that a session cookie exists. The API still verifies the
  * JWT on every request, and client pages handle a 401 by sending the user to /login.
  */
-const PROTECTED = ["/home", "/onboarding", "/recommendations", "/profile", "/history", "/favorites", "/admin"];
+const PROTECTED = ["/home", "/onboarding", "/recommendations", "/profile", "/history", "/favorites", "/admin", "/intel"];
 const AUTH_PAGES = ["/login", "/register"];
 const COOKIE = "jev_session";
 
@@ -23,5 +23,5 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/home", "/onboarding", "/recommendations", "/profile", "/history", "/favorites", "/admin/:path*", "/login", "/register"],
+  matcher: ["/home", "/onboarding", "/recommendations", "/profile", "/history", "/favorites", "/admin/:path*", "/intel", "/intel/:path*", "/login", "/register"],
 };

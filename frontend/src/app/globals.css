@@ -43,6 +43,10 @@
   --color-sig-popularity: var(--sig-popularity);
   --color-sig-preference: var(--sig-preference);
   --color-sig-recency: var(--sig-recency);
+  --color-status-good: var(--status-good);
+  --color-status-warning: var(--status-warning);
+  --color-status-serious: var(--status-serious);
+  --color-status-critical: var(--status-critical);
   --radius-sm: calc(var(--radius) * 0.6);
   --radius-md: calc(var(--radius) * 0.8);
   --radius-lg: var(--radius);
@@ -79,6 +83,11 @@
   --sig-popularity: #eda100;
   --sig-preference: #e87ba4;
   --sig-recency: #008300;
+  /* status palette: reserved for state, mode-invariant, always shipped with an icon + label */
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
   --grain-opacity: 0.05;
 }
 

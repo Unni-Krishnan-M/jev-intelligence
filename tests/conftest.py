@@ -22,6 +22,7 @@ os.environ["JEV_ADMIN_PASSWORD"] = "admin-pass-123"
 os.environ["JEV_RATE_LIMIT_PER_MINUTE"] = "100000"
 os.environ["JEV_AUTH_RATE_LIMIT_PER_MINUTE"] = "100000"
 os.environ.pop("JEV_REDIS_URL", None)
+os.environ["JEV_INTEL_RUN_ON_STARTUP"] = "false"  # intel tests trigger runs explicitly
 
 import json  # noqa: E402
 

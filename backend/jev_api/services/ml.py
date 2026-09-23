@@ -6,6 +6,7 @@ import logging
 import threading
 from pathlib import Path
 
+from jev_api.metrics import metrics
 from jev_ml.engine import RecommendationEngine
 from jev_ml.registry import active_version, set_active
 
@@ -29,6 +30,7 @@ class EngineHolder:
             engine = RecommendationEngine(self.models_dir / version)
         except (OSError, ValueError, KeyError) as exc:
             self.last_error = f"failed to load model {version}: {exc}"
+            metrics.inc("model", "load_errors")
             log.exception("model load failed")
             return None
         with self._lock:

@@ -35,3 +35,49 @@ _Last updated: 2026-09-23_
 ## Next
 - Re-run the browser journey against Docker; refresh screenshots with the final model.
 - Roadmap items (cold-stage weights / learning-to-rank) — see [roadmap.md](roadmap.md).
+
+---
+
+# Upgrade: Intelligence & early-warning layer (started 2026-09-23)
+
+Spec: upgrade JEV into an intelligent decision & early-warning engine without discarding the recommender.
+Design contract: [intelligence.md](intelligence.md).
+
+## Audit (before any change)
+- Baseline green: 57 pytest tests pass, ruff and mypy clean.
+- Complete: data ingestion + validation (MovieLens + Wikidata), 5 recommenders + hybrid, evaluation framework,
+  model registry, FastAPI (auth, CSRF, rate limits, request ids, structured logs), recommendation feedback,
+  admin model/experiment dashboards, Docker Compose, docs.
+- Missing relative to the spec: signals, trends/change points, anomaly detection, forecasting, risk scoring,
+  typed decision layer, early warnings with lifecycle, scenarios, action planner, operator feedback,
+  intelligence evaluation, metrics endpoint, operator console.
+- Interpretation: "JEV" in the spec is the decision layer. Here it is implemented as typed, versioned decision
+  policies over computed evidence (no external LLM, no API key; runs offline on any laptop).
+
+## Status
+- [x] ML intelligence core (`ml/jev_ml/intel`) + evaluation: 28 tests; ~0.85 s per run; report in experiments/intel-eval-20260923T134257Z
+- [x] Persistence (migration 0002, 6 tables) + `/intel/*` API + `/admin/metrics`: 14 API tests; real-data smoke test clean
+- [x] Intelligence console (frontend): 13 sections + 3 detail routes; tsc, lint, build clean 
+- [x] Integration: real-browser review against real data found 8 UI issues (freshness labels, stage order, confidence kinds,
+  number formats, protocol notes, mobile overflow). All fixed and re-verified: 0 px overflow at 390/1366, both themes
+- [x] CI workflow (`.github/workflows/ci.yml`); clean-copy run: 94 passed, 5 skipped (need real data)
+- [x] README + ARCHITECTURE updated
+- [x] Screenshots 14–21 (console) + refreshed 01–13; final report below
+
+## Upgrade report (2026-09-23)
+| Area | Status | Evidence |
+|---|---|---|
+| Data ingestion, validation, freshness, provenance | DONE | `intel/ingest.py`; 10 weighted checks; per-source SLA |
+| Signals (dedup, strength, evidence) | DONE | `intel/signals.py`; 18 signals on real data |
+| Trends + change points | DONE | Mann–Kendall/Theil–Sen + BH FDR; AR(1)-null change points (7 % false alarms, above nominal) |
+| Anomalies (series + raters + live feedback) | DONE / PARTIAL | live-feedback test only exercised on synthetic app data |
+| Forecasts + lapse prediction | DONE | median MASE 0.93 vs naive 1.15; lapse AUC 0.886, ECE 0.061 |
+| Risk engine | DONE | 8 kinds; some impact weights are declared estimates (labelled) |
+| Decision layer ("JEV") | DONE | 5 typed specs, versioned policies, confidence kinds, abstention |
+| Early warnings + lifecycle | DONE | dedup, suppression, reopen, audit trail; 14 API tests |
+| Scenarios, action planner, feedback | DONE | effort per action type is a declared estimate |
+| API, persistence, metrics | DONE | migration 0002 (SQLite + PostgreSQL 17 verified); `/admin/metrics` |
+| Operator console | DONE | 13 sections + 3 detail pages; real-browser verified |
+| CI | DONE | `.github/workflows/ci.yml` (clean-copy run green) |
+| Auto-resolution of stale warnings | DEFERRED | open warnings are never auto-resolved |
+| Frontend unit tests | MISSING | no JS test runner in the project; covered by tsc/lint/build + browser checks |

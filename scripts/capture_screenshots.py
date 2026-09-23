@@ -99,6 +99,22 @@ def main() -> None:
         page.goto(f"{base}/admin/experiments")
         shot(page, "12-admin-experiments")
 
+        # intelligence console (needs at least one pipeline run; the API starts one on boot)
+        for name, path in (
+            ("14-intel-overview", ""),
+            ("15-intel-trends", "/trends"),
+            ("16-intel-predictions", "/predictions"),
+            ("17-intel-warning", "/warnings/1"),
+            ("18-intel-decision", "/decisions/1"),
+            ("20-intel-evaluation", "/evaluation"),
+        ):
+            page.goto(f"{base}/intel{path}")
+            shot(page, name)
+        page.goto(f"{base}/intel/scenarios")
+        page.get_by_role("button", name="Run scenarios").click()
+        page.wait_for_timeout(1500)
+        shot(page, "19-intel-scenarios")
+
         # small screens: phone and light theme
         m = browser.new_context(
             viewport={"width": 390, "height": 844}, device_scale_factor=2, color_scheme="light"
@@ -108,6 +124,13 @@ def main() -> None:
         mp.evaluate("localStorage.setItem('theme','light')")
         mp.goto(f"{base}/discover")
         shot(mp, "13-mobile-discover-light", full=False)
+        mp.goto(f"{base}/login")
+        mp.fill("#email", args.admin_email)
+        mp.fill("#password", args.admin_password)
+        mp.click("button[type=submit]")
+        mp.wait_for_url("**/home")
+        mp.goto(f"{base}/intel")
+        shot(mp, "21-mobile-intel-light", full=False)
         browser.close()
 
 

@@ -4,6 +4,12 @@
 **collaborative filtering**, **matrix factorization**, **popularity** and **behavioural** signals into one ranked list,
 explains every pick from the model's actual evidence, and measures itself on a held-out test set.
 
+On top of the recommender sits an **intelligence and early-warning layer** for the people who run the platform. It
+turns the changing rating stream, live app activity and the recommender's own evaluation into signals, trends,
+anomalies, forecasts, risk scores, typed decisions, early warnings and an action plan. Every output carries its
+evidence and an honest confidence, and the layer evaluates itself offline. See
+[Intelligence & early warnings](#intelligence--early-warnings).
+
 ![Home](docs/screenshots/04-home.png)
 
 ## Problem statement
@@ -81,10 +87,74 @@ excluded, the same protocol for every model. Numbers from run `jev-hybrid-v1-202
 On the cold-start protocol (3 interactions) popularity still leads (NDCG@10 0.046 vs hybrid 0.035). See
 [docs/evaluation.md](docs/evaluation.md) for the full tables, plots and discussion.
 
+## Intelligence & early warnings
+**Problem.** A recommender that only ranks films cannot tell its operators that part of the audience is about to
+stop rating, that a genre's demand has shifted, that someone is bulk-rating to push a film, or that the model has
+gone stale. The intelligence layer watches the data and the model and reports those things *before* they matter.
+
+```
+INGEST → VALIDATE → UNDERSTAND → DETECT → PREDICT → ASSESS → DECIDE → ACT/EXPLAIN → FEEDBACK
+sources  quality    monthly     trends,   forecasts, risk    typed      warnings,   operator verdicts
+         freshness  series,     change    lapse      scores  decisions  action      → evaluation
+                    signals     points,   model                         plan
+                                anomalies
+```
+- **Leak-free replay.** Every run analyses the data *as of* a timestamp and never looks past it. Replaying as of
+  2017-07-01 raises a high warning for the May-2017 Horror spike. At that date the retrain and serving decisions
+  abstain, because the model was trained on later data.
+- **Detection:**
+  - trends: Mann–Kendall plus a Theil–Sen slope with 95 % CI, and Benjamini–Hochberg control across series;
+  - change points: a mean shift tested against an AR(1) null;
+  - series anomalies: robust (MAD) z-scores against a trailing baseline;
+  - rater anomalies: an IsolationForest over behavioural features.
+- **Prediction:**
+  - Damped Holt, moving-average and naive forecasts, selected per series by rolling-origin MASE, with
+    finite-sample 80 % intervals.
+  - A lapse model, a calibrated logistic regression that estimates P(no rating in 180 days), trained and tested on
+    separate time cut-offs.
+- **Risk:** each risk scores likelihood × impact, shrunk by confidence and data quality, and lists its contributing
+  factors.
+- **Decisions ("JEV").** The decision layer is JEV itself, not an external LLM. Each decision is a fixed question
+  with a fixed answer type (`boolean`, `choice`, `score`) and a versioned policy. Normal code does all arithmetic;
+  the policy only combines evidence. Every decision stores:
+  - the exact state it saw and its rationale;
+  - a confidence labelled `probability` (paired bootstrap or calibrated model), `margin` (not a probability) or
+    `rule`;
+  - an explicit abstention when the data is insufficient.
+- **Early warnings:**
+  - Warnings are raised from risks and anomalies, and each shows its trigger condition (observed vs threshold),
+    evidence and recommended action.
+  - They are deduplicated by key. Their lifecycle runs `new → acknowledged → investigating → resolved | dismissed`,
+    with an audit trail.
+  - A dismissal suppresses the warning unless its severity escalates; a resolved warning that fires again reopens.
+- **What-if and feedback:**
+  - Scenarios bend a series' fitted trend (continue, slow, reverse, shock) and compare the projections against the
+    baseline band.
+  - Operators mark decisions, warnings, actions and forecasts as correct or useful. The system reports decision
+    accuracy and warning precision from those verdicts.
+
+**Offline evaluation** (`uv run python scripts/evaluate_intelligence.py`, run `intel-eval-20260923T134257Z`):
+
+| Component | Protocol | Result | Baseline |
+|---|---|---|---|
+| Forecasts (21 series) | model picked on origins 1–12, scored on 13–24 | median MASE 0.93; beats naive on 21/21; 80 % interval coverage 0.95 | naive MASE 1.15 |
+| Lapse model | temporal holdout, 1,017 train / 493 test rows | AUC 0.886 · Brier 0.115 · ECE 0.061 | recency rule AUC 0.779 · Brier 0.155 |
+| Shilling detection | synthetic, labelled attack profiles injected into real data | AUC 0.95 random · 0.99 average · 0.92 bandwagon | deviation rule F1 0 |
+| Series anomalies | 756 spikes/drops injected into real series | 50 % detected overall (73–76 % at ≥ 5σ); 2 % false-alarm rate | — |
+| Change points | synthetic AR(1) matched to real volume | 32.5 % detected; 7 % false alarms (nominal 1 %) | — |
+
+A full run over the real data takes about 0.85 s on a laptop CPU. Design, contract and method notes:
+[docs/intelligence.md](docs/intelligence.md).
+```bash
+uv run python scripts/run_intelligence.py --as-of 2017-07-01   # one run, printed as JSON
+uv run python scripts/evaluate_intelligence.py                 # offline evaluation → experiments/intel-eval-*/
+```
+
 ## API
 REST under FastAPI with JWT (httpOnly cookie or bearer) and CSRF protection for cookie writes. Main endpoints:
 `/auth/*`, `/users/me*`, `/movies*`, `/recommendations` (+ `/similar/{id}`, `/trending`, `/because-you-watched`,
 `/similar-to-favorites`, `/feedback`, `/history`), `/models*`, `/experiments*`, `/health`, `/health/ml`.
+Operators (admins) also get `/intel/*`: status, runs (with replay `as_of`), signals, trends, anomalies, predictions, series, risks, decisions, warnings (lifecycle), actions, scenarios, feedback and evaluation, plus `/admin/metrics`.
 Reference: [docs/api.md](docs/api.md). OpenAPI UI is at `http://localhost:8000/docs` in development.
 
 ## Frontend
@@ -92,7 +162,7 @@ Next.js 16 App Router. Pages: `/` landing (live metrics), `/login`, `/register`,
 quick ratings), `/home` (six shelves: Recommended for you, Because you watched, Similar to your favourites, Trending,
 Popular, New discoveries), `/discover`, `/movies/[id]`, `/recommendations` (full ranking with "Why this?"
 breakdowns and feedback), `/profile` (taste profile), `/history`, `/favorites`, `/admin`, `/admin/models`,
-`/admin/experiments`.
+`/admin/experiments`, and the Intelligence console under `/intel` (overview, signals, trends, anomalies, predictions, risks, early warnings, decisions, actions, what-if scenarios, feedback, evaluation, system health).
 
 The design is a festival programme printed for a dark screening room. It uses warm near-black and paper tones, a
 single tungsten-amber accent, serif display type, and typeset covers generated from each film's metadata instead of
@@ -113,7 +183,7 @@ See [docs/deployment.md](docs/deployment.md).
 
 ## Testing
 ```bash
-uv run pytest                   # unit + ML + API integration (synthetic data, ~5 s; real-model checks when models/ exists)
+uv run pytest                   # 99 tests: unit, ML, intelligence, API integration (~13 s; real-data checks skip without data)
 uv run ruff check . && uv run ruff format --check . && uv run mypy
 cd frontend && pnpm exec tsc --noEmit && pnpm exec eslint src && pnpm build
 uv run python scripts/capture_screenshots.py     # real-browser user journey (Chrome) → docs/screenshots
@@ -127,6 +197,15 @@ uv run python scripts/capture_screenshots.py     # real-browser user journey (Ch
 | ![Movie](docs/screenshots/07-movie-detail.png) | ![Taste profile](docs/screenshots/08-taste-profile.png) |
 | ![Admin experiments](docs/screenshots/12-admin-experiments.png) | ![Mobile, paper theme](docs/screenshots/13-mobile-discover-light.png) |
 
+Intelligence console:
+
+| | |
+|---|---|
+| ![Situation report](docs/screenshots/14-intel-overview.png) | ![Trends](docs/screenshots/15-intel-trends.png) |
+| ![Forecasts and lapse model](docs/screenshots/16-intel-predictions.png) | ![Early warning](docs/screenshots/17-intel-warning.png) |
+| ![Decision with evidence](docs/screenshots/18-intel-decision.png) | ![What-if scenarios](docs/screenshots/19-intel-scenarios.png) |
+| ![Evaluation](docs/screenshots/20-intel-evaluation.png) | ![Mobile, paper theme](docs/screenshots/21-mobile-intel-light.png) |
+
 ## Limitations
 - **Cold start**: with about 3 interactions, plain popularity still beats the hybrid on NDCG@10.
 - MovieLens-small is small (610 users) and old (ratings to 2018), so absolute metrics are modest and results may not
@@ -136,6 +215,14 @@ uv run python scripts/capture_screenshots.py     # real-browser user journey (Ch
 - App users are not in the training data. They are served by fold-in, and their feedback is not yet fed back into retraining.
 - No password reset or email verification; JWTs are not revocable before expiry.
 - Posters are typeset, not artwork.
+- **Intelligence layer:**
+  - MovieLens is a static 2018 snapshot, so every live signal needs real app traffic before it says anything. Until
+    then those stages report "skipped" instead of guessing.
+  - On this thin stream (10–15 active raters a month), genre trends rarely survive false-discovery control.
+  - The change-point test over-alarms (7 % vs 1 % nominal).
+  - The rater detector spends much of its 2 % review budget on genuine heavy users.
+  - Some impact weights and action efforts are declared estimates, and they are labelled as such.
+  - The lapse base rate is high (74 %), so a lapse warning mostly restates that most raters do not return.
 
 ## Future improvements
 Separate cold-stage weights or learning-to-rank on logged feedback · sequence-aware models · scheduled retraining that

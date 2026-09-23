@@ -267,4 +267,195 @@ class ExperimentDetail(ExperimentOut):
     metrics: list[MetricOut]
 
 
+# --- intelligence layer (docs/intelligence.md, section 6) ------------------------------------------
+# Run-backed objects (signals, trends, ...) are passed through from PipelineResult.to_dict(), whose
+# contract lives in ml/jev_ml/intel; DB-backed objects are typed here.
+WarningStatus = Literal["new", "acknowledged", "investigating", "resolved", "dismissed"]
+Severity = Literal["low", "medium", "high", "critical"]
+FeedbackTarget = Literal["decision", "warning", "action", "prediction"]
+Verdict = Literal["correct", "incorrect", "useful", "not_useful", "false_positive"]
+
+
+class IntelPage(BaseModel):
+    items: list[dict[str, Any]]
+    total: int
+    limit: int
+    offset: int
+    run_id: str | None
+    as_of: str | None
+
+
+class RunTrigger(BaseModel):
+    # "YYYY-MM-DD" (UTC midnight) or a full ISO timestamp; omitted = the last MovieLens event
+    as_of: str | None = Field(default=None, max_length=40)
+
+
+class IntelRunOut(BaseModel):
+    id: int
+    run_id: str
+    trigger: str
+    status: str
+    as_of: str | None
+    started_at: str
+    finished_at: str | None
+    duration_ms: float | None
+    pipeline_version: str
+    data_version: str | None
+    model_version: str | None
+    summary: dict[str, Any] | None
+    stage_ms: dict[str, Any]
+    error: str | None
+
+
+class IntelRunList(BaseModel):
+    items: list[IntelRunOut]
+    total: int
+
+
+class WarningEventOut(BaseModel):
+    from_status: str | None
+    to_status: str
+    note: str | None
+    actor: str
+    at: str
+
+
+class IntelWarningOut(BaseModel):
+    id: int
+    key: str
+    title: str
+    description: str
+    severity: str
+    confidence: float | None
+    confidence_kind: str | None
+    status: str
+    trigger: dict[str, Any]
+    evidence: list[Any]
+    recommended_action: str
+    source: dict[str, Any]
+    entity_type: str | None
+    entity: str | None
+    detected_at: str
+    last_seen_at: str
+    updated_at: str
+    occurrences: int
+    first_seen_run_id: str | None
+    last_seen_run_id: str | None
+    reopened_from: int | None
+    suppressed_until: str | None = None
+    history: list[WarningEventOut] | None = None
+
+
+class IntelWarningList(BaseModel):
+    items: list[IntelWarningOut]
+    total: int
+    limit: int
+    offset: int
+
+
+class WarningUpdate(BaseModel):
+    status: WarningStatus
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class DecisionFeedbackCounts(BaseModel):
+    correct: int = 0
+    incorrect: int = 0
+
+
+class IntelDecisionOut(BaseModel):
+    id: str
+    key: str
+    spec_id: str
+    policy_version: str
+    question: str
+    kind: str
+    options: list[str]
+    answer: str | None
+    option_scores: dict[str, Any]
+    confidence: float | None
+    confidence_kind: str
+    state: dict[str, Any]
+    rationale: list[str]
+    evidence: list[Any]
+    abstained: bool
+    fallback_reason: str | None
+    entity_type: str | None
+    entity: str | None
+    db_id: int
+    run_id: str
+    as_of: str
+    created_at: str
+    feedback: DecisionFeedbackCounts
+
+
+class IntelDecisionList(BaseModel):
+    items: list[IntelDecisionOut]
+    total: int
+    limit: int
+    offset: int
+
+
+class IntelFeedbackIn(BaseModel):
+    target_type: FeedbackTarget
+    target_id: str = Field(min_length=1, max_length=64)
+    verdict: Verdict
+    note: str | None = Field(default=None, max_length=1000)
+    outcome: str | None = Field(default=None, max_length=500)
+
+
+class IntelFeedbackOut(BaseModel):
+    id: int
+    target_type: str
+    target_id: str
+    verdict: str
+    note: str | None
+    outcome: str | None
+    actor: str
+    created_at: str
+
+
+class IntelFeedbackList(BaseModel):
+    items: list[IntelFeedbackOut]
+    total: int
+    limit: int
+    offset: int
+    summary: dict[str, dict[str, Any]]
+
+
+class ScenarioSpecIn(BaseModel):
+    # value ranges are validated by run_scenario (its messages come back as 422)
+    model_config = ConfigDict(extra="allow")
+
+    name: str | None = Field(default=None, max_length=80)
+    kind: str = Field(max_length=16)
+    trend_multiplier: float | None = None
+    level_shift_pct: float | None = None
+    shock_month: int | None = None
+
+
+class ScenarioRequest(BaseModel):
+    series_id: str = Field(min_length=1, max_length=200)
+    horizon_months: int = 12
+    as_of: str | None = Field(default=None, max_length=40)
+    scenarios: list[ScenarioSpecIn] = Field(default_factory=list, max_length=6)
+    trend_source: Literal["auto", "model"] | None = None
+    save: bool = False
+    title: str | None = Field(default=None, max_length=200)
+
+
+class SavedScenarioOut(BaseModel):
+    id: int
+    title: str
+    series_id: str
+    created_at: str
+    input: dict[str, Any]
+    output: dict[str, Any]
+
+
+class SavedScenarioList(BaseModel):
+    items: list[SavedScenarioOut]
+    total: int
+
+
 TokenResponse.model_rebuild()

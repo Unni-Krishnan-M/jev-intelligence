@@ -71,6 +71,14 @@ export default function AdminOverview() {
         Live health of the API, database, cache and loaded model, plus how recommendations are being served and received.
       </PageHeader>
 
+      <div className="mb-8 flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-card px-4 py-3">
+        <p className="text-sm">
+          <span className="eyebrow mr-2">Intelligence</span>
+          Signals, early warnings, decisions and action plans built on the platform&apos;s data.
+        </p>
+        <Button asChild variant="outline" size="sm"><Link href="/intel">Open the console</Link></Button>
+      </div>
+
       <div className="grid gap-4 lg:grid-cols-3">
         <Panel title="System health">
           {health.error ? (

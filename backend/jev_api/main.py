@@ -18,7 +18,9 @@ from jev_api.cache import build_cache
 from jev_api.config import Settings, get_settings
 from jev_api.db import SessionLocal
 from jev_api.logging_setup import configure_logging, request_id_var
-from jev_api.routers import admin, auth, health, movies, recommendations, users
+from jev_api.metrics import metrics
+from jev_api.routers import admin, auth, health, intel, movies, recommendations, users
+from jev_api.services.intel import IntelService
 from jev_api.services.ml import EngineHolder
 from jev_api.services.sync import ensure_admin, sync_all
 
@@ -48,6 +50,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     with SessionLocal() as db:
         synced = sync_all(db)
         ensure_admin(db)
+    # a stale or missing intelligence run is refreshed in a background thread: never blocks startup
+    app.state.intel.start_background_refresh()
     log.info("startup complete", extra={"extra_fields": {"synced": synced, "cache": app.state.cache.backend}})
     yield
 
@@ -67,6 +71,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.log = log
     app.state.cache = build_cache(settings.redis_url)
     app.state.engines = EngineHolder(settings.models_dir)
+    app.state.intel = IntelService(settings, app.state.engines, app.state.cache)
 
     app.add_middleware(
         CORSMiddleware,
@@ -87,18 +92,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             limited = _rate_limited(request, settings)
             if limited is not None:
+                metrics.inc("http", "rate_limited")
+                metrics.record_request(request.method, "rate_limited", 429, 0.0)
                 return limited
             try:
                 response = await call_next(request)
             except Exception:
                 # log the traceback server-side; clients get a generic message plus the request id
                 log.exception("unhandled error on %s %s", request.method, request.url.path)
+                metrics.inc("http", "unhandled_exceptions")
                 response = JSONResponse(
                     {"detail": "internal server error", "request_id": rid}, status_code=500
                 )
         finally:
             request_id_var.reset(token)
         elapsed = (time.perf_counter() - start) * 1000
+        # the router stores the matched route in the scope; unmatched paths share one label
+        route = getattr(request.scope.get("route"), "path", None) or "unmatched"
+        metrics.record_request(request.method, route, response.status_code, elapsed)
         response.headers["X-Request-ID"] = rid
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
@@ -136,7 +147,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             status_code=422,
         )
 
-    for r in (health.router, auth.router, users.router, movies.router, recommendations.router, admin.router):
+    for r in (
+        health.router,
+        auth.router,
+        users.router,
+        movies.router,
+        recommendations.router,
+        admin.router,
+        intel.router,
+    ):
         app.include_router(r)
     return app
 

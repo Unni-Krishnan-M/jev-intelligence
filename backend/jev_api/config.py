@@ -11,7 +11,7 @@ from typing import Annotated
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-from jev_ml.paths import EXPERIMENTS_DIR, MODELS_DIR, ROOT
+from jev_ml.paths import EXPERIMENTS_DIR, MODELS_DIR, PROCESSED_DIR, ROOT
 
 log = logging.getLogger(__name__)
 
@@ -35,10 +35,15 @@ class Settings(BaseSettings):
     admin_password: SecretStr | None = None
     models_dir: Path = MODELS_DIR
     experiments_dir: Path = EXPERIMENTS_DIR
+    processed_dir: Path = PROCESSED_DIR  # processed MovieLens files the intelligence layer reads
     recommendation_cache_seconds: int = 300
     log_level: str = "INFO"
     auto_migrate: bool = True  # run `alembic upgrade head` on startup
     trust_proxy: bool = False  # honour X-Forwarded-For (only behind a trusted reverse proxy)
+    # intelligence layer (docs/intelligence.md)
+    intel_run_on_startup: bool = True  # refresh a missing/stale run in a background thread at startup
+    intel_min_interval_hours: float = Field(24.0, ge=0)  # "stale" = latest successful run older than this
+    intel_suppress_days: int = Field(30, ge=0)  # a dismissed warning key stays quiet this long
 
     @field_validator("cors_origins", mode="before")
     @classmethod

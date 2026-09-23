@@ -45,7 +45,7 @@ export function SiteHeader() {
   const router = useRouter();
   const { user, logout } = useSession();
   const [sheet, setSheet] = useState(false);
-  const nav = user ? [...NAV, ...(user.is_admin ? [{ href: "/admin", label: "Admin" }] : [])] : [{ href: "/discover", label: "Discover" }];
+  const nav = user ? [...NAV, ...(user.is_admin ? [{ href: "/admin", label: "Admin" }, { href: "/intel", label: "Intelligence" }] : [])] : [{ href: "/discover", label: "Discover" }];
 
   return (
     <header className="glass-bar sticky top-0 z-40 border-b hairline">
@@ -97,6 +97,7 @@ export function SiteHeader() {
                 <DropdownMenuItem onSelect={() => router.push("/history")}>History</DropdownMenuItem>
                 <DropdownMenuItem onSelect={() => router.push("/favorites")}>Favourites</DropdownMenuItem>
                 {user.is_admin && <DropdownMenuItem onSelect={() => router.push("/admin")}>Admin</DropdownMenuItem>}
+                {user.is_admin && <DropdownMenuItem onSelect={() => router.push("/intel")}>Intelligence</DropdownMenuItem>}
                 <DropdownMenuSeparator />
                 <DropdownMenuItem onSelect={async () => { await logout(); router.push("/"); }}>Log out</DropdownMenuItem>
               </DropdownMenuContent>

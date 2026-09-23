@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.1.0 — 2026-09-23
+### Added
+- Intelligence & early-warning layer (`ml/jev_ml/intel`), run leak-free as of any date:
+  - validation and freshness;
+  - monthly series and signals;
+  - trends (Mann–Kendall, Theil–Sen, BH FDR) and change points (AR(1) null);
+  - robust-z series anomalies and IsolationForest rater anomalies;
+  - damped-Holt/MA/naive forecasts with finite-sample intervals, and a calibrated lapse model;
+  - risk scoring;
+  - typed, versioned decisions with labelled confidence kinds and abstention;
+  - early warnings, an action planner and what-if scenarios.
+- Offline evaluation of the layer: forecast backtests, lapse holdout with calibration, a shilling-injection study,
+  series-anomaly and change-point studies, and latency (`scripts/evaluate_intelligence.py`).
+- Migration `0002_intelligence`: runs, warnings (lifecycle + audit trail), decisions, scenarios and feedback.
+  `/intel/*` API and `/admin/metrics`.
+- Intelligence console in the web app: 13 sections plus warning, decision and series detail pages.
+- GitHub Actions CI.
+
 ## 1.0.0 — 2026-09-23
 ### Added
 - Data pipeline: checksum-verified MovieLens download, resumable Wikidata enrichment, validation and preprocessing.

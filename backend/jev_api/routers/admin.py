@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from sqlalchemy import func, select
 
 from jev_api.deps import DB, AdminUser
+from jev_api.metrics import metrics
 from jev_api.models import (
     Experiment,
     ModelVersion,
@@ -176,3 +177,24 @@ def stats(_: AdminUser, db: DB) -> dict[str, Any]:
         "recommendations_per_day": [{"date": str(d), "count": c} for d, c in per_day],
         "reason_codes": [{"code": c, "count": n} for c, n in reasons],
     }
+
+
+@router.get("/admin/metrics")
+def admin_metrics(_: AdminUser, db: DB, request: Request) -> dict[str, Any]:
+    """In-process counters (since this process started) plus DB-derived intelligence gauges.
+
+    Groups: http_* (requests by status class and route template, errors, latency, rate limiting),
+    intel_pipeline / intel_pipeline_ms / intel_stage_ms (runs, failures, durations, stage timings
+    incl. forecast and lapse-prediction latency), intel_warnings (lifecycle counters),
+    intel_warnings_open, intel_decisions_latest_run (by spec and answer), data_freshness, model.
+    """
+    snap = metrics.snapshot()
+    snap.update(request.app.state.intel.metrics_snapshot(db))
+    holder = request.app.state.engines
+    snap["model"] = {
+        **snap.get("model", {}),
+        "loaded": holder.engine is not None,
+        "version": holder.engine.version if holder.engine is not None else None,
+        "last_error": holder.last_error,
+    }
+    return snap

@@ -17,6 +17,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -250,3 +251,220 @@ class EvaluationMetric(Base):
     value: Mapped[float] = mapped_column(Float, nullable=False)
 
     experiment: Mapped[Experiment] = relationship(back_populates="metrics")
+
+
+# --- intelligence layer (docs/intelligence.md, section 5) -------------------------------------------
+# Enum values live here once; the CHECK constraints and the API validation both use them.
+INTEL_RUN_TRIGGERS = ("startup", "manual", "script", "schedule")
+INTEL_RUN_STATUSES = ("running", "succeeded", "failed")
+INTEL_SEVERITIES = ("low", "medium", "high", "critical")
+WARNING_STATUSES = ("new", "acknowledged", "investigating", "resolved", "dismissed")
+WARNING_OPEN_STATUSES = ("new", "acknowledged", "investigating")
+DECISION_KINDS = ("boolean", "choice", "score")
+CONFIDENCE_KINDS = ("probability", "margin", "rule")
+FEEDBACK_VERDICTS = {
+    "decision": ("correct", "incorrect"),
+    "warning": ("useful", "not_useful", "false_positive"),
+    "action": ("useful", "not_useful"),
+    "prediction": ("correct", "incorrect"),
+}
+
+
+def _in(column: str, values: tuple[str, ...]) -> str:
+    return f"{column} IN ({','.join(repr(v) for v in values)})"
+
+
+_OPEN_WARNING = _in("status", WARNING_OPEN_STATUSES)
+_VERDICT_MATCHES_TARGET = " OR ".join(
+    f"(target_type = '{t}' AND {_in('verdict', v)})" for t, v in FEEDBACK_VERDICTS.items()
+)
+
+
+class IntelRun(Base):
+    """One pipeline run: parameters, status, timings, versions, summary and the full result JSON."""
+
+    __tablename__ = "intel_runs"
+    __table_args__ = (
+        # quoted: TRIGGER is a keyword in SQL
+        CheckConstraint(_in('"trigger"', INTEL_RUN_TRIGGERS), name="ck_intel_run_trigger"),
+        CheckConstraint(_in("status", INTEL_RUN_STATUSES), name="ck_intel_run_status"),
+        Index("ix_intel_runs_status_started", "status", "started_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(36), unique=True, nullable=False)
+    trigger: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="running", nullable=False)
+    requested_as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # resolved by the pipeline
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    duration_ms: Mapped[float | None] = mapped_column(Float)
+    pipeline_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    data_version: Mapped[str | None] = mapped_column(String(120))
+    model_version: Mapped[str | None] = mapped_column(String(80))
+    summary: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    stage_ms: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    error: Mapped[str | None] = mapped_column(Text)
+    # PipelineResult.to_dict() (~0.5 MB): deferred, so listing runs never loads it
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON, deferred=True)
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+
+
+class IntelWarning(TimestampMixin, Base):
+    """An early warning with a lifecycle. At most one open warning per key (partial unique index)."""
+
+    __tablename__ = "intel_warnings"
+    __table_args__ = (
+        CheckConstraint(_in("severity", INTEL_SEVERITIES), name="ck_intel_warning_severity"),
+        CheckConstraint(_in("status", WARNING_STATUSES), name="ck_intel_warning_status"),
+        CheckConstraint(
+            f"dismissed_severity IS NULL OR {_in('dismissed_severity', INTEL_SEVERITIES)}",
+            name="ck_intel_warning_dismissed_severity",
+        ),
+        CheckConstraint("occurrences >= 1", name="ck_intel_warning_occurrences"),
+        Index(
+            "uq_intel_warnings_open_key",
+            "key",
+            unique=True,
+            sqlite_where=text(_OPEN_WARNING),
+            postgresql_where=text(_OPEN_WARNING),
+        ),
+        Index("ix_intel_warnings_key", "key"),
+        Index("ix_intel_warnings_status_severity", "status", "severity"),
+        Index("ix_intel_warnings_last_seen", "last_seen_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(200), nullable=False)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    confidence_kind: Mapped[str | None] = mapped_column(String(16))
+    status: Mapped[str] = mapped_column(String(16), default="new", nullable=False)
+    trigger: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    evidence: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    recommended_action: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    source: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    entity_type: Mapped[str | None] = mapped_column(String(32))
+    entity: Mapped[str | None] = mapped_column(String(200))
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    occurrences: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    first_seen_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("intel_runs.run_id", ondelete="SET NULL")
+    )
+    last_seen_run_id: Mapped[str | None] = mapped_column(ForeignKey("intel_runs.run_id", ondelete="SET NULL"))
+    reopened_from: Mapped[int | None] = mapped_column(ForeignKey("intel_warnings.id", ondelete="SET NULL"))
+    # set on dismissal: the key stays suppressed until suppressed_until unless severity escalates
+    dismissed_severity: Mapped[str | None] = mapped_column(String(16))
+    suppressed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    events: Mapped[list[IntelWarningEvent]] = relationship(
+        back_populates="warning", cascade="all, delete-orphan", order_by="IntelWarningEvent.id"
+    )
+
+
+class IntelWarningEvent(Base):
+    """Audit trail: every status change of a warning (who, when, from -> to, note)."""
+
+    __tablename__ = "intel_warning_events"
+    __table_args__ = (
+        CheckConstraint(
+            f"from_status IS NULL OR {_in('from_status', WARNING_STATUSES)}", name="ck_intel_event_from"
+        ),
+        CheckConstraint(_in("to_status", WARNING_STATUSES), name="ck_intel_event_to"),
+        Index("ix_intel_events_warning_at", "warning_id", "at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    warning_id: Mapped[int] = mapped_column(
+        ForeignKey("intel_warnings.id", ondelete="CASCADE"), nullable=False
+    )
+    from_status: Mapped[str | None] = mapped_column(String(16))
+    to_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+    actor: Mapped[str] = mapped_column(String(320), nullable=False)  # "system" or the user's email
+    actor_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("intel_runs.run_id", ondelete="SET NULL"))
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    warning: Mapped[IntelWarning] = relationship(back_populates="events")
+
+
+class IntelDecision(Base):
+    """Every decision of every run: flattened columns plus the policy's state/evidence as JSON."""
+
+    __tablename__ = "intel_decisions"
+    __table_args__ = (
+        UniqueConstraint("run_id", "decision_id", name="uq_intel_decision_run"),
+        CheckConstraint(_in("kind", DECISION_KINDS), name="ck_intel_decision_kind"),
+        CheckConstraint(_in("confidence_kind", CONFIDENCE_KINDS), name="ck_intel_decision_confidence_kind"),
+        Index("ix_intel_decisions_decision_id", "decision_id"),
+        Index("ix_intel_decisions_key_created", "key", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("intel_runs.run_id", ondelete="CASCADE"), nullable=False)
+    decision_id: Mapped[str] = mapped_column(String(40), nullable=False)  # contract id "dec-..."
+    key: Mapped[str] = mapped_column(String(64), nullable=False)
+    spec_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    options: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    answer: Mapped[str | None] = mapped_column(String(64))
+    option_scores: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    confidence_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    rationale: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    evidence: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    abstained: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    fallback_reason: Mapped[str | None] = mapped_column(Text)
+    entity_type: Mapped[str | None] = mapped_column(String(32))
+    entity: Mapped[str | None] = mapped_column(String(200))
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class IntelScenario(Base):
+    """A saved what-if analysis (input spec + output)."""
+
+    __tablename__ = "intel_scenarios"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    series_id: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    input: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    output: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False, index=True
+    )
+
+
+class IntelFeedback(Base):
+    """Operator verdicts on decisions, warnings, actions and predictions."""
+
+    __tablename__ = "intel_feedback"
+    __table_args__ = (
+        CheckConstraint(_in("target_type", tuple(FEEDBACK_VERDICTS)), name="ck_intel_feedback_target"),
+        CheckConstraint(_VERDICT_MATCHES_TARGET, name="ck_intel_feedback_verdict"),
+        Index("ix_intel_feedback_target", "target_type", "target_id"),
+        Index("ix_intel_feedback_created", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    target_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    verdict: Mapped[str] = mapped_column(String(16), nullable=False)
+    note: Mapped[str | None] = mapped_column(String(1000))
+    outcome: Mapped[str | None] = mapped_column(String(500))
+    actor: Mapped[str] = mapped_column(String(320), nullable=False)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("intel_runs.run_id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)

@@ -35,7 +35,7 @@ export function Status({ ok, label }: { ok: boolean; label?: string }) {
   const Icon = ok ? CheckCircle2 : XCircle;
   return (
     <span className={cn("inline-flex items-center gap-1.5 font-sans", ok ? "text-[#0ca30c]" : "text-destructive")}>
-      <Icon className="size-3.5" aria-hidden />
+      <Icon className="size-3.5 shrink-0" aria-hidden />
       <span className="text-foreground">{label ?? (ok ? "ok" : "error")}</span>
     </span>
   );
