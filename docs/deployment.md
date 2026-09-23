@@ -3,23 +3,119 @@
 ## Docker Compose (recommended)
 ```bash
 cp .env.example .env          # set POSTGRES_PASSWORD, JEV_JWT_SECRET, JEV_ADMIN_*
-docker compose --profile train run --rm trainer   # first run only: download, preprocess, train (writes ./data ./models ./experiments)
+docker compose --profile train run --rm trainer   # first run only: download, preprocess, train + calibrate, evaluate the intelligence layer
 docker compose up -d --build                      # db, cache, api, web
 open http://localhost:3000
 ```
-Services: `db` (postgres:17-alpine, volume `pgdata`), `cache` (redis:7-alpine, 128 MB LRU, no persistence), `api`
-(FastAPI, non-root, health-checked, migrates on start), `web` (Next.js standalone, non-root), `trainer` (profile
-`train`; `TRAIN_ARGS=--quick` for a fast run). Model artifacts are bind-mounted, so training on the host and serving
-in Docker (or the reverse) share one registry.
 
-Resource use: see the measured figures in the README (quick training peaks at about 620 MB RSS).
+### Services
+| Service | Image / notes |
+|---|---|
+| `db` | postgres:17-alpine, volume `pgdata`, health-checked |
+| `cache` | redis:7-alpine, 128 MB LRU, no persistence |
+| `api` | FastAPI (`docker/api.Dockerfile`). Migrates on start, runs as the host user, health-checked. **Not published to the host** (`expose: 8000`) |
+| `web` | Next.js standalone (`docker/web.Dockerfile`), non-root, published on `${WEB_PORT:-3000}`. Proxies `/api/*` to `http://api:8000`. That URL is a **build arg** (`JEV_API_URL`), because the Next.js rewrite is fixed at build time; to point web elsewhere, rebuild it. Runtime env: `JEV_HTTPS` |
+| `trainer` | Profile `train`, same image as `api`. `download → preprocess → train_models.py --calibrate → evaluate_intelligence.py`. Set `TRAIN_ARGS=--quick` for a fast run |
+
+### Artefacts and paths
+`./data`, `./models` and `./experiments` are bind-mounted into `api` and `trainer` at `/app/data`, `/app/models` and
+`/app/experiments`. Training on the host and serving in Docker (or the reverse) therefore share one registry. Compose
+sets the paths explicitly:
+
+| Variable | Value in the container | Used by |
+|---|---|---|
+| `JEV_PROCESSED_DIR` | `/app/data/processed` | intelligence layer inputs (`movies.csv`, `interactions.csv`, `dataset_meta.json`) |
+| `JEV_MODELS_DIR` | `/app/models` | `registry.json`, the active model, `models/<version>/calibration.json` (recommendation confidence) |
+| `JEV_EXPERIMENTS_DIR` | `/app/experiments` | training runs and `intel-eval-*/report.json` (`/intel/evaluation`, `/intel/evaluation/runs`) |
+
+The API needs all three for the intelligence layer. Without `calibration.json`, every `confidence` is null (never
+guessed). Without an `intel-eval-*` directory, `/intel/evaluation` reports `available: false`.
+
+**File ownership.** `api` and `trainer` run as `${JEV_UID:-1000}:${JEV_GID:-1000}` so they can read and write the
+bind mounts. `models/registry.json` is written with mode 0600, and activating a model rewrites it. If your host uid is
+not 1000, set `JEV_UID=$(id -u)` and `JEV_GID=$(id -g)` in `.env`. (With the image's own uid 10001 the API cannot
+start: `PermissionError: /app/models/registry.json`.)
+
+### Networking and proxy headers
+- The browser only talks to `web`, which proxies `/api/*` to the API over the compose network. For host debugging,
+  publish the API on loopback with a `docker-compose.override.yml`:
+  ```yaml
+  services:
+    api:
+      ports: ["127.0.0.1:8000:8000"]
+  ```
+- The network has a fixed subnet (`JEV_SUBNET`, default `172.29.84.0/24`), and `web` has a fixed address (`JEV_WEB_IP`,
+  default `172.29.84.10`). If that subnet clashes with a local network, change both variables.
+- **Forwarded headers are not trusted by default.**
+  - The backend never parses `X-Forwarded-For`. It uses `request.client`, which uvicorn (`--proxy-headers`) rewrites
+    only for peers listed in `FORWARDED_ALLOW_IPS`. Compose sets that from `JEV_FORWARDED_ALLOW_IPS`, default
+    `127.0.0.1`, which in the container means nobody. The image never uses `"*"`. (`JEV_TRUST_PROXY` only enables a
+    startup warning when `FORWARDED_ALLOW_IPS` is `"*"`, so compose does not set it.)
+  - Reason: Next.js rewrites pass the browser's `X-Forwarded-For` through verbatim and do not append the real peer.
+    Verified on 2026-09-24 against the final images: with `JEV_FORWARDED_ALLOW_IPS=172.29.84.10`, a login through
+    `:3000` with `X-Forwarded-For: 6.6.6.6` was audited with `client: 6.6.6.6`. With the default it is audited with
+    `client: 172.29.84.10`.
+  - With the default, every request is attributed to `web`'s address. Spoofing is impossible, but per-IP rate limits
+    (240/min, and 20/min on login and register) are shared by all clients.
+- Behind an edge proxy (nginx, Caddy, a load balancer) that **overwrites** `X-Forwarded-For` with the socket peer (for
+  example nginx `proxy_set_header X-Forwarded-For $remote_addr;`), set `JEV_FORWARDED_ALLOW_IPS=172.29.84.10` (web's
+  address). The API then sees the real client, and a client cannot forge it.
+- `X-Request-ID` is always generated by the server. A client-supplied id is only logged, as `upstream_request_id`.
+
+### Environment and HTTPS
+- `JEV_ENV` defaults to **production** in compose. That disables `/docs` and makes `JEV_JWT_SECRET` mandatory.
+  `.env.example` sets `JEV_ENV=development` for local demos (OpenAPI docs at the API's `/docs`). Remove that line, or
+  set it to production, for a real deployment. The acceptance test passes in both modes: 58/58 locally in development
+  mode and 58/58 in Docker in production mode, on 2026-09-24.
+- `JEV_HTTPS=true` on `web` adds `Strict-Transport-Security: max-age=31536000; includeSubDomains` and the CSP
+  directive `upgrade-insecure-requests` (read at runtime by `frontend/src/proxy.ts`). Set it only when the site is
+  served over HTTPS, together with `JEV_COOKIE_SECURE=true`. It defaults to false, so plain http on localhost keeps
+  working. Every page carries a per-request nonce CSP, so every page renders dynamically.
+
+### Intelligence layer in Docker
+- On start, the API runs the pipeline in a background thread when no successful run exists or the latest one is older
+  than `JEV_INTEL_MIN_INTERVAL_HOURS`. That takes about 1.1 s in the container and never blocks startup.
+- Replays and manual runs use the Situation report or `POST /api/intel/runs`.
+- Compose passes these variables (defaults in brackets):
+
+| Variable | Meaning |
+|---|---|
+| `JEV_INTEL_RUN_ON_STARTUP` [true] | refresh a missing or stale run on startup |
+| `JEV_INTEL_MIN_INTERVAL_HOURS` [24] | "stale" means the latest successful run is older than this |
+| `JEV_INTEL_SUPPRESS_DAYS` [30] | a warning dismissed as a false positive stays quiet this long, unless its severity rises |
+| `JEV_INTEL_RUN_RATE_LIMIT_PER_MINUTE` [10] | `POST /intel/runs` per admin per minute (on top of the one-run lock) |
+| `JEV_RATE_LIMIT_PER_MINUTE` [240] / `JEV_AUTH_RATE_LIMIT_PER_MINUTE` [20] | per-client limits |
+
+### Verify a deployment
+```bash
+docker compose ps                                  # api, web: (healthy)
+uv run python scripts/acceptance_test.py --base http://localhost:3000/api --admin-password "$JEV_ADMIN_PASSWORD"
+docker compose logs api | grep -E '"level": "(ERROR|CRITICAL)"'   # expect nothing
+```
+The acceptance test covers the recommender journey and the intelligence layer end to end (58 checks, including the
+feedback upsert of migration 0004). It can be re-run against the same database.
+
+Measured on 2026-09-24 (Linux x86-64, Docker 29, Compose v5):
+- The first build of both images takes 2 min 18 s (a rebuild after source changes, plus `up`, took 2 min 50 s).
+  Images: api 1.52 GB on disk (356 MB compressed), web 303 MB.
+- `up` to a healthy web: about 10 s once the database is initialised. Migrations 0001 → 0004 run on PostgreSQL 17 on
+  the first start.
+- The acceptance test passes in about 3.6 s. It passed 57/57 four times (development mode, before the dedup check was
+  added), then 58/58 in production mode on the same database.
+- No ERROR lines in the API log. Idle memory: api 343 MiB, web 51 MiB, db 52 MiB, cache 12 MiB.
+
+Resource use for training: quick training peaks at about 620 MB RSS.
 
 ## Production checklist
 - `JEV_ENV=production`: disables `/docs` and makes `JEV_JWT_SECRET` mandatory.
-- Serve over HTTPS behind a reverse proxy; set `JEV_COOKIE_SECURE=true`, `JEV_CORS_ORIGINS=https://your.domain`,
-  and keep `JEV_TRUST_PROXY=true` only when the proxy sets `X-Forwarded-For`.
-- Use a managed Postgres with backups; Redis can be ephemeral (cache + rate-limit counters only).
-- Run several API workers (`uvicorn --workers N`): each loads the model (about 60 MB RSS). Rate limits need Redis
-  when there is more than one worker.
-- Retrain by running the trainer, then activate the new version from `/admin/models` (or `models/registry.json`).
-  The API swaps it in without a restart.
+- Serve over HTTPS behind a reverse proxy that overwrites `X-Forwarded-For`. Set `JEV_COOKIE_SECURE=true` and
+  `JEV_CORS_ORIGINS=https://your.domain`, set `JEV_HTTPS=true` on web, and follow
+  [Networking and proxy headers](#networking-and-proxy-headers) before you set `JEV_FORWARDED_ALLOW_IPS`.
+- Use a managed Postgres with backups. Redis can be ephemeral: it holds only the cache and rate-limit counters.
+- Run several API workers (`uvicorn --workers N`). Each worker loads the model (about 60 MB RSS). Rate limits and the
+  intelligence-run limit need Redis when there is more than one worker. The one-run lock is per process, so trigger
+  runs from a single worker, or keep `JEV_INTEL_RUN_ON_STARTUP` on for only one of them.
+- Retrain by running the trainer (it also writes `calibration.json`), then activate the new version from
+  `/admin/models` (or `models/registry.json`). The API swaps it in without a restart. Run
+  `scripts/evaluate_intelligence.py` after data changes so `/intel/evaluation` stays current.
+- Open warnings are never auto-resolved. Someone has to triage the queue (`/intel/warnings`).

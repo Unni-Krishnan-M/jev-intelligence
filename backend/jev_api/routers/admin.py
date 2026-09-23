@@ -1,25 +1,35 @@
-"""Model registry, experiments and system stats (admin only)."""
+"""Model registry, experiments, system stats and the audit log (admin only)."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from sqlalchemy import func, select
 
-from jev_api.deps import DB, AdminUser
+from jev_api.deps import DB, MAX_OFFSET, AdminUser, IdPath
 from jev_api.metrics import metrics
 from jev_api.models import (
+    AUDIT_ACTIONS,
+    AuditLog,
     Experiment,
     ModelVersion,
     Rating,
     Recommendation,
-    RecommendationFeedback,
     User,
     WatchHistory,
 )
-from jev_api.schemas import ExperimentDetail, ExperimentOut, ModelVersionDetail, ModelVersionOut
+from jev_api.schemas import (
+    AuditPage,
+    ExperimentDetail,
+    ExperimentOut,
+    ModelVersionDetail,
+    ModelVersionOut,
+)
+from jev_api.services import audit
+from jev_api.services.feedback import feedback_counts
+from jev_api.services.ml import engine_calibration
 from jev_api.services.sync import sync_experiments, sync_model_versions
 from jev_ml.registry import load_manifest
 
@@ -68,6 +78,7 @@ def active_summary(db: DB, request: Request) -> dict[str, Any]:
         "split": m.get("split", {}).get("strategy"),
         "eval_users": n_users,
         "comparison": comparison,
+        "calibration": engine_calibration(engine),  # recommendation confidence metrics, or null
     }
 
 
@@ -78,7 +89,7 @@ def list_models(_: AdminUser, db: DB) -> list[ModelVersion]:
 
 
 @router.get("/models/{model_id}", response_model=ModelVersionDetail)
-def get_model(model_id: int, _: AdminUser, db: DB, request: Request) -> dict[str, Any]:
+def get_model(model_id: IdPath, _: AdminUser, db: DB, request: Request) -> dict[str, Any]:
     mv = db.get(ModelVersion, model_id)
     if mv is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "model version not found")
@@ -106,16 +117,25 @@ def get_model(model_id: int, _: AdminUser, db: DB, request: Request) -> dict[str
 
 
 @router.post("/models/{model_id}/activate", response_model=ModelVersionOut)
-def activate_model(model_id: int, _: AdminUser, db: DB, request: Request) -> ModelVersion:
+def activate_model(model_id: IdPath, user: AdminUser, db: DB, request: Request) -> ModelVersion:
     mv = db.get(ModelVersion, model_id)
     if mv is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "model version not found")
+    previous = request.app.state.engines.engine
     try:
         request.app.state.engines.activate(mv.version)
     except (OSError, ValueError) as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, "model artifacts failed to load") from exc
     for other in db.scalars(select(ModelVersion)).all():
         other.is_active = other.id == mv.id
+    audit.record(
+        db,
+        "model.activate",
+        user,
+        "model_version",
+        mv.id,
+        {"version": mv.version, "previous": previous.version if previous is not None else None},
+    )
     db.commit()
     request.app.state.cache.delete_prefix("rec:")
     return mv
@@ -137,7 +157,7 @@ def list_experiments(_: AdminUser, db: DB) -> list[dict[str, Any]]:
 
 
 @router.get("/experiments/{experiment_id}", response_model=ExperimentDetail)
-def get_experiment(experiment_id: int, _: AdminUser, db: DB) -> dict[str, Any]:
+def get_experiment(experiment_id: IdPath, _: AdminUser, db: DB) -> dict[str, Any]:
     e = db.get(Experiment, experiment_id)
     if e is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "experiment not found")
@@ -158,9 +178,7 @@ def stats(_: AdminUser, db: DB) -> dict[str, Any]:
     ).all()
     feedback: dict[str, int] = {
         kind: n
-        for kind, n in db.execute(
-            select(RecommendationFeedback.feedback, func.count()).group_by(RecommendationFeedback.feedback)
-        )
+        for kind, n in db.execute(feedback_counts())  # distinct per member per movie
     }
     reasons = db.execute(
         select(Recommendation.reason_code, func.count())
@@ -186,7 +204,9 @@ def admin_metrics(_: AdminUser, db: DB, request: Request) -> dict[str, Any]:
     Groups: http_* (requests by status class and route template, errors, latency, rate limiting),
     intel_pipeline / intel_pipeline_ms / intel_stage_ms (runs, failures, durations, stage timings
     incl. forecast and lapse-prediction latency), intel_warnings (lifecycle counters),
-    intel_warnings_open, intel_decisions_latest_run (by spec and answer), data_freshness, model.
+    intel_warnings_open, intel_decisions_latest_run (by spec and answer), data_freshness, model;
+    v1.1: audit_entries_by_action, intel_rows_persisted (per table, summed over runs) and
+    intel_evidence_rows_per_run.
     """
     snap = metrics.snapshot()
     snap.update(request.app.state.intel.metrics_snapshot(db))
@@ -198,3 +218,32 @@ def admin_metrics(_: AdminUser, db: DB, request: Request) -> dict[str, Any]:
         "last_error": holder.last_error,
     }
     return snap
+
+
+@router.get("/admin/audit", response_model=AuditPage)
+def audit_log(
+    _: AdminUser,
+    db: DB,
+    action: str | None = Query(None, max_length=40),
+    actor: str | None = Query(None, max_length=320),
+    target_type: str | None = Query(None, max_length=32),
+    target_id: str | None = Query(None, max_length=200),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0, le=MAX_OFFSET),
+) -> dict[str, Any]:
+    """Newest first. `action` is exact (422 for an unknown one); `actor` matches the email exactly
+    (case-insensitive) or "system"."""
+    if action is not None and action not in AUDIT_ACTIONS:
+        raise HTTPException(422, f"unknown action {action!r}; use one of: {', '.join(AUDIT_ACTIONS)}")
+    q = select(AuditLog)
+    if action:
+        q = q.where(AuditLog.action == action)
+    if actor:
+        q = q.where(func.lower(AuditLog.actor) == actor.strip().lower())
+    if target_type:
+        q = q.where(AuditLog.target_type == target_type)
+    if target_id:
+        q = q.where(AuditLog.target_id == target_id)
+    total = db.scalar(select(func.count()).select_from(q.subquery())) or 0
+    rows = db.scalars(q.order_by(AuditLog.at.desc(), AuditLog.id.desc()).limit(limit).offset(offset)).all()
+    return {"items": [audit.entry_out(e) for e in rows], "total": total, "limit": limit, "offset": offset}

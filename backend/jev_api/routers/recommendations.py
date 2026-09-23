@@ -4,9 +4,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 
-from jev_api.deps import DB, CacheDep, CurrentUser, Engine, OptionalUser
+from jev_api.deps import DB, MAX_COUNT, CacheDep, CurrentUser, Engine, IdPath, OptionalUser
 from jev_api.models import (
     Favorite,
     Movie,
@@ -23,6 +23,7 @@ from jev_api.schemas import (
     RecommendationResponse,
     SimpleRecResponse,
 )
+from jev_api.services.feedback import CLICK, upsert_feedback
 from jev_api.services.profile import load_user_state
 from jev_api.services.recommend import personalized, simple_items
 from jev_ml.models.hybrid import RecommendationFilters
@@ -42,8 +43,8 @@ def recommendations(
     genres: list[str] | None = Query(None, max_length=10),
     year_min: int | None = Query(None, ge=1800, le=2100),
     year_max: int | None = Query(None, ge=1800, le=2100),
-    min_ratings: int | None = Query(None, ge=0),
-    max_ratings: int | None = Query(None, ge=0),
+    min_ratings: int | None = Query(None, ge=0, le=MAX_COUNT),
+    max_ratings: int | None = Query(None, ge=0, le=MAX_COUNT),
     context: str = Query("feed", pattern=r"^[a-z_]{1,32}$"),
 ) -> dict[str, Any]:
     filters = RecommendationFilters(
@@ -54,7 +55,7 @@ def recommendations(
 
 @router.get("/similar/{movie_id}", response_model=SimpleRecResponse)
 def similar(
-    movie_id: int,
+    movie_id: IdPath,
     db: DB,
     engine: Engine,
     cache: CacheDep,
@@ -219,18 +220,8 @@ def feedback(body: FeedbackRequest, user: CurrentUser, db: DB) -> Recommendation
         rec = db.get(Recommendation, body.recommendation_id)
         if rec is None or rec.user_id != user.id or rec.movie_id != body.movie_id:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "recommendation not found")
-    fb = RecommendationFeedback(
-        user_id=user.id,
-        movie_id=body.movie_id,
-        feedback=body.feedback,
-        recommendation_id=body.recommendation_id,
-    )
-    db.add(fb)
-    if body.feedback in ("dislike", "not_interested"):
-        user.profile_version += 1  # these exclude the movie from future recommendations
-    db.commit()
-    db.refresh(fb)
-    return fb
+    # an upsert: repeating a verdict changes nothing, a new verdict replaces the old one
+    return upsert_feedback(db, user, body.movie_id, body.feedback, body.recommendation_id)
 
 
 @router.get("/history", response_model=list[RecommendationHistoryItem])
@@ -244,10 +235,13 @@ def history(user: CurrentUser, db: DB, limit: int = Query(50, ge=1, le=200)) -> 
     fb: dict[int | None, str] = {
         rid: kind
         for rid, kind in db.execute(
-            select(RecommendationFeedback.recommendation_id, RecommendationFeedback.feedback).where(
+            select(RecommendationFeedback.recommendation_id, RecommendationFeedback.feedback)
+            .where(
                 RecommendationFeedback.user_id == user.id,
                 RecommendationFeedback.recommendation_id.in_([r.id for r in rows]),
             )
+            # a verdict and a click can share a recommendation: clicks first, so the verdict wins
+            .order_by(case((RecommendationFeedback.feedback == CLICK, 0), else_=1))
         )
     }
     return [
@@ -263,6 +257,8 @@ def history(user: CurrentUser, db: DB, limit: int = Query(50, ge=1, le=200)) -> 
             "reason": r.reason,
             "created_at": r.created_at,
             "feedback": fb.get(r.id),
+            "confidence": r.confidence,
+            "confidence_kind": r.confidence_kind,
         }
         for r in rows
     ]

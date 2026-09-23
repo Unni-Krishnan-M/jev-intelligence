@@ -6,7 +6,7 @@
 name: jev-recsys  # unique project name → its own containers and volumes (jev-recsys_pgdata)
 
 x-api-env: &api-env
-  JEV_ENV: ${JEV_ENV:-development}
+  JEV_ENV: ${JEV_ENV:-production}  # production hides /docs; set JEV_ENV=development for local API docs
   JEV_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-jev}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-jev}
   JEV_REDIS_URL: redis://cache:6379/0
   JEV_JWT_SECRET: ${JEV_JWT_SECRET:?set JEV_JWT_SECRET in .env}
@@ -14,8 +14,28 @@ x-api-env: &api-env
   JEV_ADMIN_PASSWORD: ${JEV_ADMIN_PASSWORD:-}
   JEV_CORS_ORIGINS: ${JEV_CORS_ORIGINS:-http://localhost:3000}
   JEV_COOKIE_SECURE: ${JEV_COOKIE_SECURE:-false}
-  JEV_TRUST_PROXY: "true"
+  # Proxy headers. The API is not published to the host; its only client is the `web` container
+  # (the Next.js /api/* proxy, fixed address JEV_WEB_IP). The backend uses request.client, which
+  # uvicorn rewrites from X-Forwarded-For only for peers in FORWARDED_ALLOW_IPS. Next.js rewrites
+  # forward the browser's X-Forwarded-For verbatim and never append the real peer, so trusting web
+  # would let any client choose its own address (rate limits, audit `client`); verified. Default:
+  # trust nobody (127.0.0.1; never "*"), so every request is attributed to web's address. Only
+  # when an edge proxy in front of web OVERWRITES X-Forwarded-For with the socket peer, set
+  # JEV_FORWARDED_ALLOW_IPS to web's address (JEV_WEB_IP). See docs/deployment.md.
+  FORWARDED_ALLOW_IPS: ${JEV_FORWARDED_ALLOW_IPS:-127.0.0.1}
   JEV_LOG_LEVEL: ${JEV_LOG_LEVEL:-INFO}
+  JEV_RATE_LIMIT_PER_MINUTE: ${JEV_RATE_LIMIT_PER_MINUTE:-240}
+  JEV_AUTH_RATE_LIMIT_PER_MINUTE: ${JEV_AUTH_RATE_LIMIT_PER_MINUTE:-20}
+  # artefact paths inside the image (bind-mounted from ./data ./models ./experiments below); the
+  # intelligence layer reads data/processed, the active model (+ calibration.json) and experiments/
+  JEV_PROCESSED_DIR: /app/data/processed
+  JEV_MODELS_DIR: /app/models
+  JEV_EXPERIMENTS_DIR: /app/experiments
+  # intelligence layer (docs/intelligence.md, section 8)
+  JEV_INTEL_RUN_ON_STARTUP: ${JEV_INTEL_RUN_ON_STARTUP:-true}
+  JEV_INTEL_MIN_INTERVAL_HOURS: ${JEV_INTEL_MIN_INTERVAL_HOURS:-24}
+  JEV_INTEL_SUPPRESS_DAYS: ${JEV_INTEL_SUPPRESS_DAYS:-30}
+  JEV_INTEL_RUN_RATE_LIMIT_PER_MINUTE: ${JEV_INTEL_RUN_RATE_LIMIT_PER_MINUTE:-10}
 
 services:
   db:
@@ -44,12 +64,20 @@ services:
 
   api:
     build: { context: ., dockerfile: docker/api.Dockerfile }
-    environment: *api-env
+    # run as the host user that owns the bind-mounted ./models ./data ./experiments (default
+    # 1000:1000; set JEV_UID/JEV_GID to `id -u`/`id -g`). The registry is written 0600 and model
+    # activation rewrites it, so the image's own uid 10001 could neither read nor update it.
+    user: "${JEV_UID:-1000}:${JEV_GID:-1000}"
+    environment:
+      <<: *api-env
+      HOME: /tmp
     volumes:
       - ./models:/app/models
       - ./experiments:/app/experiments
       - ./data:/app/data
-    ports: ["${API_PORT:-8000}:8000"]
+    # internal only: the browser reaches the API through web (/api/*). For host debugging, add a
+    # docker-compose.override.yml with ports: ["127.0.0.1:${API_PORT:-8000}:8000"] (docs/deployment.md)
+    expose: ["8000"]
     depends_on:
       db: { condition: service_healthy }
       cache: { condition: service_healthy }
@@ -60,6 +88,13 @@ services:
       context: .
       dockerfile: docker/web.Dockerfile
       args: { JEV_API_URL: http://api:8000 }
+    networks:
+      default:
+        ipv4_address: ${JEV_WEB_IP:-172.29.84.10}  # fixed, so it can be named in JEV_FORWARDED_ALLOW_IPS
+    environment:
+      # read at runtime by frontend/src/proxy.ts: HSTS + upgrade-insecure-requests; set true only
+      # when the site is served over HTTPS
+      JEV_HTTPS: ${JEV_HTTPS:-false}
     ports: ["${WEB_PORT:-3000}:3000"]
     depends_on:
       api: { condition: service_healthy }
@@ -68,12 +103,30 @@ services:
   trainer:
     profiles: [train]
     build: { context: ., dockerfile: docker/api.Dockerfile }
-    environment: *api-env
+    user: "${JEV_UID:-1000}:${JEV_GID:-1000}"
+    environment:
+      <<: *api-env
+      HOME: /tmp
+      TRAIN_ARGS: ${TRAIN_ARGS:-}  # e.g. TRAIN_ARGS=--quick
     volumes:
       - ./models:/app/models
       - ./experiments:/app/experiments
       - ./data:/app/data
-    command: ["sh", "-c", "python scripts/download_data.py && python scripts/preprocess_data.py && python scripts/train_models.py $${TRAIN_ARGS:-}"]
+    # download → preprocess → train (+ recommendation-confidence calibration) → intelligence evaluation
+    command:
+      - sh
+      - -c
+      - >-
+        python scripts/download_data.py &&
+        python scripts/preprocess_data.py &&
+        python scripts/train_models.py --calibrate $${TRAIN_ARGS} &&
+        python scripts/evaluate_intelligence.py
+
+networks:
+  default:
+    ipam:
+      # fixed subnet so web can have a fixed address (change both if it clashes with a local network)
+      config: [{ subnet: "${JEV_SUBNET:-172.29.84.0/24}" }]
 
 volumes:
   pgdata:

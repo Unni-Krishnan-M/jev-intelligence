@@ -22,6 +22,8 @@ def _atomic_write(path: Path, data: Any) -> None:
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-", suffix=".json")
     with os.fdopen(fd, "w") as fh:
         json.dump(data, fh, indent=2, sort_keys=True)
+    # mkstemp creates 0600; the API and trainer may run as different users, so make it world-readable
+    os.chmod(tmp, 0o644)
     os.replace(tmp, path)
 
 

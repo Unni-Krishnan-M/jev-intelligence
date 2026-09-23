@@ -14,8 +14,6 @@ from jev_ml.data.preprocess import LIST_SEP
 from jev_ml.paths import PROCESSED_DIR
 from jev_ml.signals import UserProfile, preference_weight, rating_weights
 
-LIST_COLUMNS = ("genres", "tags", "directors", "cast", "keywords", "wd_genres", "countries")
-
 
 def split_list(value: object) -> list[str]:
     if not isinstance(value, str) or not value:

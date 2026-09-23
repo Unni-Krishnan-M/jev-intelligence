@@ -2,6 +2,8 @@
 
 Requires the API (default :8000) and the frontend (default :3000) to be running, plus Chrome or
 Chromium: `uv run python scripts/capture_screenshots.py [--base http://localhost:3000]`.
+`--only 22 23 24` still walks the whole journey but saves only the screenshots whose names start
+with those prefixes (the others on disk stay untouched).
 """
 
 from __future__ import annotations
@@ -13,9 +15,12 @@ from pathlib import Path
 from playwright.sync_api import Page, sync_playwright
 
 OUT = Path(__file__).resolve().parents[1] / "docs" / "screenshots"
+ONLY: tuple[str, ...] = ()
 
 
 def shot(page: Page, name: str, full: bool = True) -> None:
+    if ONLY and not name.startswith(ONLY):
+        return
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(500)
     page.screenshot(path=str(OUT / f"{name}.png"), full_page=full)
@@ -30,7 +35,10 @@ def main() -> None:
     ap.add_argument(
         "--channel", default="chrome", help="playwright browser channel ('' for bundled chromium)"
     )
+    ap.add_argument("--only", nargs="*", default=[], help="save only names with these prefixes")
     args = ap.parse_args()
+    global ONLY
+    ONLY = tuple(args.only)
     OUT.mkdir(parents=True, exist_ok=True)
     base = args.base.rstrip("/")
     email = f"viewer{int(time.time())}@example.com"
@@ -114,6 +122,16 @@ def main() -> None:
         page.get_by_role("button", name="Run scenarios").click()
         page.wait_for_timeout(1500)
         shot(page, "19-intel-scenarios")
+
+        # v1.1 pages: evidence search, recommender monitoring, audit log
+        page.goto(f"{base}/intel/evidence")
+        page.get_by_label("Search evidence").fill("horror")
+        page.wait_for_timeout(800)
+        shot(page, "22-intel-evidence", full=False)
+        page.goto(f"{base}/intel/recommendations")
+        shot(page, "23-intel-recommender", full=False)
+        page.goto(f"{base}/intel/audit")
+        shot(page, "24-intel-audit", full=False)
 
         # small screens: phone and light theme
         m = browser.new_context(

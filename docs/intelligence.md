@@ -322,7 +322,7 @@ EvaluationReport = {
 ## 7. Implementation notes (ML)
 
 Code: `ml/jev_ml/intel/` (`config, common, ingest, series, trends, anomalies, forecast, lapse,
-modelstats, risk, decisions, warnings, actions, signals, scenario, pipeline, evaluation`). Every
+modelstats, risk, decisions, batches, warnings, actions, signals, scenario, pipeline, evaluation`). Every
 threshold lives in `IntelConfig` (embedded in `run.config`); each default has a one-line reason in
 `config.py`. CLIs: `uv run python scripts/run_intelligence.py [--as-of YYYY-MM-DD] [--out f.json]` and
 `uv run python scripts/evaluate_intelligence.py`. Tests: `tests/intel/`.
@@ -343,6 +343,10 @@ threshold lives in `IntelConfig` (embedded in `run.config`); each default has a 
 - `run_scenario(result_or_inputs, spec, config=None) -> dict`. It raises `ValueError` on invalid specs.
 - `jev_ml.intel.evaluation.run_evaluation(inputs=None, config=None, experiments_dir=None,
   n_latency_runs=5) -> (report, run_dir)`. `evaluate(...)` builds the report without writing it.
+- v1.1: `jev_ml.intel.batches.run_batch(name, question, state, questions, as_of_key) -> (decisions, batch)`
+  and `state_hash(state)`. `jev_ml.intel.decisions.build_decision_batches(...)` defines the three batches of a run, and
+  `POLICY_VERSIONS` maps each decision key to its policy version.
+  `jev_ml.intel.forecast.window_mean_forecast(state, window, cfg)` and `forecast_shares(...)` are also new.
 
 ### Additions to the contract (fields added, none renamed)
 - `run.last_complete_month`. `data.excluded_after_as_of`. `data.live` (live-feedback test status).
@@ -360,7 +364,12 @@ threshold lives in `IntelConfig` (embedded in `run.config`); each default has a 
 - `lapse.metrics`: `train_base_rate`, `baseline_brier`, `base_rate_brier`, `calibration_method`.
   `lapse.population.mean_p`. When `status` is `insufficient_data`, `metrics` and `population` are `null`.
 - `decisions[]`: an abstained decision has `answer: null`, `confidence: null` and empty
-  `option_scores`.
+  `option_scores`. v1.1 adds `scale`, `answer_interval` (both null except for `kind: "score"`) and `batch_id` to
+  every decision.
+- v1.1: `run.pipeline_version` is `intel-1.1.0`. `predictions.share_forecasts` (the Forecast shape, one per
+  `share:genre:<G>` with a recent share ≥ `genre_min_share`) is published separately from `predictions.forecasts`,
+  so forecast signals and the forecast evaluation are unchanged. `result.forecast_states` also holds the share
+  states, so scenarios on share series reuse them. The top-level `decision_batches` is described in section 9.1.
 - `warnings[]`: `confidence_kind` (always `"margin"`: a normalised evidence strength, never a
   probability), `entity_type`, `entity`.
 - `actions[]`: `effort_basis: "declared estimate per action type"`.
@@ -423,12 +432,14 @@ threshold lives in `IntelConfig` (embedded in `run.config`); each default has a 
   confidence is P(best > runner-up); `random` is excluded). `genre_programming` (z = Theil–Sen
   slope/se; margin; non-hold answers need q ≤ 0.10). `rater_action` (margin of anomaly strength ×
   influence; active flagged raters only, at most 5). `reengagement_campaign` (exact Poisson-binomial
-  P(≥ 5 high-risk users lapse); abstains if the holdout AUC is below 0.65).
+  P(≥ 5 high-risk users lapse); abstains if the holdout AUC is below 0.65). v1.1: `editorial_slot_share` (score,
+  `interval`; see 9.1). Every decision is produced in one of three batches (see 9.1).
 - **Signals.** Strength definitions are in the `signals.py` docstring. One signal per `dedup_key`,
   and at most 5 forecast signals, because genre forecasts move together.
 
 ### Results on the real data
-Runtime: 0.8–0.9 s per full run (evaluation latency: mean 815 ms, p95 842 ms over 5 runs; the largest
+Runtime: 0.8–0.9 s per full run before v1.1; about 1.0 s with v1.1, because the 18 share forecasts add about 110 ms
+to the forecast stage (evaluation latency: mean 815 ms, p95 842 ms over 5 runs; the largest
 stages are lapse at about 210 ms and explain/serialisation at about 180 ms).
 
 As of 2018-09-24 (default): status **watch**. Quality 1.0. 18 signals; 4 non-flat trends
@@ -438,6 +449,12 @@ p = 0.004). 10 active and 12 suppressed anomalies. 4 risks. **1 warning**:
 `risk:audience_lapse:all`, medium (40 of 60 recently active raters have P(lapse) ≥ 0.7; score 22.3).
 24 decisions: retrain = no (rule, 0 new events), serving = hybrid (P = 1.00 that it beats itemknn),
 18 × genre hold, 3 × rater ignore, re-engagement = yes. 1 action (P2 re-engage 40 users).
+v1.1 adds 18 `editorial_slot_share` decisions (42 decisions in total). Examples: Thriller 23.2 % [15.3, 34.5],
+Sci-Fi 22.4 % [14.0, 28.5], Action 35.6 % [26.0, 45.0], Documentary 1.2 % [0.0, 2.3]. Each interval's
+backtested coverage is 0.67–1.00 over 12 origins. Three genres abstain (Adventure, Comedy, Drama), because their
+window interval covered only 58 % in the backtest. All three batches have status `ok`.
+In the 2017-07-01 replay, 10 of the 18 slot-share decisions abstain on coverage (0.42–0.58), because the Q2-2017 burst
+breaks the backtest intervals. Model governance abstains as before.
 
 As of 2017-07-01 (replay): status **alert**. **1 warning**: the `share:genre:Horror` spike in 2017-05
 (high), the genre-specific trace of the Q2-2017 burst. `volume:all` itself is *not* flagged: on log
@@ -529,3 +546,186 @@ migration `0002_intelligence`. Tests: `tests/integration/test_intel_api.py`.
   path.
 - Verified: migration upgrade → downgrade → upgrade on SQLite (test) and PostgreSQL 17 (manually,
   including the partial unique index and CHECK constraints); `alembic check` reports no drift.
+
+### v1.1 implementation (section 9.3)
+Code: migration `0003_intel_normalized`, `models.py` (`IntelSignalRow`, `IntelTrendRow`, `IntelAnomalyRow`,
+`IntelForecastRow`, `IntelRiskRow`, `IntelEvidenceRow`, `AuditLog`, `IntelEvaluationRun`), `services/intel.py`
+(`normalised_rows`, `evidence_rows`), `services/audit.py`, `services/sync.py` (`sync_intel_evaluations`),
+`services/ml.py` (`engine_calibration`), `services/recommend.py` (`confidence_of`). Tests:
+`tests/integration/test_intel_v11.py`. Backend version 1.1.0.
+
+- **Tables.** Each normalised table has `run_id` = the *integer* `intel_runs.id` (FK, `ON DELETE CASCADE`), the
+  object's contract id (`signal_id`, `trend_id`, `anomaly_id`, `forecast_id`, `risk_id`, unique per run), its key
+  (`dedup_key`; trends and forecasts `series_id`; risks `key` = `risk:<kind>:<entity>`, the warning key), kind,
+  entity type/entity, severity or level, score/strength, the observed/detected/issued time, a few numeric columns
+  (value, slope, p/q values, MASE, coverage80, likelihood/impact/exposure/confidence) and `payload` (the full contract
+  object). The API always reports the run's uuid. `intel_evidence` adds `owner_title` (the owner's title, question or
+  series, so the evidence list needs no polymorphic join) and `position` (order within its owner). An Evidence
+  `value` is stored in `value_num` when it is a finite number, otherwise as text (lists/dicts/bools as JSON).
+- **Constraints.** CHECKs on severity/level, direction, evidence `owner_type` and audit `action`. Kinds are an
+  ML-owned open vocabulary and have no CHECK, so a new kind can never fail a run. `intel_decisions.confidence_kind`
+  now also allows `interval`; `recommendations.confidence_kind` allows `probability` (or null). The downgrade deletes
+  `score`/`interval` decisions before it narrows the CHECK again.
+- **Writes.** `_persist_success` inserts the decisions, the normalised rows (bulk inserts) and every Evidence item of
+  signals, trends, anomalies, forecasts, risks, decisions, warnings and actions, then the warning lifecycle, in the
+  run's success transaction: a failure rolls all of it back and the run ends `failed`. About 180 evidence rows and
+  ~15–25 ms of `persist` per MovieLens run. The run JSON stays the source for the existing list endpoints; evidence
+  and history read the tables.
+- **Score decisions.** A numeric `answer` goes to `answer_value` (only for `kind: "score"`) and `answer` keeps
+  `str(answer)`; `answer_interval`, `scale` and `batch_id` are stored as given. The API returns the number in `answer`
+  for score decisions (so `answer` is `str | number | null`) and adds `answer_value, answer_interval, scale, batch_id`
+  to every decision (null for older rows).
+- **Batches.** `GET /intel/decisions/batches` returns the run's `decision_batches` from its result JSON (every field
+  the pipeline writes is passed through). For a result without that key it rebuilds groups from the stored
+  `batch_id`s (`name`, `question`, `state_hash` null).
+- **History.** Only successful runs; ordered by run start, oldest first, capped at `limit` most recent points. A key
+  that matches no row is tried as an object id and resolved to that object's key. Mapping of `value/score/level/
+  direction` per entity is in `docs/api.md`.
+- **Audit.** `audit.record(db, action, actor, target_type, target_id, detail, commit=False)` adds the row to the
+  caller's session (same transaction as the change); failed logins pass `commit=True`. It never raises: errors are
+  logged and counted in `audit.errors`. `request_id` comes from the logging context (API-triggered runs carry it,
+  startup runs do not). `detail` is JSON-normalised, redacted with the log redactor (sensitive keys, bearer tokens,
+  JWTs, URL credentials) and capped at 4 000 characters. Wired: `auth.login.success|failure` (reason
+  `unknown_email|wrong_password`, client IP), `auth.register`, `intel.run` (every run with a row, any trigger; not the
+  409/422 rejections), `warning.transition`, `feedback.create` (intelligence feedback only, not end-user
+  recommendation feedback), `scenario.save`, `model.activate`.
+- **Evaluation runs.** Synced on startup (`sync_all`) and on every `GET /intel/evaluation/runs`; a file whose sha1
+  changed is re-synced in place, an unreadable one is skipped with a warning. NaN/Infinity in a report become null.
+  The full report is kept in a deferred JSON column.
+- **Recommendation confidence.** `confidence_of` accepts a value only when it is a finite number in [0, 1]; otherwise
+  both fields are null. `engine_calibration` reads `engine.calibration` (falling back to `engine.health()`), converts
+  numpy scalars and drops lists longer than 20 items (the fitted mapping); it is served by `/models/active/summary`,
+  `/health/ml` and `/intel/recommendations`. Recommendation-feedback counts per reason code use only feedback linked
+  through `recommendation_id`; `positive_rate = like / (like + dislike + not_interested)`.
+- **Metrics.** `audit_entries_by_action`, `intel_rows_persisted` (per table), `intel_evidence_rows_per_run` and
+  `intel_pipeline.last_evidence_rows`.
+- **Deviations from / additions to 9.3.** Normalised tables name the integer FK `run_id` (as 9.3 says), unlike
+  `intel_decisions.run_id`, which is the uuid. Extra columns: `recommendations.confidence_kind`,
+  `intel_evidence.owner_title/position`, `intel_evaluation_runs.as_of/report_sha1/report/synced_at`. Extra response
+  fields: evidence items `position`; history items `id` and `observed_at`; monitoring `served.with_confidence` and
+  `recent[].model_version`; batches envelope `run_id`, `as_of`. Extra filters: evidence `owner_id`; audit
+  `target_type`, `target_id`; history `limit`; monitoring `recent`. `GET /intel/decisions/batches` returns 404 when
+  there is no run, like the other run-backed endpoints.
+- Verified: `0003` upgrade → downgrade → upgrade on SQLite (test) and on PostgreSQL 17 (manually: CHECKs,
+  CASCADE/SET NULL FKs, `alembic check` with no drift, two real pipeline runs and every new endpoint).
+
+## 9. v1.1 additions (contract)
+
+Additive only. Nothing above is renamed or removed.
+
+### 9.1 Score decisions and multi-question decision calls (ML → API → UI)
+- **New decision kind `score`.**
+  - `answer` is a **number**, and the decision carries `scale: {"min": number, "max": number, "unit": str}`.
+  - `answer_interval` is `[lo, hi]` or null.
+  - `options` is `[]` and `option_scores` is `{}`.
+- **New confidence kind `interval`.** `confidence` is the nominal coverage of `answer_interval` (for example 0.8).
+  The UI renders it as "80 % interval [lo, hi]", never as a probability of being right.
+- **Multi-question calls.** Every decision gains `batch_id: str | null`. The result gains:
+  ```jsonc
+  "decision_batches": [{"id": "batch-…", "name": "model_governance", "question": "…",
+                        "keys": ["retrain_model", "serving_model"], "decision_ids": ["dec-…"],
+                        "state_hash": "sha1 of the shared input state", "policy_versions": {"retrain_model": "retrain-1.0.0"}}]
+  ```
+  A batch answers several bounded questions against **one shared, hashed state snapshot**, atomically. Either all of its
+  decisions are produced from that state, or each records its own abstention.
+- **At least one real score decision.** For example, `editorial_slot_share` per genre: the recommended % of home-rail
+  slots, taken from the forecast share, with the forecast's 80 % interval as `answer_interval`.
+
+*Implementation notes (ML).*
+- `editorial_slot_share` (policy `slot-share-1.0.0`, `ml/jev_ml/intel/decisions.py`) allocates slots in proportion
+  to demand:
+  - `answer` = 100 × the mean forecast `share:genre:<G>` over the next `slot_share_window_months` = 3 months,
+    counted from the first month after the last complete month, so the partial as_of month is included.
+  - `answer_interval` = the conformal 80 % interval **of that 3-month mean**. It is built from the selected model's
+    backtest residuals of the window mean, not by averaging the per-month bounds. Both values are clipped to
+    [0, 100].
+  - `confidence` is 0.8 (the nominal coverage) and `confidence_kind` is `interval`. The honestly backtested coverage
+    is in `state.interval_backtest_coverage`.
+  - The decision abstains when there is no share forecast, when there are fewer than 8 complete backtest windows,
+    or when the backtested coverage is below `slot_share_min_coverage` = 0.6.
+  - A film has several genres, so slot shares do not sum to 100.
+  - Editorial boost/hold/reduce stays in `genre_programming`, which is in the same batch. The slot share is not
+    adjusted by it.
+  - Scale: `{"min": 0, "max": 100, "unit": "% of home-rail slots"}`.
+- Batches (`ml/jev_ml/intel/batches.py`) are `model_governance` (retrain_model, serving_model), `genre_programming`
+  (genre_programming, editorial_slot_share over every eligible genre) and `audience` (rater_action,
+  reengagement_campaign).
+  - The state snapshot is deep-copied once, and every question receives the same copy.
+  - `state_hash` is the sha1 of a canonical encoding. DataFrames and arrays are hashed by value, and floats by
+    `repr`.
+  - If any policy raises, returns another key's decisions, or mutates the snapshot (the hash is checked again at the
+    end), no answer of the batch is kept. Every question then records an abstention with the failure as
+    `fallback_reason`, and the batch reports `status: "failed"`.
+  - `batch_id = stable_id("batch", name, as_of)`, so ids are stable per as_of, like decision ids.
+  - Fields added to the batch record beyond the contract: `state_keys`, `n_decisions`, `n_abstained`, `status`
+    (`ok|failed`) and `failure_reason`.
+- For the API: `confidence_kind` can now be `interval`, so the `ck_intel_decision_confidence_kind` CHECK in
+  migration 0002 must allow it. A score `answer` is a JSON number, and the decision's `answer` string column stores
+  `str(answer)`; the numeric value belongs in `answer_value`.
+
+### 9.2 Recommendation confidence (ML → API → UI)
+- **Engine.** Engine `Recommendation` gains `confidence: float | None` and `confidence_kind: "probability" | None`.
+  It is the *calibrated* P(the user rates this film ≥ 4). The calibration is fitted offline by isotonic regression of
+  hybrid score (and/or rank) against held-out relevance on the **validation** split, never on the test split. It is
+  stored per model version as `models/<version>/calibration.json`, with its metrics (ECE, Brier, n, method, fitted_on).
+  Without that file `confidence` is null; it is never guessed.
+- **Script.** `scripts/calibrate_recommendations.py [--model VERSION]` writes the file.
+  `GET /models/active/summary` and `/health/ml` expose `calibration` (metrics) or null.
+- *Implementation notes (ML).*
+  - Module: `ml/jev_ml/calibration.py`. The engine sets `Recommendation.confidence`, rounded to 4 decimals, and
+    `confidence_kind` (`"probability"` or null). Both are dataclass fields with default None, so existing
+    constructors keep working.
+  - Accessor: `RecommendationEngine.calibration`, which is `calibration_summary(calibration.json)` or None. It holds
+    the metrics without the knots: `calibration_version, model_version, dataset_version, created_at, target,
+    confidence_kind, method, k, horizon_ratings, fitted_on, headline, strata[{name, profile_truncation, applies_to,
+    feature, base_rate, validation{…}, test{…}}], assumptions`. The same dict is in `engine.health()["calibration"]`,
+    so `/health/ml` already carries it.
+  - The file is ignored (confidence null) when it is missing, unreadable, invalid, or written for another model
+    version.
+  - Target: P(rating ≥ 4 among the user's next 5 ratings). Fitting protocol: models are fitted on the train split,
+    labels come from validation, and isotonic regression is fitted per profile-size stratum (0–1, 2–5, 6–30, ≥ 31
+    interactions). The test evaluation refits the models on train+validation. The transfer assumption is recorded
+    in the file.
+  - Results (test): ECE ≤ 0.0014 in every stratum. Discrimination is weak (AUC 0.57–0.63; Brier skill over the base
+    rate +0.45 % warm, about 0 for short profiles). Typical values are 0.7–5.7 %. See
+    [evaluation.md](evaluation.md#recommendation-confidence-calibration).
+  - The UI should present confidence as a small probability ("≈ 3 % chance you rate it 4★+ among your next 5
+    ratings"), not as a match score.
+- **API.** Recommendation items (`RecommendationItem`, `SimpleRecItem`, history items) gain `confidence` and
+  `confidence_kind`, both nullable. `recommendations.confidence` is persisted as a nullable column.
+
+### 9.3 Normalised persistence, audit log, evaluation runs (API)
+- **Migration `0003_intel_normalized`.**
+  - New tables: `intel_signals`, `intel_trends`, `intel_anomalies`, `intel_forecasts`, `intel_risks` and
+    `intel_evidence`. Each row references `intel_runs.id` (CASCADE) and carries indexed key columns (id, dedup key or
+    series id, kind, entity, severity or level, score, observed or detected time) plus the full JSON payload.
+    `intel_evidence` is polymorphic: `owner_type`, `owner_id`, `run_id`, `kind`, `label`, `value_num`, `value_text`,
+    `detail`, `ref`.
+  - `audit_logs`: `id`, `at`, `actor_user_id` (SET NULL), `actor`, `action`, `target_type`, `target_id`, `detail`
+    (JSON), `request_id`. Written for `intel.run`, `warning.transition`, `feedback.create`, `scenario.save`,
+    `model.activate`, `auth.login.success`, `auth.login.failure` and `auth.register`. It never stores secrets or
+    passwords.
+  - `intel_evaluation_runs`, synced from `experiments/intel-eval-*/report.json`.
+  - `intel_decisions` gains `batch_id`, `answer_value` (float), `answer_interval` (JSON) and `scale` (JSON).
+  - `recommendations` gains `confidence`.
+- **New endpoints** (admin only):
+  ```jsonc
+  // GET /intel/evidence?run_id=&owner_type=&kind=&q=&limit=&offset=
+  //   → Page<Evidence + {"id": int, "owner_type": "signal|trend|anomaly|forecast|risk|decision|warning|action",
+  //                      "owner_id": str, "owner_title": str, "run_id": uuid}>
+  // GET /intel/history/{entity}?key=   entity ∈ signals|risks|trends|anomalies; key = dedup_key | series_id | risk id key
+  //   → {"entity", "key", "items": [{"run_id", "as_of", "created_at", "value": num|null, "score": num|null,
+  //                                  "level": str|null, "direction": str|null}]}      (oldest → newest across runs)
+  // GET /intel/recommendations → recommender monitoring:
+  //   {"model_version", "calibration": {...}|null, "served": {"total", "per_day": [{"date", "count"}]},
+  //    "feedback_totals": {"like", "dislike", "not_interested", "clicked"},
+  //    "reason_codes": [{"code", "served", "like", "dislike", "not_interested", "clicked", "positive_rate": num|null}],
+  //    "confidence_histogram": [{"bin": "0.0-0.1", "n"}], "recent": [{"id", "user_id", "movie_id", "title", "rank",
+  //    "score", "confidence", "confidence_kind", "reason", "reason_code", "created_at"}]}
+  // GET /admin/audit?action=&actor=&limit=&offset= → Page<AuditEntry>  (AuditEntry = the audit_logs columns)
+  // GET /intel/evaluation/runs → {"items": [{"id", "run_dir", "created_at", "pipeline_version", "data_version",
+  //                               "headline": {"median_mase", "share_beating_naive", "lapse_auc", "lapse_ece",
+  //                                            "shilling_auc_mean", "pipeline_ms_mean"}}], "total"}
+  // GET /intel/decisions?batch_id=   (new filter); Decision items include batch_id, scale, answer_interval
+  // Run-backed decision payloads include "decision_batches" via GET /intel/decisions/batches?run_id= → {"items": [...]}
+  ```

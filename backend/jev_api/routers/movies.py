@@ -5,7 +5,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import delete, func, or_, select
 
-from jev_api.deps import DB, AdminUser, CurrentUser, Engine, OptionalUser
+from jev_api.deps import DB, MAX_COUNT, MAX_PAGE, AdminUser, CurrentUser, Engine, IdPath, OptionalUser
 from jev_api.models import Favorite, Genre, Movie, MovieGenre, Rating, User, WatchHistory
 from jev_api.schemas import (
     FavoriteRequest,
@@ -49,12 +49,12 @@ def list_genres(db: DB) -> list[dict]:
 @router.get("/movies", response_model=MoviePage)
 def list_movies(
     db: DB,
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(24, ge=1, le=100),
     genre: str | None = Query(None, max_length=64),
     year_min: int | None = Query(None, ge=1800, le=2100),
     year_max: int | None = Query(None, ge=1800, le=2100),
-    min_ratings: int = Query(0, ge=0),
+    min_ratings: int = Query(0, ge=0, le=MAX_COUNT),
     sort: SortKey = "popular",
 ) -> MoviePage:
     q = select(Movie)
@@ -119,7 +119,7 @@ def popular_movies(
 
 
 @router.get("/movies/{movie_id}", response_model=MovieDetail)
-def get_movie(movie_id: int, db: DB, user: OptionalUser, engine: Engine) -> MovieDetail:
+def get_movie(movie_id: IdPath, db: DB, user: OptionalUser, engine: Engine) -> MovieDetail:
     m = _get_movie(db, movie_id)
     detail = MovieDetail.model_validate(m)
     detail.in_model = engine.item_index.index_of(movie_id) is not None
@@ -143,7 +143,7 @@ def get_movie(movie_id: int, db: DB, user: OptionalUser, engine: Engine) -> Movi
 
 
 @router.post("/movies/{movie_id}/rate", response_model=InteractionResult)
-def rate_movie(movie_id: int, body: RateRequest, user: CurrentUser, db: DB) -> InteractionResult:
+def rate_movie(movie_id: IdPath, body: RateRequest, user: CurrentUser, db: DB) -> InteractionResult:
     _get_movie(db, movie_id)
     r = db.scalar(select(Rating).where(Rating.user_id == user.id, Rating.movie_id == movie_id))
     if r is None:
@@ -154,14 +154,14 @@ def rate_movie(movie_id: int, body: RateRequest, user: CurrentUser, db: DB) -> I
 
 
 @router.delete("/movies/{movie_id}/rate", response_model=InteractionResult)
-def unrate_movie(movie_id: int, user: CurrentUser, db: DB) -> InteractionResult:
+def unrate_movie(movie_id: IdPath, user: CurrentUser, db: DB) -> InteractionResult:
     db.execute(delete(Rating).where(Rating.user_id == user.id, Rating.movie_id == movie_id))
     return InteractionResult(movie_id=movie_id, rating=None, profile_version=_bump(db, user))
 
 
 @router.post("/movies/{movie_id}/favorite", response_model=InteractionResult)
 def favorite_movie(
-    movie_id: int, user: CurrentUser, db: DB, body: FavoriteRequest | None = None
+    movie_id: IdPath, user: CurrentUser, db: DB, body: FavoriteRequest | None = None
 ) -> InteractionResult:
     _get_movie(db, movie_id)
     want = True if body is None else body.favorite
@@ -174,7 +174,7 @@ def favorite_movie(
 
 
 @router.post("/movies/{movie_id}/watch", response_model=InteractionResult)
-def watch_movie(movie_id: int, user: CurrentUser, db: DB) -> InteractionResult:
+def watch_movie(movie_id: IdPath, user: CurrentUser, db: DB) -> InteractionResult:
     _get_movie(db, movie_id)
     db.add(WatchHistory(user_id=user.id, movie_id=movie_id))
     return InteractionResult(movie_id=movie_id, watched=True, profile_version=_bump(db, user))

@@ -6,6 +6,7 @@ import useSWR from "swr";
 import { fmtDate } from "@/components/jev/admin/ui";
 import { DirectionIcon, FreshnessBadge, Meter } from "@/components/jev/intel/badges";
 import { EvidenceDisclosure } from "@/components/jev/intel/evidence-list";
+import { HistoryTimeline } from "@/components/jev/intel/history-timeline";
 import { PageHeader } from "@/components/jev/intel/page-header";
 import { FilterRow, IntelError, Pagination, RowsSkeleton } from "@/components/jev/intel/states";
 import { EmptyState } from "@/components/jev/states";
@@ -16,6 +17,19 @@ import type { Page, Signal } from "@/lib/intel-types";
 const LIMIT = 50;
 const KINDS = ["all", "trend", "anomaly", "change_point", "forecast", "quality", "live", "model"];
 const ENTITY_TYPES = ["all", "genre", "platform", "user", "model", "source"];
+
+/** Across-runs history for one signal, fetched only once the operator opens it. */
+function RunsDisclosure({ dedupKey }: { dedupKey: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <details className="group min-w-0 open:basis-full" onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}>
+      <summary className="inline-flex cursor-pointer list-none items-center gap-1 text-xs text-muted-foreground hover:text-foreground [&::-webkit-details-marker]:hidden">
+        <span className="transition-transform group-open:rotate-90" aria-hidden>›</span> Across runs
+      </summary>
+      {open && <HistoryTimeline entity="signals" historyKey={dedupKey} labels={{ score: "strength", value: "value" }} quiet={false} className="mt-2" />}
+    </details>
+  );
+}
 
 export default function SignalsPage() {
   const [kind, setKind] = useState("all");
@@ -75,7 +89,10 @@ export default function SignalsPage() {
                     <span className="num text-xs text-muted-foreground">{fmtDate(s.observed_at).slice(0, 10)}</span>
                   </div>
                 </div>
-                <EvidenceDisclosure items={s.evidence} className="mt-2" />
+                <div className="mt-2 flex flex-wrap gap-x-5 gap-y-2">
+                  <EvidenceDisclosure items={s.evidence} />
+                  <RunsDisclosure dedupKey={s.dedup_key} />
+                </div>
               </li>
             ))}
           </ul>

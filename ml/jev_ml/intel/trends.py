@@ -18,7 +18,6 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-import pandas as pd
 from scipy import stats
 
 from jev_ml.intel.common import fnum, month_str, stable_id, sub_seed
@@ -202,7 +201,3 @@ def analyse_trends(series: list[Series], cfg: IntelConfig, as_of_key: str) -> li
 
 def window_label(trend: dict[str, Any]) -> str:
     return f"{trend['window']['start'][:7]}..{trend['window']['end'][:7]}"
-
-
-def as_month(p: str) -> pd.Period:
-    return pd.Period(p[:7], freq="M")

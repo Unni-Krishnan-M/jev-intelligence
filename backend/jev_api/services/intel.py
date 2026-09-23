@@ -5,7 +5,8 @@ The pipeline itself (ml/jev_ml/intel) is pure. This module owns everything state
   (ratings, recommendation feedback, served recommendations, dismissed warning keys),
 - one run at a time (a process-wide lock; a second trigger gets IntelBusyError -> HTTP 409),
 - persistence of the run (running -> succeeded | failed), its decisions and the warning lifecycle
-  (docs/intelligence.md, section 5),
+  (docs/intelligence.md, section 5), plus the normalised run objects (signals, trends, anomalies,
+  forecasts, risks) and every Evidence item, in the same transaction (section 9.3),
 - a small cache of parsed run results, so list endpoints do not re-read ~0.5 MB of JSON per call.
 
 Pipeline failures are recorded on the run row and never propagate to the API.
@@ -13,7 +14,10 @@ Pipeline failures are recorded on the run row and never propagate to the API.
 
 from __future__ import annotations
 
+import json
 import logging
+import math
+import re
 import threading
 import time
 import uuid
@@ -23,7 +27,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import func, select
+from sqlalchemy import func, insert, select
 from sqlalchemy.orm import Session
 
 from jev_api.cache import Cache
@@ -32,15 +36,22 @@ from jev_api.db import SessionLocal
 from jev_api.metrics import metrics
 from jev_api.models import (
     WARNING_OPEN_STATUSES,
+    IntelAnomalyRow,
     IntelDecision,
+    IntelEvidenceRow,
+    IntelForecastRow,
+    IntelRiskRow,
     IntelRun,
+    IntelSignalRow,
+    IntelTrendRow,
     IntelWarning,
     IntelWarningEvent,
     Rating,
     Recommendation,
-    RecommendationFeedback,
     User,
 )
+from jev_api.services import audit
+from jev_api.services.feedback import latest_feedback
 from jev_api.services.ml import EngineHolder
 from jev_ml.intel import PIPELINE_VERSION, IntelConfig, PipelineInputs, load_default_inputs, run_pipeline
 from jev_ml.intel.config import severity_rank
@@ -95,10 +106,23 @@ def parse_as_of(value: str | datetime | None) -> datetime | None:
     if isinstance(value, datetime):
         return aware(value)
     try:
-        dt = datetime.fromisoformat(value.strip())
-    except ValueError as exc:
+        # OverflowError: a valid timestamp whose UTC conversion leaves year 1..9999
+        return aware(datetime.fromisoformat(value.strip()))
+    except (ValueError, OverflowError) as exc:
         raise IntelInputError("as_of must be YYYY-MM-DD or an ISO-8601 timestamp") from exc
-    return aware(dt)
+
+
+_ABS_PATH = re.compile(r"(?<![\w.])(?:/[^\s'\"/:]+)+/([^\s'\"/:]+)")
+
+
+def safe_error(exc: BaseException, context: str | None = None) -> str:
+    """The run error shown to operators: exception type plus the first line of its message, with
+    absolute paths cut to their file name and without SQLAlchemy's statement / parameter dump.
+    The full traceback is logged server-side."""
+    lines = str(exc).strip().splitlines()
+    msg = _ABS_PATH.sub(r"\1", lines[0] if lines else "")[:500]
+    text = f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+    return f"{context}: {text}" if context else text
 
 
 # --- serialisation ------------------------------------------------------------------------------
@@ -163,6 +187,8 @@ def warning_out(w: IntelWarning, history: bool = False) -> dict[str, Any]:
 
 def decision_out(d: IntelDecision, feedback: dict[str, int] | None = None) -> dict[str, Any]:
     fb = feedback or {}
+    # score decisions answer with a number (section 9.1); `answer` is stored as its str()
+    numeric = d.kind == "score" and d.answer_value is not None
     return {
         "id": d.decision_id,
         "key": d.key,
@@ -171,7 +197,11 @@ def decision_out(d: IntelDecision, feedback: dict[str, int] | None = None) -> di
         "question": d.question,
         "kind": d.kind,
         "options": d.options or [],
-        "answer": d.answer,
+        "answer": d.answer_value if numeric else d.answer,
+        "answer_value": d.answer_value,
+        "answer_interval": d.answer_interval,
+        "scale": d.scale,
+        "batch_id": d.batch_id,
         "option_scores": d.option_scores or {},
         "confidence": d.confidence,
         "confidence_kind": d.confidence_kind,
@@ -194,6 +224,185 @@ def _cut(value: Any, n: int) -> str | None:
     return None if value is None else str(value)[:n]
 
 
+def _num(value: Any) -> float | None:
+    """A finite float, or None (strings, bools, NaN and missing values are not numbers here)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    v = float(value)
+    return v if math.isfinite(v) else None
+
+
+def _when(value: Any) -> datetime | None:
+    try:
+        return parse_as_of(value) if isinstance(value, str | datetime) else None
+    except IntelInputError:
+        return None
+
+
+# --- normalised run objects (section 9.3) ------------------------------------------------------------
+def _owner_title(owner_type: str, item: dict[str, Any]) -> str:
+    if owner_type == "decision":
+        title = item.get("question")
+    elif owner_type == "trend":
+        title = f"{item.get('series_id')} trend {item.get('direction')}"
+    elif owner_type == "anomaly":
+        title = f"{item.get('kind')}: {item.get('series_id') or item.get('entity')}"
+    elif owner_type == "forecast":
+        title = f"forecast {item.get('series_id')}"
+    else:
+        title = item.get("title")
+    return str(title or item.get("id") or item.get("key") or "")[:300]
+
+
+def evidence_owners(data: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Every (owner_type, object) of a result that can carry Evidence."""
+    groups = (
+        ("signal", data.get("signals")),
+        ("trend", data.get("trends")),
+        ("anomaly", data.get("anomalies")),
+        ("forecast", (data.get("predictions") or {}).get("forecasts")),
+        ("risk", data.get("risks")),
+        ("decision", data.get("decisions")),
+        ("warning", data.get("warnings")),
+        ("action", data.get("actions")),
+    )
+    return [(owner, item) for owner, items in groups for item in items or [] if isinstance(item, dict)]
+
+
+def evidence_rows(run_pk: int, data: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for owner, item in evidence_owners(data):
+        # warnings carry no id in the result: their dedup key identifies them
+        owner_id = str(item.get("key") if owner == "warning" else item.get("id"))[:200]
+        title = _owner_title(owner, item)
+        for pos, ev in enumerate(item.get("evidence") or []):
+            if not isinstance(ev, dict):
+                continue
+            value = ev.get("value")
+            num = _num(value)
+            if num is None and value is not None:
+                text = json.dumps(value) if isinstance(value, bool | list | dict) else str(value)
+            else:
+                text = None
+            rows.append(
+                {
+                    "run_id": run_pk,
+                    "owner_type": owner,
+                    "owner_id": owner_id,
+                    "owner_title": title,
+                    "position": pos,
+                    "kind": str(ev.get("kind") or "")[:16],
+                    "label": str(ev.get("label") or "")[:300],
+                    "value_num": num,
+                    "value_text": text,
+                    "detail": None if ev.get("detail") is None else str(ev["detail"]),
+                    "ref": _cut(ev.get("ref"), 200),
+                }
+            )
+    return rows
+
+
+def normalised_rows(run_pk: int, data: dict[str, Any]) -> dict[Any, list[dict[str, Any]]]:
+    """Indexed key columns plus the full contract object (`payload`) per run object."""
+    signals = [
+        {
+            "run_id": run_pk,
+            "signal_id": str(x["id"])[:40],
+            "dedup_key": str(x.get("dedup_key") or x["id"])[:200],
+            "kind": str(x.get("kind") or "")[:32],
+            "entity_type": _cut(x.get("entity_type"), 32),
+            "entity": _cut(x.get("entity"), 200),
+            "title": str(x.get("title") or x["id"])[:300],
+            "value": _num(x.get("value")),
+            "strength": _num(x.get("strength")),
+            "direction": _cut(x.get("direction"), 8),
+            "observed_at": _when(x.get("observed_at")),
+            "payload": x,
+        }
+        for x in data.get("signals") or []
+    ]
+    trends = [
+        {
+            "run_id": run_pk,
+            "trend_id": str(x["id"])[:40],
+            "series_id": str(x.get("series_id") or "")[:200],
+            "metric": _cut(x.get("metric"), 32),
+            "entity_type": _cut(x.get("entity_type"), 32),
+            "entity": _cut(x.get("entity"), 200),
+            "direction": _cut(x.get("direction"), 8),
+            "slope": _num(x.get("slope")),
+            "p_value": _num(x.get("p_value")),
+            "q_value": _num(x.get("q_value")),
+            "evidence_strength": _num(x.get("evidence_strength")),
+            "has_change_point": bool(x.get("change_point")),
+            "payload": x,
+        }
+        for x in data.get("trends") or []
+    ]
+    anomalies = [
+        {
+            "run_id": run_pk,
+            "anomaly_id": str(x["id"])[:40],
+            "dedup_key": _cut(x.get("dedup_key"), 200),
+            "kind": str(x.get("kind") or "")[:32],
+            "entity_type": _cut(x.get("entity_type"), 32),
+            "entity": _cut(x.get("entity"), 200),
+            "series_id": _cut(x.get("series_id"), 200),
+            "severity": _cut(x.get("severity"), 16),
+            "score": _num(x.get("score")),
+            "value": _num(x.get("value")),
+            "detected_at": _when(x.get("detected_at")),
+            "suppressed": bool(x.get("suppressed")),
+            "payload": x,
+        }
+        for x in data.get("anomalies") or []
+    ]
+    forecasts = [
+        {
+            "run_id": run_pk,
+            "forecast_id": str(x["id"])[:40],
+            "series_id": str(x.get("series_id") or "")[:200],
+            "metric": _cut(x.get("metric"), 32),
+            "entity_type": _cut(x.get("entity_type"), 32),
+            "entity": _cut(x.get("entity"), 200),
+            "model": _cut(x.get("model"), 40),
+            "horizon_months": x.get("horizon_months") if isinstance(x.get("horizon_months"), int) else None,
+            "mase": _num((x.get("backtest") or {}).get("mase")),
+            "coverage80": _num((x.get("backtest") or {}).get("coverage80")),
+            "issued_at": _when(x.get("issued_at")),
+            "payload": x,
+        }
+        for x in (data.get("predictions") or {}).get("forecasts") or []
+    ]
+    risks = [
+        {
+            "run_id": run_pk,
+            "risk_id": str(x["id"])[:40],
+            "key": f"risk:{x.get('kind')}:{x.get('entity')}"[:200],  # the warning key of this risk
+            "kind": str(x.get("kind") or "")[:40],
+            "entity_type": _cut(x.get("entity_type"), 32),
+            "entity": _cut(x.get("entity"), 200),
+            "title": str(x.get("title") or x["id"])[:300],
+            "level": _cut(x.get("level"), 16),
+            "score": _num(x.get("score")),
+            "likelihood": _num(x.get("likelihood")),
+            "impact": _num(x.get("impact")),
+            "exposure": _num(x.get("exposure")),
+            "confidence": _num(x.get("confidence")),
+            "payload": x,
+        }
+        for x in data.get("risks") or []
+    ]
+    return {
+        IntelSignalRow: signals,
+        IntelTrendRow: trends,
+        IntelAnomalyRow: anomalies,
+        IntelForecastRow: forecasts,
+        IntelRiskRow: risks,
+        IntelEvidenceRow: evidence_rows(run_pk, data),
+    }
+
+
 # --- the service --------------------------------------------------------------------------------
 class IntelService:
     def __init__(self, settings: Settings, engines: EngineHolder, cache: Cache) -> None:
@@ -208,10 +417,6 @@ class IntelService:
         self._latest_obj: tuple[str, PipelineResult] | None = None
         # replaced in tests with a synthetic dataset; takes the requested as_of (or None)
         self.inputs_factory: Callable[[datetime | None], PipelineInputs] = self._file_inputs
-
-    @property
-    def busy(self) -> bool:
-        return self._lock.locked()
 
     # ---- inputs ---------------------------------------------------------------------------------
     def _file_inputs(self, as_of: datetime | None) -> PipelineInputs:
@@ -241,9 +446,9 @@ class IntelService:
         inputs.now = now
         ratings = db.execute(select(Rating.user_id, Rating.movie_id, Rating.rating, Rating.updated_at)).all()
         inputs.app_ratings = pd.DataFrame(ratings, columns=["user_id", "movie_id", "rating", "timestamp"])
-        feedback = db.execute(
-            select(RecommendationFeedback.feedback, RecommendationFeedback.created_at)
-        ).all()
+        # one verdict (and one click) per member per movie: repeats cannot fake or bury a spike
+        latest = latest_feedback()
+        feedback = db.execute(select(latest.c.feedback, latest.c.created_at)).all()
         inputs.app_feedback = pd.DataFrame(feedback, columns=["feedback", "timestamp"])
         served = db.execute(select(Recommendation.movie_id, Recommendation.created_at)).all()
         inputs.app_served = pd.DataFrame(served, columns=["movie_id", "timestamp"])
@@ -305,7 +510,7 @@ class IntelService:
             raise
         except Exception as exc:
             log.exception("intelligence inputs failed to load")
-            error = f"loading inputs failed: {type(exc).__name__}: {exc}"
+            error = safe_error(exc, "loading inputs failed")
         load_ms = round(1000 * (time.perf_counter() - t0), 2)
         metrics.inc("intel_pipeline", f"runs_{trigger}")
         db.add(run)
@@ -316,24 +521,26 @@ class IntelService:
                 result = run_pipeline(inputs, self.config)
             except Exception as exc:
                 log.exception("intelligence pipeline failed", extra={"extra_fields": {"run_id": run.run_id}})
-                error = f"{type(exc).__name__}: {exc}"
+                error = safe_error(exc)
         if result is not None:
             t1 = time.perf_counter()
             try:
                 data = result.to_dict()
-                self._persist_success(db, run, data, now)
+                persisted = self._persist_success(db, run, data, now)
                 run.stage_ms = {"load_inputs": load_ms, **data["run"]["stage_ms"]}
                 run.stage_ms["persist"] = round(1000 * (time.perf_counter() - t1), 2)
                 run.duration_ms = round(1000 * (time.perf_counter() - t0), 2)
                 run.finished_at = datetime.now(UTC)
+                self._audit_run(db, run, user, persisted)
                 db.commit()
+                self._record_persisted(persisted)
                 self._remember(run.run_id, data, result)
             except Exception as exc:
                 db.rollback()
                 log.exception(
                     "persisting intelligence run failed", extra={"extra_fields": {"run_id": run.run_id}}
                 )
-                error = f"persisting the result failed: {type(exc).__name__}: {exc}"
+                error = safe_error(exc, "persisting the result failed")
         if error is not None:
             run = db.get(IntelRun, run.id) or run
             run.status = "failed"
@@ -341,6 +548,7 @@ class IntelService:
             run.finished_at = datetime.now(UTC)
             run.duration_ms = round(1000 * (time.perf_counter() - t0), 2)
             run.stage_ms = {"load_inputs": load_ms}
+            self._audit_run(db, run, user, None)
             db.commit()
         self._record_metrics(run)
         log.info(
@@ -360,6 +568,33 @@ class IntelService:
         )
         return run
 
+    @staticmethod
+    def _audit_run(db: Session, run: IntelRun, user: User | None, persisted: dict[str, int] | None) -> None:
+        audit.record(
+            db,
+            "intel.run",
+            user,
+            "intel_run",
+            run.run_id,
+            {
+                "trigger": run.trigger,
+                "status": run.status,
+                "requested_as_of": iso(run.requested_as_of),
+                "as_of": iso(run.as_of),
+                "duration_ms": run.duration_ms,
+                "counts": (run.summary or {}).get("counts"),
+                "persisted": persisted,
+                "error": _cut(run.error, 500),
+            },
+        )
+
+    @staticmethod
+    def _record_persisted(persisted: dict[str, int]) -> None:
+        for table, n in persisted.items():
+            metrics.inc("intel_rows_persisted", table, n)
+        metrics.set("intel_pipeline", "last_evidence_rows", persisted.get("intel_evidence", 0))
+        metrics.observe("intel_evidence_rows_per_run", "all", persisted.get("intel_evidence", 0))
+
     def _record_metrics(self, run: IntelRun) -> None:
         metrics.inc("intel_pipeline", run.status)
         metrics.set("intel_pipeline", "last_status", run.status)
@@ -373,7 +608,11 @@ class IntelService:
                 if isinstance(ms, int | float):
                     metrics.observe("intel_stage_ms", stage, float(ms))
 
-    def _persist_success(self, db: Session, run: IntelRun, data: dict[str, Any], now: datetime) -> None:
+    def _persist_success(
+        self, db: Session, run: IntelRun, data: dict[str, Any], now: datetime
+    ) -> dict[str, int]:
+        """Run row, decisions, normalised objects + evidence and warnings, in one transaction.
+        Returns the number of rows written per table."""
         info = data["run"]
         run.status = "succeeded"
         run.as_of = parse_as_of(info["as_of"])
@@ -383,6 +622,8 @@ class IntelService:
         run.result = data
         as_of = run.as_of or now
         for d in data.get("decisions", []):
+            answer = d.get("answer")
+            answer_value = _num(answer)  # score decisions (section 9.1) answer with a number
             db.add(
                 IntelDecision(
                     run_id=run.run_id,
@@ -393,7 +634,7 @@ class IntelService:
                     question=str(d.get("question") or ""),
                     kind=d["kind"],
                     options=d.get("options") or [],
-                    answer=_cut(d.get("answer"), 64),
+                    answer=_cut(answer, 64),
                     option_scores=d.get("option_scores") or {},
                     confidence=d.get("confidence"),
                     confidence_kind=d["confidence_kind"],
@@ -404,11 +645,21 @@ class IntelService:
                     fallback_reason=d.get("fallback_reason"),
                     entity_type=_cut(d.get("entity_type"), 32),
                     entity=_cut(d.get("entity"), 200),
+                    batch_id=_cut(d.get("batch_id"), 64),
+                    answer_value=answer_value if d.get("kind") == "score" else None,
+                    answer_interval=d.get("answer_interval"),
+                    scale=d.get("scale"),
                     as_of=as_of,
                     created_at=now,
                 )
             )
+        persisted = {"intel_decisions": len(data.get("decisions", []))}
+        for model, rows in normalised_rows(run.id, data).items():
+            if rows:
+                db.execute(insert(model), rows)
+            persisted[model.__tablename__] = len(rows)
         self._upsert_warnings(db, run, data.get("warnings", []), now)
+        return persisted
 
     # ---- warning lifecycle ------------------------------------------------------------------------
     @staticmethod
@@ -512,6 +763,14 @@ class IntelService:
                 actor_id=user.id,
                 at=now,
             )
+        )
+        audit.record(
+            db,
+            "warning.transition",
+            user,
+            "intel_warning",
+            w.id,
+            {"key": w.key, "from": w.status, "to": status, "note": note, "severity": w.severity},
         )
         w.status = status
         if status == "dismissed":

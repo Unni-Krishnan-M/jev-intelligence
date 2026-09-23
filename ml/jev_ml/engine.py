@@ -20,6 +20,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from jev_ml.calibration import Calibrator, calibration_summary, load_calibration
 from jev_ml.data.dataset import ItemIndex, load_movies, split_list
 from jev_ml.explain import explain
 from jev_ml.models.als import ALSRecommender
@@ -62,6 +63,10 @@ class Recommendation:
     anchor_movie_ids: list[int]
     signals: dict[str, dict[str, float]]
     rank: int
+    # calibrated P(the user rates this film >= 4); None without models/<version>/calibration.json
+    # or beyond the calibrated rank range (see jev_ml/calibration.py)
+    confidence: float | None = None
+    confidence_kind: str | None = None  # "probability" when confidence is set
 
 
 class RecommendationEngine:
@@ -83,6 +88,10 @@ class RecommendationEngine:
         self._titles = self.movies["title"].to_numpy()
         self._ids = self.movies["movie_id"].to_numpy()
         self._validate()
+        self._calibrator: Calibrator | None = None
+        #: calibration metrics (calibration_summary of calibration.json) or None when uncalibrated
+        self.calibration: dict[str, Any] | None = None
+        self._load_calibration()
         self.load_seconds = time.perf_counter() - t0
         log.info("loaded model %s (%d items) in %.2fs", self.version, len(self.movies), self.load_seconds)
 
@@ -106,6 +115,22 @@ class RecommendationEngine:
             raise ValueError(f"model artifacts inconsistent with item catalog: {bad}")
         if not np.isfinite(self.als.item_factors).all():
             raise ValueError("ALS item factors contain non-finite values")
+
+    def _load_calibration(self) -> None:
+        data = load_calibration(self.model_dir)
+        if data is None:
+            return
+        if data.get("model_version") != self.version:
+            log.warning(
+                "calibration.json belongs to %s, not %s; ignoring it", data.get("model_version"), self.version
+            )
+            return
+        try:
+            self._calibrator = Calibrator.from_dict(data)
+        except (KeyError, TypeError, ValueError) as exc:
+            log.warning("invalid calibration.json for %s (%s); ignoring it", self.version, exc)
+            return
+        self.calibration = calibration_summary(data)
 
     # --- profiles --------------------------------------------------------------------------------
     def build_profile(
@@ -133,6 +158,11 @@ class RecommendationEngine:
     # --- recommendations ------------------------------------------------------------------------
     def _to_rec(self, r: RankedItem, profile: UserProfile, rank: int) -> Recommendation:
         ex = explain(r, profile, lambda i: str(self._titles[i]), lambda i: int(self._ids[i]))
+        conf = (
+            self._calibrator.predict(r.score, rank, profile.n_interactions)
+            if self._calibrator is not None
+            else None
+        )
         return Recommendation(
             movie_id=int(self._ids[r.item]),
             title=str(self._titles[r.item]),
@@ -143,6 +173,8 @@ class RecommendationEngine:
             anchor_movie_ids=ex.anchor_movie_ids,
             signals={k: {kk: round(vv, 6) for kk, vv in v.items()} for k, v in r.signals.items()},
             rank=rank,
+            confidence=None if conf is None else round(conf, 4),
+            confidence_kind=None if conf is None else "probability",
         )
 
     def recommend(
@@ -244,4 +276,5 @@ class RecommendationEngine:
             "itemknn_nnz": int(self.itemknn.sim.nnz),
             "load_seconds": round(self.load_seconds, 3),
             "dataset_version": self.manifest.get("dataset_version"),
+            "calibration": self.calibration,
         }

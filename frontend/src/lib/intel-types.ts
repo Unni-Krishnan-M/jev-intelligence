@@ -1,11 +1,12 @@
 /**
- * Types for the intelligence layer (`/intel/*`). They mirror docs/intelligence.md sections 4 and 6
- * field for field; change them only when the contract changes.
+ * Types for the intelligence layer (`/intel/*`). They mirror docs/intelligence.md sections 4, 6 and
+ * 9 field for field; change them only when the contract changes.
  */
 
 export type Severity = "low" | "medium" | "high" | "critical";
 export type Direction = "up" | "down" | "flat";
-export type ConfidenceKind = "probability" | "margin" | "rule";
+/** `interval` (v1.1): confidence is the nominal coverage of a score decision's answer_interval. */
+export type ConfidenceKind = "probability" | "margin" | "rule" | "interval";
 export type SystemStatus = "nominal" | "watch" | "alert";
 
 export interface Evidence {
@@ -251,9 +252,12 @@ export interface Decision {
   spec_id: string;
   policy_version: string;
   question: string;
-  kind: "boolean" | "choice" | "score";
+  kind: DecisionKind;
+  /** [] for a score decision */
   options: string[];
-  answer: string | null;
+  /** a number for a score decision, an option otherwise; null when abstained */
+  answer: string | number | null;
+  /** {} for a score decision */
   option_scores: Record<string, number>;
   confidence: number | null;
   confidence_kind: ConfidenceKind;
@@ -265,6 +269,43 @@ export interface Decision {
   fallback_reason: string | null;
   entity_type: string;
   entity: string;
+  /** v1.1: the multi-question call this decision was answered in; null when asked alone */
+  batch_id?: string | null;
+  /** v1.1, score decisions only */
+  scale?: DecisionScale | null;
+  /** v1.1, score decisions only: [lo, hi] at `confidence` nominal coverage */
+  answer_interval?: [number, number] | null;
+}
+
+export type DecisionKind = "boolean" | "choice" | "score";
+
+export interface DecisionScale {
+  min: number;
+  max: number;
+  unit: string;
+}
+
+/** A multi-question call: several bounded questions answered against one hashed state (9.1). */
+export interface DecisionBatch {
+  id: string;
+  name: string;
+  question: string;
+  keys: string[];
+  decision_ids: string[];
+  /** sha1 of the shared input state */
+  state_hash: string;
+  policy_versions: Record<string, string>;
+  /** backend additions: the shared state's top-level keys and how the call went */
+  state_keys?: string[];
+  n_decisions?: number;
+  n_abstained?: number;
+  status?: "ok" | "failed";
+  failure_reason?: string | null;
+}
+
+/** GET /intel/decisions/batches?run_id= */
+export interface DecisionBatchList {
+  items: DecisionBatch[];
 }
 
 /** Decision as stored in the log (GET /intel/decisions). */
@@ -582,3 +623,154 @@ export interface EvaluationResponse {
 
 /** GET /admin/metrics: in-process counters. Only the groups are named by the contract. */
 export type AdminMetrics = Record<string, unknown>;
+
+// ---- v1.1 (section 9.3) ----------------------------------------------------------------------
+
+export type EvidenceOwnerType = "signal" | "trend" | "anomaly" | "forecast" | "risk" | "decision" | "warning" | "action";
+
+/** GET /intel/evidence row: an Evidence item with the object it belongs to. */
+export interface EvidenceRow extends Evidence {
+  id: number;
+  owner_type: EvidenceOwnerType;
+  owner_id: string;
+  owner_title: string;
+  run_id: string;
+}
+
+export type HistoryEntity = "signals" | "risks" | "trends" | "anomalies";
+
+/** One run's reading of an object, oldest → newest across runs. */
+export interface HistoryPoint {
+  run_id: string;
+  as_of: string;
+  created_at: string;
+  value: number | null;
+  score: number | null;
+  level: string | null;
+  direction: string | null;
+}
+
+/** GET /intel/history/{entity}?key= */
+export interface HistoryResponse {
+  entity: HistoryEntity;
+  key: string;
+  items: HistoryPoint[];
+}
+
+/**
+ * Recommendation calibration (the metrics part of models/<version>/calibration.json). The contract
+ * only promises "metrics"; the ML side nests them per split (validation, test.<protocol>), so every
+ * field is optional and the console reads it through calibrationView().
+ */
+export interface CalibrationMetrics {
+  n?: number | null;
+  ece?: number | null;
+  brier?: number | null;
+  base_rate_brier?: number | null;
+  auc?: number | null;
+  observed_rate?: number | null;
+  mean_predicted?: number | null;
+  reliability?: CalibrationBin[] | null;
+  bins?: CalibrationBin[] | null;
+  primary?: boolean;
+  [k: string]: unknown;
+}
+
+export interface RecCalibration extends CalibrationMetrics {
+  method?: string | null;
+  target?: string | null;
+  fitted_on?: string | Record<string, unknown> | null;
+  created_at?: string | null;
+  validation?: CalibrationMetrics | null;
+  test?: Record<string, CalibrationMetrics | string> | CalibrationMetrics | null;
+  /** the held-out figures the ML side leads with (split + stratum named inside) */
+  headline?: (CalibrationMetrics & { split?: string; stratum?: string }) | null;
+  /** one calibrator per profile-size stratum */
+  strata?: CalibrationStratum[] | null;
+  assumptions?: string[] | null;
+}
+
+export interface CalibrationStratum {
+  name: string;
+  applies_to?: { min: number; max: number | null; unit: string } | null;
+  feature?: string | null;
+  base_rate?: number | null;
+  validation?: CalibrationMetrics | null;
+  test?: CalibrationMetrics | null;
+}
+
+export interface RecFeedbackTotals {
+  like: number;
+  dislike: number;
+  not_interested: number;
+  clicked: number;
+}
+
+export interface ReasonCodeStats extends RecFeedbackTotals {
+  code: string;
+  served: number;
+  positive_rate: number | null;
+}
+
+export interface ServedRecommendation {
+  id: number;
+  user_id: number;
+  movie_id: number;
+  title: string;
+  rank: number;
+  score: number;
+  confidence: number | null;
+  confidence_kind: "probability" | null;
+  reason: string;
+  reason_code: string;
+  created_at: string;
+}
+
+/** GET /intel/recommendations: recommender monitoring. */
+export interface RecommenderMonitoring {
+  model_version: string | null;
+  calibration: RecCalibration | null;
+  served: { total: number; per_day: { date: string; count: number }[] };
+  feedback_totals: RecFeedbackTotals;
+  reason_codes: ReasonCodeStats[];
+  confidence_histogram: { bin: string; n: number }[];
+  recent: ServedRecommendation[];
+}
+
+/** GET /admin/audit row = the audit_logs columns. */
+export interface AuditEntry {
+  id: number;
+  at: string;
+  actor_user_id: number | null;
+  actor: string | null;
+  action: string;
+  target_type: string | null;
+  target_id: string | null;
+  detail: Record<string, unknown> | null;
+  request_id: string | null;
+}
+
+/** GET /admin/audit. Page<AuditEntry>; the run fields do not apply. */
+export type AuditPage = Pick<Page<AuditEntry>, "items" | "total"> & Partial<Pick<Page<AuditEntry>, "limit" | "offset">>;
+
+export interface EvaluationRunSummary {
+  id: number;
+  run_dir: string;
+  created_at: string;
+  pipeline_version: string;
+  data_version: string;
+  headline: {
+    median_mase: number | null;
+    share_beating_naive: number | null;
+    lapse_auc: number | null;
+    lapse_ece: number | null;
+    shilling_auc_mean: number | null;
+    pipeline_ms_mean: number | null;
+  };
+}
+
+/** GET /intel/evaluation/runs */
+export interface EvaluationRunList {
+  items: EvaluationRunSummary[];
+  total: number;
+}

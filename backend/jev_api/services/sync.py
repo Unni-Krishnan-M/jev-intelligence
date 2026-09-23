@@ -1,11 +1,13 @@
-"""Idempotent sync of files → database: movie catalog, model versions, experiments + metrics."""
+"""Idempotent sync of files → database: movie catalog, model versions, experiments + metrics,
+intelligence evaluation runs."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,7 @@ from jev_api.models import (
     EvaluationMetric,
     Experiment,
     Genre,
+    IntelEvaluationRun,
     ModelVersion,
     Movie,
     MovieGenre,
@@ -159,6 +162,72 @@ def sync_experiments(db: Session) -> int:
     return n
 
 
+def _parse_ts(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
+
+
+def _mean(values: list[Any]) -> float | None:
+    nums = [float(v) for v in values if isinstance(v, int | float) and not isinstance(v, bool)]
+    return round(sum(nums) / len(nums), 4) if nums else None
+
+
+def intel_eval_headline(report: dict[str, Any]) -> dict[str, float | None]:
+    """The few numbers the console compares across evaluation runs (null when a part is missing)."""
+    fc = (report.get("forecast") or {}).get("summary") or {}
+    lapse = (report.get("lapse") or {}).get("metrics") or {}
+    attacks = ((report.get("anomaly") or {}).get("injection") or {}).get("attack_types") or []
+    return {
+        "median_mase": fc.get("median_mase"),
+        "share_beating_naive": fc.get("share_beating_naive"),
+        "lapse_auc": lapse.get("auc"),
+        "lapse_ece": lapse.get("ece"),
+        "shilling_auc_mean": _mean([a.get("auc") for a in attacks if isinstance(a, dict)]),
+        "pipeline_ms_mean": (report.get("latency") or {}).get("pipeline_ms_mean"),
+    }
+
+
+def sync_intel_evaluations(db: Session, experiments_dir: Path | None = None) -> int:
+    """experiments/intel-eval-*/report.json → intel_evaluation_runs. A changed file is re-synced
+    (sha1); an unreadable one is logged and skipped. Returns the number of rows added or updated."""
+    base = experiments_dir or get_settings().experiments_dir
+    n = 0
+    for path in sorted(base.glob("intel-eval-*/report.json")):
+        raw = path.read_bytes()
+        digest = hashlib.sha1(raw).hexdigest()  # noqa: S324 - change detection, not security
+        row = db.scalar(select(IntelEvaluationRun).where(IntelEvaluationRun.run_dir == path.parent.name))
+        if row is not None and row.report_sha1 == digest:
+            continue
+        try:
+            report = json.loads(raw, parse_constant=lambda _: None)  # NaN/Infinity -> null
+            if not isinstance(report, dict):
+                raise ValueError("report is not an object")
+        except ValueError:
+            log.warning("unreadable intelligence evaluation report %s", path.parent.name)
+            continue
+        if row is None:
+            row = IntelEvaluationRun(run_dir=path.parent.name[:120])
+            db.add(row)
+        row.created_at = _parse_ts(report.get("created_at"))
+        row.pipeline_version = (
+            str(report["pipeline_version"])[:40] if report.get("pipeline_version") else None
+        )
+        row.data_version = str(report["data_version"])[:120] if report.get("data_version") else None
+        row.as_of = _parse_ts(report.get("as_of"))
+        row.headline = intel_eval_headline(report)
+        row.report_sha1 = digest
+        row.report = report
+        row.synced_at = datetime.now(UTC)
+        n += 1
+    db.commit()
+    return n
+
+
 def ensure_admin(db: Session) -> None:
     s = get_settings()
     if not s.admin_email or not s.admin_password:
@@ -187,4 +256,5 @@ def sync_all(db: Session) -> dict[str, int]:
         "movies": seed_catalog(db),
         "model_versions": sync_model_versions(db),
         "experiments": sync_experiments(db),
+        "intel_evaluations": sync_intel_evaluations(db),
     }

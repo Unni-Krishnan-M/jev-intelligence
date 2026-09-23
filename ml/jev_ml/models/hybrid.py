@@ -35,14 +35,6 @@ from jev_ml.models.popularity import PopularityRecommender
 from jev_ml.signals import UserProfile
 
 SIGNALS = ("content", "collaborative", "latent", "popularity", "preference", "recency")
-SIGNAL_LABELS = {
-    "content": "content_similarity",
-    "collaborative": "collaborative_score",
-    "latent": "latent_factor_score",
-    "popularity": "popularity_score",
-    "preference": "user_preference_score",
-    "recency": "recency_score",
-}
 
 
 @dataclass

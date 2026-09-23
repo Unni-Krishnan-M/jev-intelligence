@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     cors_origins: Annotated[list[str], NoDecode] = ["http://localhost:3000", "http://127.0.0.1:3000"]
     rate_limit_per_minute: int = 240
     auth_rate_limit_per_minute: int = 20
+    # POST /intel/runs costs about 1 s of CPU and a few hundred rows; one run at a time (lock) and
+    # at most this many per client per minute
+    intel_run_rate_limit_per_minute: int = 10
     admin_email: str | None = None
     admin_password: SecretStr | None = None
     models_dir: Path = MODELS_DIR
@@ -39,7 +42,11 @@ class Settings(BaseSettings):
     recommendation_cache_seconds: int = 300
     log_level: str = "INFO"
     auto_migrate: bool = True  # run `alembic upgrade head` on startup
-    trust_proxy: bool = False  # honour X-Forwarded-For (only behind a trusted reverse proxy)
+    # Deployed behind a reverse proxy. The app never parses X-Forwarded-For itself: the client address
+    # comes from uvicorn, which rewrites it only for peers in --forwarded-allow-ips /
+    # FORWARDED_ALLOW_IPS (see deps.client_address). With this flag set, startup warns when that list
+    # trusts every peer ("*").
+    trust_proxy: bool = False
     # intelligence layer (docs/intelligence.md)
     intel_run_on_startup: bool = True  # refresh a missing/stale run in a background thread at startup
     intel_min_interval_hours: float = Field(24.0, ge=0)  # "stale" = latest successful run older than this

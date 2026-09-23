@@ -127,8 +127,3 @@ def build_series(prep: Prepared, cfg: IntelConfig) -> list[Series]:
             Series(f"rating:genre:{g}", "rating", g, "genre", "mean rating", months, mean_r, partial, gv)
         )
     return out
-
-
-def last_complete_month(series: Series) -> pd.Period:
-    months, _, _ = series.complete()
-    return months[-1]

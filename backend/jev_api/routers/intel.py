@@ -2,34 +2,50 @@
 
 Run-backed lists (signals, trends, anomalies, risks, actions, predictions, series) read the latest
 successful run, or `?run_id=`. DB-backed resources (runs, warnings, decisions, feedback, scenarios)
-come from the intel_* tables.
+come from the intel_* tables. v1.1 (section 9.3): evidence and history read the normalised tables,
+recommendation monitoring reads recommendations + recommendation_feedback, evaluation runs are
+synced from experiments/intel-eval-*.
 """
 
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
-from typing import Any, Literal
+import time
+from datetime import UTC, datetime, timedelta
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
-from sqlalchemy import func, select, text
+from fastapi import APIRouter, HTTPException, Path, Query, Request, status
+from sqlalchemy import case, func, or_, select, text
 from sqlalchemy.orm import Session, selectinload
 
-from jev_api.deps import DB, AdminUser
+from jev_api.deps import DB, MAX_OFFSET, AdminUser, IdPath, parse_db_id
 from jev_api.models import (
     FEEDBACK_VERDICTS,
+    IntelAnomalyRow,
     IntelDecision,
+    IntelEvaluationRun,
+    IntelEvidenceRow,
     IntelFeedback,
+    IntelRiskRow,
     IntelRun,
     IntelScenario,
+    IntelSignalRow,
+    IntelTrendRow,
     IntelWarning,
+    Recommendation,
 )
 from jev_api.schemas import (
+    DecisionBatchList,
+    EvaluationRunList,
+    EvidenceOwner,
+    HistoryEntity,
     IntelDecisionList,
     IntelDecisionOut,
+    IntelEvidencePage,
     IntelFeedbackIn,
     IntelFeedbackList,
     IntelFeedbackOut,
+    IntelHistory,
     IntelPage,
     IntelRunList,
     IntelRunOut,
@@ -42,6 +58,8 @@ from jev_api.schemas import (
     WarningStatus,
     WarningUpdate,
 )
+from jev_api.services import audit
+from jev_api.services.feedback import feedback_counts, latest_feedback
 from jev_api.services.intel import (
     IntelBusyError,
     IntelInputError,
@@ -53,12 +71,16 @@ from jev_api.services.intel import (
     run_out,
     warning_out,
 )
+from jev_api.services.ml import engine_calibration
+from jev_api.services.sync import sync_intel_evaluations
 
 router = APIRouter(prefix="/intel", tags=["intelligence"])
 
 NO_RUN = "no intelligence run yet"
 Limit = Query(50, ge=1, le=200)
-Offset = Query(0, ge=0)
+Offset = Query(0, ge=0, le=MAX_OFFSET)
+RunId = Query(None, max_length=36)  # a run uuid
+SeriesId = Query(None, max_length=200)
 HISTOGRAM_BINS = 5
 
 
@@ -67,16 +89,20 @@ def _service(request: Request) -> IntelService:
     return svc
 
 
-def _run_and_result(db: Session, svc: IntelService, run_id: str | None) -> tuple[IntelRun, dict[str, Any]]:
+def _resolve_run(db: Session, svc: IntelService, run_id: str | None) -> IntelRun:
     if run_id:
         run = db.scalar(select(IntelRun).where(IntelRun.run_id == run_id))
         if run is None or run.status != "succeeded":
             raise HTTPException(status.HTTP_404_NOT_FOUND, "intelligence run not found")
-    else:
-        latest = svc.latest_run(db)
-        if latest is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, NO_RUN)
-        run = latest
+        return run
+    latest = svc.latest_run(db)
+    if latest is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, NO_RUN)
+    return latest
+
+
+def _run_and_result(db: Session, svc: IntelService, run_id: str | None) -> tuple[IntelRun, dict[str, Any]]:
+    run = _resolve_run(db, svc, run_id)
     return run, svc.result_for(db, run)
 
 
@@ -108,7 +134,16 @@ def list_runs(_: AdminUser, db: DB, limit: int = Limit, offset: int = Offset) ->
 @router.post("/runs", response_model=IntelRunOut)
 def trigger_run(body: RunTrigger, user: AdminUser, request: Request) -> dict[str, Any]:
     """Runs synchronously (a few seconds) and returns the finished run; failures come back as a
-    run with status "failed" and its error text."""
+    run with status "failed" and its error text. Limited per admin (not per IP, so anonymous
+    traffic behind the same proxy cannot use up an operator's budget) on top of the one-run lock."""
+    window = int(time.time() // 60)
+    count = request.app.state.cache.incr_window(f"rl:intel_run:{user.id}:{window}", 60)
+    if count > request.app.state.settings.intel_run_rate_limit_per_minute:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "too many intelligence runs; try again in a minute",
+            headers={"Retry-After": str(60 - int(time.time()) % 60)},
+        )
     try:
         run = _service(request).run("manual", body.as_of, user)
     except IntelBusyError as exc:
@@ -119,9 +154,11 @@ def trigger_run(body: RunTrigger, user: AdminUser, request: Request) -> dict[str
 
 
 @router.get("/runs/{run_ref}", response_model=IntelRunOut)
-def get_run(run_ref: str, _: AdminUser, db: DB) -> dict[str, Any]:
-    q = select(IntelRun).where(IntelRun.id == int(run_ref)) if run_ref.isdigit() else None
-    run = db.scalar(q if q is not None else select(IntelRun).where(IntelRun.run_id == run_ref))
+def get_run(run_ref: Annotated[str, Path(max_length=64)], _: AdminUser, db: DB) -> dict[str, Any]:
+    pk = parse_db_id(run_ref)
+    run = db.scalar(
+        select(IntelRun).where(IntelRun.id == pk if pk is not None else IntelRun.run_id == run_ref)
+    )
     if run is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "intelligence run not found")
     return run_out(run)
@@ -133,7 +170,7 @@ def signals(
     _: AdminUser,
     db: DB,
     request: Request,
-    run_id: str | None = None,
+    run_id: str | None = RunId,
     kind: str | None = Query(None, max_length=32),
     entity_type: str | None = Query(None, max_length=32),
     direction: Literal["up", "down", "flat"] | None = None,
@@ -150,7 +187,7 @@ def trends(
     _: AdminUser,
     db: DB,
     request: Request,
-    run_id: str | None = None,
+    run_id: str | None = RunId,
     direction: Literal["up", "down", "flat"] | None = None,
     metric: str | None = Query(None, max_length=32),
     entity: str | None = Query(None, max_length=200),
@@ -167,7 +204,7 @@ def anomalies(
     _: AdminUser,
     db: DB,
     request: Request,
-    run_id: str | None = None,
+    run_id: str | None = RunId,
     kind: str | None = Query(None, max_length=32),
     severity: Severity | None = None,
     entity_type: str | None = Query(None, max_length=32),
@@ -185,7 +222,7 @@ def risks(
     _: AdminUser,
     db: DB,
     request: Request,
-    run_id: str | None = None,
+    run_id: str | None = RunId,
     kind: str | None = Query(None, max_length=40),
     level: Severity | None = None,
     limit: int = Limit,
@@ -200,7 +237,7 @@ def actions(
     _: AdminUser,
     db: DB,
     request: Request,
-    run_id: str | None = None,
+    run_id: str | None = RunId,
     priority: Literal["P1", "P2", "P3"] | None = None,
     limit: int = Limit,
     offset: int = Offset,
@@ -211,7 +248,7 @@ def actions(
 
 @router.get("/predictions")
 def predictions(
-    _: AdminUser, db: DB, request: Request, run_id: str | None = None, series_id: str | None = None
+    _: AdminUser, db: DB, request: Request, run_id: str | None = RunId, series_id: str | None = SeriesId
 ) -> dict[str, Any]:
     run, res = _run_and_result(db, _service(request), run_id)
     pred = res.get("predictions") or {}
@@ -223,7 +260,11 @@ def predictions(
 
 @router.get("/series/{series_id:path}")
 def series(
-    series_id: str, _: AdminUser, db: DB, request: Request, run_id: str | None = None
+    series_id: Annotated[str, Path(max_length=200)],
+    _: AdminUser,
+    db: DB,
+    request: Request,
+    run_id: str | None = RunId,
 ) -> dict[str, Any]:
     """A series with its trend, anomalies and forecast (ids contain colons: volume:genre:Drama)."""
     run, res = _run_and_result(db, _service(request), run_id)
@@ -346,13 +387,13 @@ def _warning(db: Session, warning_id: int) -> IntelWarning:
 
 
 @router.get("/warnings/{warning_id}", response_model=IntelWarningOut)
-def get_warning(warning_id: int, _: AdminUser, db: DB) -> dict[str, Any]:
+def get_warning(warning_id: IdPath, _: AdminUser, db: DB) -> dict[str, Any]:
     return warning_out(_warning(db, warning_id), history=True)
 
 
 @router.patch("/warnings/{warning_id}", response_model=IntelWarningOut)
 def update_warning(
-    warning_id: int, body: WarningUpdate, user: AdminUser, db: DB, request: Request
+    warning_id: IdPath, body: WarningUpdate, user: AdminUser, db: DB, request: Request
 ) -> dict[str, Any]:
     w = _warning(db, warning_id)
     try:
@@ -383,6 +424,7 @@ def list_decisions(
     key: str | None = Query(None, max_length=64),
     run_id: str | None = Query(None, max_length=36),
     entity: str | None = Query(None, max_length=200),
+    batch_id: str | None = Query(None, max_length=64),
     limit: int = Limit,
     offset: int = Offset,
 ) -> dict[str, Any]:
@@ -393,6 +435,8 @@ def list_decisions(
         q = q.where(IntelDecision.run_id == run_id)
     if entity:
         q = q.where(IntelDecision.entity == entity)
+    if batch_id:
+        q = q.where(IntelDecision.batch_id == batch_id)
     total = db.scalar(select(func.count()).select_from(q.subquery())) or 0
     rows = db.scalars(q.order_by(IntelDecision.id.desc()).limit(limit).offset(offset)).all()
     fb = _decision_feedback(db, [d.decision_id for d in rows])
@@ -404,11 +448,52 @@ def list_decisions(
     }
 
 
+@router.get("/decisions/batches", response_model=DecisionBatchList)
+def decision_batches(
+    _: AdminUser, db: DB, request: Request, run_id: str | None = Query(None, max_length=36)
+) -> dict[str, Any]:
+    """The run's multi-question decision calls (section 9.1). Declared before /decisions/{ref}."""
+    run, res = _run_and_result(db, _service(request), run_id)
+    batches = res.get("decision_batches")
+    if not isinstance(batches, list):
+        # a result without decision_batches: rebuild the groups from the stored batch ids
+        grouped: dict[str, dict[str, Any]] = {}
+        for bid, did, key, pv in db.execute(
+            select(
+                IntelDecision.batch_id,
+                IntelDecision.decision_id,
+                IntelDecision.key,
+                IntelDecision.policy_version,
+            )
+            .where(IntelDecision.run_id == run.run_id, IntelDecision.batch_id.is_not(None))
+            .order_by(IntelDecision.id)
+        ):
+            b = grouped.setdefault(
+                bid,
+                {
+                    "id": bid,
+                    "name": None,
+                    "question": None,
+                    "keys": [],
+                    "decision_ids": [],
+                    "state_hash": None,
+                    "policy_versions": {},
+                },
+            )
+            b["decision_ids"].append(did)
+            if key not in b["keys"]:
+                b["keys"].append(key)
+            b["policy_versions"][key] = pv
+        batches = list(grouped.values())
+    return {"items": batches, "run_id": run.run_id, "as_of": iso(run.as_of)}
+
+
 @router.get("/decisions/{decision_ref}", response_model=IntelDecisionOut)
-def get_decision(decision_ref: str, _: AdminUser, db: DB) -> dict[str, Any]:
+def get_decision(decision_ref: Annotated[str, Path(max_length=64)], _: AdminUser, db: DB) -> dict[str, Any]:
     """By db_id, or by contract id ("dec-…": the most recent run's copy of that decision)."""
-    if decision_ref.isdigit():
-        d = db.get(IntelDecision, int(decision_ref))
+    pk = parse_db_id(decision_ref)
+    if pk is not None:
+        d = db.get(IntelDecision, pk)
     else:
         d = db.scalar(
             select(IntelDecision)
@@ -455,7 +540,8 @@ def record_feedback(body: IntelFeedbackIn, user: AdminUser, db: DB, request: Req
         )
         found = run_id is not None
     elif body.target_type == "warning":
-        found = tid.isdigit() and db.get(IntelWarning, int(tid)) is not None
+        pk = parse_db_id(tid)
+        found = pk is not None and db.get(IntelWarning, pk) is not None
     else:
         latest = svc.latest_run(db)
         res = svc.result_for(db, latest) if latest else {}
@@ -478,6 +564,15 @@ def record_feedback(body: IntelFeedbackIn, user: AdminUser, db: DB, request: Req
         run_id=run_id,
     )
     db.add(f)
+    db.flush()
+    audit.record(
+        db,
+        "feedback.create",
+        user,
+        body.target_type,
+        tid,
+        {"feedback_id": f.id, "verdict": body.verdict, "run_id": run_id, "has_note": bool(body.note)},
+    )
     db.commit()
     return _feedback_out(f)
 
@@ -546,6 +641,15 @@ def create_scenario(body: ScenarioRequest, user: AdminUser, db: DB, request: Req
             created_by_id=user.id,
         )
         db.add(row)
+        db.flush()
+        audit.record(
+            db,
+            "scenario.save",
+            user,
+            "intel_scenario",
+            row.id,
+            {"title": row.title, "series_id": row.series_id, "n_scenarios": len(out.get("scenarios", []))},
+        )
         db.commit()
         saved_id = row.id
     return {**out, "id": saved_id}
@@ -590,8 +694,285 @@ def evaluation(_: AdminUser, request: Request) -> dict[str, Any]:
         return {"available": False, "run_dir": None, "report": None}
     latest = runs[-1]
     try:
-        report = json.loads((latest / "report.json").read_text())
+        # NaN/Infinity -> null, as in sync_intel_evaluations (a JSON response cannot carry them)
+        report = json.loads((latest / "report.json").read_text(), parse_constant=lambda _: None)
     except (OSError, ValueError):
         request.app.state.log.exception("unreadable intelligence evaluation report")
         return {"available": False, "run_dir": latest.name, "report": None}
     return {"available": True, "run_dir": latest.name, "report": report}
+
+
+@router.get("/evaluation/runs", response_model=EvaluationRunList)
+def evaluation_runs(_: AdminUser, db: DB, request: Request) -> dict[str, Any]:
+    """Every offline evaluation run, newest first, with its headline numbers. Synced from
+    experiments/intel-eval-*/report.json on each call (unchanged files are skipped)."""
+    try:
+        sync_intel_evaluations(db, request.app.state.settings.experiments_dir)
+    except OSError:
+        db.rollback()
+        request.app.state.log.exception("intelligence evaluation sync failed")
+    rows = db.scalars(select(IntelEvaluationRun).order_by(IntelEvaluationRun.run_dir.desc())).all()
+    items = [
+        {
+            "id": r.id,
+            "run_dir": r.run_dir,
+            "created_at": iso(r.created_at),
+            "pipeline_version": r.pipeline_version,
+            "data_version": r.data_version,
+            "headline": r.headline or {},
+        }
+        for r in rows
+    ]
+    return {"items": items, "total": len(items)}
+
+
+# --- v1.1: evidence and history (normalised tables, section 9.3) -------------------------------------
+def _like(term: str) -> str:
+    # parameterized LIKE (SQLAlchemy binds the value); escape LIKE wildcards in user input
+    return "%" + term.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def _evidence_out(e: IntelEvidenceRow, run_uuid: str) -> dict[str, Any]:
+    return {
+        "id": e.id,
+        "kind": e.kind,
+        "label": e.label,
+        "value": e.value_num if e.value_num is not None else e.value_text,
+        "detail": e.detail,
+        "ref": e.ref,
+        "owner_type": e.owner_type,
+        "owner_id": e.owner_id,
+        "owner_title": e.owner_title,
+        "position": e.position,
+        "run_id": run_uuid,
+    }
+
+
+@router.get("/evidence", response_model=IntelEvidencePage)
+def evidence(
+    _: AdminUser,
+    db: DB,
+    request: Request,
+    run_id: str | None = RunId,
+    owner_type: EvidenceOwner | None = None,
+    owner_id: str | None = Query(None, max_length=200),
+    kind: str | None = Query(None, max_length=16),
+    q: str | None = Query(None, min_length=1, max_length=100),
+    limit: int = Limit,
+    offset: int = Offset,
+) -> dict[str, Any]:
+    """Every Evidence item of the latest (or `?run_id=`) run with its owner; `q` searches the label,
+    detail and owner title (case-insensitive)."""
+    run = _resolve_run(db, _service(request), run_id)
+    query = select(IntelEvidenceRow).where(IntelEvidenceRow.run_id == run.id)
+    if owner_type:
+        query = query.where(IntelEvidenceRow.owner_type == owner_type)
+    if owner_id:
+        query = query.where(IntelEvidenceRow.owner_id == owner_id)
+    if kind:
+        query = query.where(IntelEvidenceRow.kind == kind)
+    if q and q.strip():
+        term = _like(q.strip())
+        query = query.where(
+            or_(
+                func.lower(IntelEvidenceRow.label).like(term, escape="\\"),
+                func.lower(IntelEvidenceRow.detail).like(term, escape="\\"),
+                func.lower(IntelEvidenceRow.owner_title).like(term, escape="\\"),
+            )
+        )
+    total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    rows = db.scalars(query.order_by(IntelEvidenceRow.id).limit(limit).offset(offset)).all()
+    return {
+        "items": [_evidence_out(e, run.run_id) for e in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "run_id": run.run_id,
+        "as_of": iso(run.as_of),
+    }
+
+
+_ANOMALY_DIRECTION = {"series_spike": "up", "series_drop": "down"}
+
+
+def _history_point(entity: str, row: Any) -> dict[str, Any]:
+    """value / score / level / direction per entity (docs/api.md lists the mapping)."""
+    if entity == "signals":
+        return {
+            "id": row.signal_id,
+            "observed_at": iso(row.observed_at),
+            "value": row.value,
+            "score": row.strength,
+            "level": None,
+            "direction": row.direction,
+        }
+    if entity == "risks":
+        return {
+            "id": row.risk_id,
+            "observed_at": None,
+            "value": row.exposure,
+            "score": row.score,
+            "level": row.level,
+            "direction": None,
+        }
+    if entity == "trends":
+        return {
+            "id": row.trend_id,
+            "observed_at": None,
+            "value": row.slope,
+            "score": row.evidence_strength,
+            "level": None,
+            "direction": row.direction,
+        }
+    return {
+        "id": row.anomaly_id,
+        "observed_at": iso(row.detected_at),
+        "value": row.value,
+        "score": row.score,
+        "level": row.severity,
+        "direction": _ANOMALY_DIRECTION.get(row.kind),
+    }
+
+
+# entity -> (table, key column, object id column)
+HISTORY: dict[str, tuple[Any, Any, Any]] = {
+    "signals": (IntelSignalRow, IntelSignalRow.dedup_key, IntelSignalRow.signal_id),
+    "risks": (IntelRiskRow, IntelRiskRow.key, IntelRiskRow.risk_id),
+    "trends": (IntelTrendRow, IntelTrendRow.series_id, IntelTrendRow.trend_id),
+    "anomalies": (IntelAnomalyRow, IntelAnomalyRow.dedup_key, IntelAnomalyRow.anomaly_id),
+}
+
+
+@router.get("/history/{entity}", response_model=IntelHistory)
+def history(
+    entity: HistoryEntity,
+    _: AdminUser,
+    db: DB,
+    key: str = Query(..., min_length=1, max_length=200),
+    limit: int = Query(100, ge=1, le=500),
+) -> dict[str, Any]:
+    """One object across successful runs, oldest -> newest (the most recent `limit` points).
+    `key` = signal/anomaly dedup_key, trend series_id, risk key (risk:<kind>:<entity>), or any
+    object id of that entity, which resolves to its key."""
+    model, key_col, id_col = HISTORY[entity]
+    resolved = key
+    if db.scalar(select(func.count()).select_from(model).where(key_col == key)) == 0:
+        by_id = db.scalar(select(key_col).where(id_col == key).limit(1))
+        resolved = by_id if by_id is not None else key
+    rows = db.execute(
+        select(model, IntelRun)
+        .join(IntelRun, model.run_id == IntelRun.id)
+        .where(key_col == resolved, IntelRun.status == "succeeded")
+        .order_by(IntelRun.started_at.desc(), IntelRun.id.desc(), model.id.desc())
+        .limit(limit)
+    ).all()
+    items = [
+        {
+            "run_id": run.run_id,
+            "as_of": iso(run.as_of),
+            "created_at": iso(run.started_at),
+            **_history_point(entity, row),
+        }
+        for row, run in reversed(rows)
+    ]
+    return {"entity": entity, "key": resolved, "items": items}
+
+
+# --- v1.1: recommender monitoring (section 9.3) ------------------------------------------------------
+FEEDBACK_KINDS = ("like", "dislike", "not_interested", "clicked")
+CONFIDENCE_BINS = 10
+SERVED_DAYS = 14
+
+
+def _positive_rate(c: dict[str, int]) -> float | None:
+    # explicit verdicts only: clicks are not a judgement of the recommendation
+    return _ratio(c["like"], c["like"] + c["dislike"] + c["not_interested"])
+
+
+@router.get("/recommendations")
+def recommender_monitoring(
+    _: AdminUser, db: DB, request: Request, recent: int = Query(20, ge=0, le=100)
+) -> dict[str, Any]:
+    """Serving volume, feedback by reason code, the confidence distribution of served items and the
+    active model's calibration (null until models/<version>/calibration.json exists)."""
+    engine = request.app.state.engines.engine
+    since = datetime.now(UTC) - timedelta(days=SERVED_DAYS)
+    day = func.date(Recommendation.created_at)
+    per_day = db.execute(
+        select(day, func.count()).where(Recommendation.created_at >= since).group_by(day).order_by(day)
+    ).all()
+    served_total = db.scalar(select(func.count(Recommendation.id))) or 0
+    with_conf = db.scalar(select(func.count(Recommendation.id)).where(Recommendation.confidence.is_not(None)))
+    totals = dict.fromkeys(FEEDBACK_KINDS, 0)
+    # distinct verdicts: the newest verdict (and click) per member per movie, however often it was sent
+    for kind, n in db.execute(feedback_counts()):
+        totals[kind] = int(n)
+    codes: dict[str, dict[str, Any]] = {}
+    for code, n in db.execute(
+        select(Recommendation.reason_code, func.count()).group_by(Recommendation.reason_code)
+    ):
+        codes[code] = {"code": code, "served": int(n), **dict.fromkeys(FEEDBACK_KINDS, 0)}
+    # feedback attributed to a served recommendation (recommendation_id set)
+    latest = latest_feedback()
+    for code, kind, n in db.execute(
+        select(Recommendation.reason_code, latest.c.feedback, func.count())
+        .join(Recommendation, latest.c.recommendation_id == Recommendation.id)
+        .group_by(Recommendation.reason_code, latest.c.feedback)
+    ):
+        codes.setdefault(code, {"code": code, "served": 0, **dict.fromkeys(FEEDBACK_KINDS, 0)})[kind] = int(n)
+    reason_codes = sorted(
+        ({**c, "positive_rate": _positive_rate(c)} for c in codes.values()),
+        key=lambda c: (-c["served"], c["code"]),
+    )
+    # CASE buckets, portable across SQLite and PostgreSQL (CAST rounds on PostgreSQL)
+    # edges as i / n, not i * (1 / n): 7 * 0.1 > 0.7 would put 0.7 in the 0.6-0.7 bin
+    edges = [i / CONFIDENCE_BINS for i in range(CONFIDENCE_BINS + 1)]
+    bucket = case(
+        *[(Recommendation.confidence < edges[i + 1], i) for i in range(CONFIDENCE_BINS - 1)],
+        else_=CONFIDENCE_BINS - 1,
+    )
+    counts = [0] * CONFIDENCE_BINS
+    for b, n in db.execute(
+        select(bucket, func.count()).where(Recommendation.confidence.is_not(None)).group_by(bucket)
+    ):
+        counts[int(b)] = int(n)
+    rows = (
+        db.scalars(
+            select(Recommendation)
+            .order_by(Recommendation.created_at.desc(), Recommendation.id.desc())
+            .limit(recent)
+        ).all()
+        if recent
+        else []
+    )
+    return {
+        "model_version": engine.version if engine is not None else None,
+        "calibration": engine_calibration(engine),
+        "served": {
+            "total": served_total,
+            "with_confidence": with_conf or 0,
+            "per_day": [{"date": str(d), "count": c} for d, c in per_day],
+        },
+        "feedback_totals": totals,
+        "reason_codes": reason_codes,
+        "confidence_histogram": [
+            {"bin": f"{edges[i]:.1f}-{edges[i + 1]:.1f}", "n": n} for i, n in enumerate(counts)
+        ],
+        "recent": [
+            {
+                "id": r.id,
+                "user_id": r.user_id,
+                "movie_id": r.movie_id,
+                "title": r.movie.title,
+                "rank": r.rank,
+                "score": r.score,
+                "confidence": r.confidence,
+                "confidence_kind": r.confidence_kind,
+                "reason": r.reason,
+                "reason_code": r.reason_code,
+                "model_version": r.model_version,
+                "created_at": iso(r.created_at),
+            }
+            for r in rows
+        ],
+    }

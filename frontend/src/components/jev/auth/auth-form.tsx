@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useSession } from "@/hooks/use-session";
 import { api, errorMessage } from "@/lib/api";
+import { safeNextPath } from "@/lib/safe-redirect";
 import type { User } from "@/lib/types";
 
 export function AuthForm({ mode }: { mode: "login" | "register" }) {
@@ -35,8 +36,7 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
     try {
       const res = await api<{ user: User }>(`/auth/${mode}`, { json: body });
       await refresh(res.user, { revalidate: false });
-      const next = params.get("next");
-      const safeNext = next && next.startsWith("/") && !next.startsWith("//") ? next : null;
+      const safeNext = safeNextPath(params.get("next"), window.location.origin);
       router.replace(!res.user.onboarding_completed ? "/onboarding" : (safeNext ?? "/home"));
     } catch (err) {
       setError(errorMessage(err));

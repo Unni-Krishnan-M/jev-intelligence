@@ -6,11 +6,11 @@ import useSWR from "swr";
 import { fmtDate, fmtNum, Panel, SpecRows, StatTile } from "@/components/jev/admin/ui";
 import { NamedBars, ReliabilityDiagram, TableView } from "@/components/jev/intel/charts";
 import { PageHeader } from "@/components/jev/intel/page-header";
-import { IntelError, PanelsSkeleton } from "@/components/jev/intel/states";
+import { IntelError, NotDeployedState, PanelsSkeleton, RowsSkeleton } from "@/components/jev/intel/states";
 import { EmptyState, SectionHeader } from "@/components/jev/states";
 import { Button } from "@/components/ui/button";
-import { fmtMs, fmtPct, humanize, orderStages, seriesHref, seriesLabel } from "@/lib/intel";
-import type { EvaluationReport, EvaluationResponse } from "@/lib/intel-types";
+import { fmtMs, fmtPct, humanize, isNotDeployed, orderStages, seriesHref, seriesLabel } from "@/lib/intel";
+import type { EvaluationReport, EvaluationResponse, EvaluationRunList } from "@/lib/intel-types";
 import { cn } from "@/lib/utils";
 
 function Protocol({ text }: { text: string }) {
@@ -236,6 +236,68 @@ function Report({ r }: { r: EvaluationReport }) {
   );
 }
 
+/** Every synced evaluation report (GET /intel/evaluation/runs), newest first, headline figures only. */
+function EvaluationRuns({ current }: { current: string | null }) {
+  const { data, error, mutate } = useSWR<EvaluationRunList>("/intel/evaluation/runs");
+  return (
+    <section aria-labelledby="ev-runs" className="mt-12">
+      <SectionHeader id="ev-runs" kicker="history" title="Evaluation runs" />
+      {error ? (
+        isNotDeployed(error) ? <NotDeployedState what="the evaluation run history (GET /intel/evaluation/runs)" /> : <IntelError error={error} retry={() => mutate()} runBacked={false} />
+      ) : !data ? (
+        <RowsSkeleton rows={3} />
+      ) : data.items.length === 0 ? (
+        <EmptyState title="No evaluation runs recorded" body="Reports under experiments/intel-eval-* are synced into the database when the API starts." />
+      ) : (
+        <>
+          <div className="overflow-x-auto rounded-lg border bg-card">
+            <table className="w-full min-w-[860px] text-sm">
+              <caption className="sr-only">Evaluation runs, newest first</caption>
+              <thead>
+                <tr className="border-b hairline text-left text-xs text-muted-foreground">
+                  <th className="px-4 py-2.5 font-normal">Created</th>
+                  <th className="px-2 py-2.5 font-normal">Versions</th>
+                  <th className="px-2 py-2.5 text-right font-normal">Median MASE ↓</th>
+                  <th className="px-2 py-2.5 text-right font-normal">Beating naive ↑</th>
+                  <th className="px-2 py-2.5 text-right font-normal">Lapse AUC ↑</th>
+                  <th className="px-2 py-2.5 text-right font-normal">Lapse ECE ↓</th>
+                  <th className="px-2 py-2.5 text-right font-normal">Shilling AUC ↑</th>
+                  <th className="px-4 py-2.5 text-right font-normal">Run time</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[...data.items].sort((a, b) => (a.created_at < b.created_at ? 1 : -1)).map((e) => {
+                  const h = e.headline ?? ({} as EvaluationRunList["items"][number]["headline"]);
+                  const isCurrent = current !== null && e.run_dir === current;
+                  return (
+                    <tr key={e.id} className={cn("border-b hairline align-top last:border-0", isCurrent && "bg-accent/40")}>
+                      <td className="px-4 py-2">
+                        <span className="num block text-xs">{fmtDate(e.created_at)}</span>
+                        <span className="block break-all font-mono text-[11px] text-muted-foreground">{e.run_dir}{isCurrent ? " · shown above" : ""}</span>
+                      </td>
+                      <td className="px-2 py-2 font-mono text-[11px] text-ink-2">
+                        <span className="block">{e.pipeline_version}</span>
+                        <span className="block break-all text-muted-foreground">{e.data_version}</span>
+                      </td>
+                      <td className="num px-2 py-2 text-right">{fmtNum(h.median_mase, 2)}</td>
+                      <td className="num px-2 py-2 text-right">{fmtPct(h.share_beating_naive)}</td>
+                      <td className="num px-2 py-2 text-right">{fmtNum(h.lapse_auc, 3)}</td>
+                      <td className="num px-2 py-2 text-right">{fmtNum(h.lapse_ece, 3)}</td>
+                      <td className="num px-2 py-2 text-right">{fmtNum(h.shilling_auc_mean, 3)}</td>
+                      <td className="num px-4 py-2 text-right text-ink-2">{fmtMs(h.pipeline_ms_mean)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-2 text-xs text-muted-foreground">{data.total.toLocaleString()} runs. Figures come from each run&apos;s own report; compare runs only when the data version matches.</p>
+        </>
+      )}
+    </section>
+  );
+}
+
 export default function EvaluationPage() {
   const { data, error, mutate } = useSWR<EvaluationResponse>("/intel/evaluation");
   const r = data?.report ?? null;
@@ -261,6 +323,7 @@ export default function EvaluationPage() {
       ) : (
         <Report r={r} />
       )}
+      {(data || error) && <EvaluationRuns current={data?.run_dir ?? null} />}
     </div>
   );
 }

@@ -6,12 +6,13 @@ import { Panel } from "@/components/jev/admin/ui";
 import { ConfidenceBadge, Meter, SeverityBadge } from "@/components/jev/intel/badges";
 import { RiskMatrix } from "@/components/jev/intel/charts";
 import { EvidenceList } from "@/components/jev/intel/evidence-list";
+import { HistoryTimeline } from "@/components/jev/intel/history-timeline";
 import { PageHeader } from "@/components/jev/intel/page-header";
 import { IntelError, RowsSkeleton } from "@/components/jev/intel/states";
 import { EmptyState } from "@/components/jev/states";
 import { Skeleton } from "@/components/ui/skeleton";
 import { qs } from "@/lib/api";
-import { fmtValue, humanize } from "@/lib/intel";
+import { fmtValue, humanize, riskHistoryKey } from "@/lib/intel";
 import type { Page, Risk } from "@/lib/intel-types";
 
 function Factors({ r }: { r: Risk }) {
@@ -143,6 +144,7 @@ export default function RisksPage() {
                     <p className="eyebrow mb-1.5">Recommended response</p>
                     <p className="text-sm leading-relaxed">{r.recommended_response}</p>
                   </div>
+                  <HistoryTimeline entity="risks" historyKey={riskHistoryKey(r)} labels={{ score: "risk score", value: "exposure" }} format={(v) => fmtValue(v)} />
                   <details className="group">
                     <summary className="eyebrow inline-flex cursor-pointer list-none items-center gap-1 hover:text-foreground [&::-webkit-details-marker]:hidden">
                       <span className="transition-transform group-open:rotate-90" aria-hidden>›</span> Evidence ({r.evidence.length})

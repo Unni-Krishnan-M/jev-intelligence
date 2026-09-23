@@ -36,6 +36,16 @@ def test_real_pipeline_runs_fast_and_is_plausible(real_inputs):
     assert d["summary"]["counts"]["warnings"] <= 10  # not spammy
     assert d["predictions"]["lapse"]["status"] == "ok"
     assert d["predictions"]["lapse"]["metrics"]["auc"] > d["predictions"]["lapse"]["metrics"]["baseline_auc"]
+    batches = {b["name"]: b for b in d["decision_batches"]}
+    assert set(batches) == {"model_governance", "genre_programming", "audience"}
+    assert all(b["status"] == "ok" for b in batches.values())
+    assert all(x["batch_id"] in {b["id"] for b in batches.values()} for x in d["decisions"])
+    slots = [x for x in d["decisions"] if x["key"] == "editorial_slot_share"]
+    assert slots and any(not x["abstained"] for x in slots)
+    for x in slots:
+        if not x["abstained"]:
+            lo, hi = x["answer_interval"]
+            assert 0 <= lo <= hi <= 100 and 0 <= x["answer"] <= 100 and x["confidence_kind"] == "interval"
     out = run_scenario(res, {"series_id": "volume:all", "horizon_months": 12})
     assert len(out["baseline"]["points"]) == 12
 

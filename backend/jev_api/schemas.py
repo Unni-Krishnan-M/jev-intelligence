@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+
+# ids in request bodies reach SQL: bounded to the INTEGER primary keys (jev_api.deps.MAX_DB_INT)
+DbId = Annotated[int, Field(ge=0, le=2**31 - 1)]
 
 
 class ORM(BaseModel):
@@ -51,7 +54,7 @@ class UserOut(ORM):
 
 class OnboardingRequest(BaseModel):
     genres: list[str] = Field(min_length=1, max_length=20)
-    movie_ids: list[int] = Field(default_factory=list, max_length=50)
+    movie_ids: list[DbId] = Field(default_factory=list, max_length=50)
 
 
 class PreferenceUpdate(BaseModel):
@@ -123,7 +126,7 @@ class InteractionResult(BaseModel):
 class MovieCreate(BaseModel):
     """Admin: add a movie that is not in the trained model (item cold start)."""
 
-    id: int = Field(gt=0)
+    id: int = Field(gt=0, le=2**31 - 1)
     title: str = Field(min_length=1, max_length=300)
     year: int | None = Field(default=None, ge=1870, le=2100)
     genres: list[str] = Field(default_factory=list, max_length=20)
@@ -155,6 +158,9 @@ class RecommendationItem(BaseModel):
     secondary_reasons: list[str] = []
     anchor_movie_ids: list[int] = []
     signals: dict[str, SignalValue]
+    # calibrated P(rating >= 4) (docs/intelligence.md, section 9.2); null without a calibration
+    confidence: float | None = None
+    confidence_kind: Literal["probability"] | None = None
 
 
 class RecommendationResponse(BaseModel):
@@ -178,6 +184,8 @@ class SimpleRecItem(BaseModel):
     score: float
     reason: str | None = None
     signals: dict[str, float] = {}
+    confidence: float | None = None
+    confidence_kind: Literal["probability"] | None = None
 
 
 class SimpleRecResponse(BaseModel):
@@ -189,9 +197,9 @@ class SimpleRecResponse(BaseModel):
 
 
 class FeedbackRequest(BaseModel):
-    movie_id: int
+    movie_id: DbId
     feedback: Literal["like", "dislike", "not_interested", "clicked"]
-    recommendation_id: int | None = None
+    recommendation_id: DbId | None = None
 
 
 class FeedbackOut(ORM):
@@ -214,6 +222,8 @@ class RecommendationHistoryItem(ORM):
     reason: str
     created_at: datetime
     feedback: str | None = None
+    confidence: float | None = None
+    confidence_kind: str | None = None
 
 
 # --- models / experiments --------------------------------------------------------------------------
@@ -371,7 +381,7 @@ class IntelDecisionOut(BaseModel):
     question: str
     kind: str
     options: list[str]
-    answer: str | None
+    answer: str | float | None  # a number for kind "score" (section 9.1)
     option_scores: dict[str, Any]
     confidence: float | None
     confidence_kind: str
@@ -382,6 +392,10 @@ class IntelDecisionOut(BaseModel):
     fallback_reason: str | None
     entity_type: str | None
     entity: str | None
+    batch_id: str | None = None
+    answer_value: float | None = None
+    answer_interval: list[float | None] | None = None
+    scale: dict[str, Any] | None = None
     db_id: int
     run_id: str
     as_of: str
@@ -424,8 +438,9 @@ class IntelFeedbackList(BaseModel):
 
 
 class ScenarioSpecIn(BaseModel):
-    # value ranges are validated by run_scenario (its messages come back as 422)
-    model_config = ConfigDict(extra="allow")
+    # value ranges (and NaN/Infinity) are validated by run_scenario (its messages come back as 422);
+    # unknown keys are dropped, so a saved scenario never stores arbitrary client data
+    model_config = ConfigDict(extra="ignore")
 
     name: str | None = Field(default=None, max_length=80)
     kind: str = Field(max_length=16)
@@ -455,6 +470,91 @@ class SavedScenarioOut(BaseModel):
 
 class SavedScenarioList(BaseModel):
     items: list[SavedScenarioOut]
+    total: int
+
+
+# --- v1.1 (docs/intelligence.md, section 9.3) -------------------------------------------------------
+EvidenceOwner = Literal["signal", "trend", "anomaly", "forecast", "risk", "decision", "warning", "action"]
+HistoryEntity = Literal["signals", "risks", "trends", "anomalies"]
+
+
+class IntelEvidenceOut(BaseModel):
+    id: int
+    kind: str
+    label: str
+    value: float | str | None
+    detail: str | None
+    ref: str | None
+    owner_type: str
+    owner_id: str
+    owner_title: str
+    position: int
+    run_id: str
+
+
+class IntelEvidencePage(BaseModel):
+    items: list[IntelEvidenceOut]
+    total: int
+    limit: int
+    offset: int
+    run_id: str | None
+    as_of: str | None
+
+
+class HistoryPoint(BaseModel):
+    run_id: str
+    as_of: str | None
+    created_at: str
+    id: str
+    observed_at: str | None
+    value: float | None
+    score: float | None
+    level: str | None
+    direction: str | None
+
+
+class IntelHistory(BaseModel):
+    entity: str
+    key: str
+    items: list[HistoryPoint]
+
+
+class DecisionBatchList(BaseModel):
+    items: list[dict[str, Any]]
+    run_id: str
+    as_of: str | None
+
+
+class AuditEntryOut(BaseModel):
+    id: int
+    at: str
+    actor_user_id: int | None
+    actor: str
+    action: str
+    target_type: str | None
+    target_id: str | None
+    detail: dict[str, Any]
+    request_id: str | None
+
+
+class AuditPage(BaseModel):
+    items: list[AuditEntryOut]
+    total: int
+    limit: int
+    offset: int
+
+
+class EvaluationRunOut(BaseModel):
+    id: int
+    run_dir: str
+    created_at: str | None
+    pipeline_version: str | None
+    data_version: str | None
+    headline: dict[str, float | None]
+
+
+class EvaluationRunList(BaseModel):
+    items: list[EvaluationRunOut]
     total: int
 
 

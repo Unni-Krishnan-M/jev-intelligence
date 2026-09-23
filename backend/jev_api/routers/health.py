@@ -7,6 +7,7 @@ from sqlalchemy import text
 
 from jev_api import __version__
 from jev_api.db import SessionLocal
+from jev_api.services.ml import engine_calibration
 
 router = APIRouter(tags=["health"])
 
@@ -51,4 +52,5 @@ def health_ml(request: Request, response: Response) -> dict[str, Any]:
         "status": "ok" if valid else "error",
         "self_check": {"recommendations": len(recs)},
         **engine.health(),
+        "calibration": engine_calibration(engine),
     }

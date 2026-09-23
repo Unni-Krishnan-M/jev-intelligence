@@ -8,6 +8,7 @@ import useSWR from "swr";
 import { Panel, SpecRows } from "@/components/jev/admin/ui";
 import { DirectionIcon, SeverityBadge } from "@/components/jev/intel/badges";
 import { TableView, TimeSeriesChart } from "@/components/jev/intel/charts";
+import { HistoryTimeline } from "@/components/jev/intel/history-timeline";
 import { PageHeader } from "@/components/jev/intel/page-header";
 import { IntelError } from "@/components/jev/intel/states";
 import { EmptyState } from "@/components/jev/states";
@@ -129,6 +130,7 @@ export default function SeriesPage() {
                   ]}
                 />
               )}
+              {t && <HistoryTimeline entity="trends" historyKey={t.series_id} labels={{ score: "evidence (1 − p)", value: "slope" }} className="mt-4" />}
             </Panel>
             <Panel title="Recent vs prior window">
               {!t ? (

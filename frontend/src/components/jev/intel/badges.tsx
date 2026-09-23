@@ -21,7 +21,7 @@ import {
 } from "lucide-react";
 
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { fmtDays } from "@/lib/intel";
+import { fmtConfidence, fmtDays } from "@/lib/intel";
 import type { ConfidenceKind, Direction, Severity, SystemStatus, WarningStatus } from "@/lib/intel-types";
 import { cn } from "@/lib/utils";
 
@@ -88,30 +88,40 @@ export const CONFIDENCE_EXPLAIN: Record<ConfidenceKind, string> = {
   probability: "Probability: from a probabilistic computation (a bootstrap or a calibrated classifier). Still an estimate, not a guarantee.",
   margin: "Margin: the normalised evidence gap between the best and second-best option. It is not a probability.",
   rule: "Rule: a deterministic threshold rule. 1 means the rule fired; it says nothing about how likely the answer is to be right.",
+  interval: "Interval: the nominal coverage of the range around a numeric answer. It is not a probability that the answer is right.",
 };
 
 const SCORE_EXPLAIN = "A 0–1 confidence score from the evidence behind it. It is not a probability.";
 
 /**
- * Confidence value + its kind. Only a probability is ever written as a percentage; without a
- * declared kind the value is shown as a plain 0–1 score.
+ * Confidence value + its kind. Only a probability is ever written as a percentage of being
+ * right; an interval shows its nominal coverage with the range ("80 % interval [lo, hi]"), and
+ * without a declared kind the value is shown as a plain 0–1 score.
  */
-export function ConfidenceBadge({ value, kind, className }: { value: number | null; kind?: ConfidenceKind | null; className?: string }) {
-  const shown =
-    value === null || value === undefined
-      ? "—"
-      : kind === "probability"
-        ? `${(value * 100).toFixed(0)} %`
-        : kind === "rule"
-          ? value >= 1 ? "fired" : value.toFixed(2)
-          : value.toFixed(2);
+export function ConfidenceBadge({
+  value,
+  kind,
+  interval,
+  format,
+  className,
+}: {
+  value: number | null;
+  kind?: ConfidenceKind | null;
+  /** interval kind: the [lo, hi] range the coverage refers to */
+  interval?: [number, number] | null;
+  /** formats the interval ends (e.g. on the decision's scale) */
+  format?: (v: number) => string;
+  className?: string;
+}) {
+  const shown = fmtConfidence(value, kind, interval, format);
   const explain = kind ? CONFIDENCE_EXPLAIN[kind] : SCORE_EXPLAIN;
+  const tag = kind === "interval" ? null : (kind ?? "score");
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <span tabIndex={0} className={cn(CHIP, "cursor-help", className)} aria-label={`Confidence ${shown}, ${kind ?? "score"}. ${explain}`}>
+        <span tabIndex={0} className={cn(CHIP, "cursor-help", className)} aria-label={`Confidence ${shown}${tag ? `, ${tag}` : ""}. ${explain}`}>
           <span className="num">{shown}</span>
-          <span className="font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">{kind ?? "score"}</span>
+          {tag && <span className="font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">{tag}</span>}
         </span>
       </TooltipTrigger>
       <TooltipContent className="max-w-64">{explain}</TooltipContent>

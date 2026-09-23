@@ -5,7 +5,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from sqlalchemy import delete, func, select
 
-from jev_api.deps import DB, CurrentUser
+from jev_api.deps import DB, MAX_PAGE, CurrentUser
 from jev_api.models import Favorite, Genre, Movie, Rating, User, UserGenrePreference, WatchHistory
 from jev_api.schemas import MovieBrief, OnboardingRequest, PreferenceUpdate, UserOut
 from jev_api.services.profile import taste_profile
@@ -87,7 +87,10 @@ def _page(q: Any, db: DB, page: int, size: int) -> tuple[list[Any], int]:
 
 @router.get("/me/ratings")
 def my_ratings(
-    user: CurrentUser, db: DB, page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200)
+    user: CurrentUser,
+    db: DB,
+    page: int = Query(1, ge=1, le=MAX_PAGE),
+    page_size: int = Query(50, ge=1, le=200),
 ) -> dict[str, Any]:
     q = select(Rating).where(Rating.user_id == user.id).order_by(Rating.updated_at.desc(), Rating.id.desc())
     rows, total = _page(q, db, page, page_size)
@@ -107,7 +110,10 @@ def my_ratings(
 
 @router.get("/me/history")
 def my_history(
-    user: CurrentUser, db: DB, page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200)
+    user: CurrentUser,
+    db: DB,
+    page: int = Query(1, ge=1, le=MAX_PAGE),
+    page_size: int = Query(50, ge=1, le=200),
 ) -> dict[str, Any]:
     q = (
         select(WatchHistory)
@@ -135,7 +141,10 @@ def my_history(
 
 @router.get("/me/favorites")
 def my_favorites(
-    user: CurrentUser, db: DB, page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200)
+    user: CurrentUser,
+    db: DB,
+    page: int = Query(1, ge=1, le=MAX_PAGE),
+    page_size: int = Query(50, ge=1, le=200),
 ) -> dict[str, Any]:
     q = (
         select(Favorite)

@@ -70,10 +70,10 @@ def test_contract_top_level_and_json_strict(synth_result):
         "decisions",
         "actions",
     }
-    assert d["run"]["pipeline_version"] == "intel-1.0.0"
+    assert d["run"]["pipeline_version"] == "intel-1.1.0"
     assert all(len(s["points"]) <= 120 for s in d["series"])
     for dec in d["decisions"]:
-        assert dec["confidence_kind"] in ("probability", "margin", "rule")
+        assert dec["confidence_kind"] in ("probability", "margin", "rule", "interval")
         assert dec["kind"] in ("boolean", "choice", "score")
     for a in d["anomalies"]:
         assert a["severity"] in ("low", "medium", "high", "critical")

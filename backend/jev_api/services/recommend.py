@@ -20,6 +20,20 @@ from jev_ml.engine import RecommendationEngine
 from jev_ml.models.hybrid import RecommendationFilters
 
 DIVERSITY_LAMBDA = {"focused": 1.0, "adventurous": 0.7}  # "balanced" = the model's tuned value
+CONFIDENCE_KINDS = ("probability",)  # recommendations.confidence_kind CHECK
+
+
+def confidence_of(rec: Any) -> tuple[float | None, str | None]:
+    """(confidence, confidence_kind) of an engine Recommendation or a similar/trending row dict.
+    The calibrated P(rating >= 4) of section 9.2; (None, None) when the model has no calibration,
+    or the value is not a finite probability (it is never guessed)."""
+    if isinstance(rec, dict):
+        value, kind = rec.get("confidence"), rec.get("confidence_kind")
+    else:
+        value, kind = getattr(rec, "confidence", None), getattr(rec, "confidence_kind", None)
+    if isinstance(value, bool) or not isinstance(value, int | float) or not 0.0 <= float(value) <= 1.0:
+        return None, None
+    return round(float(value), 6), kind if kind in CONFIDENCE_KINDS else "probability"
 
 
 def movie_briefs(db: Session, ids: list[int]) -> dict[int, Movie]:
@@ -67,6 +81,7 @@ def personalized(
     movies = movie_briefs(db, [r.movie_id for r in recs])
 
     request_id = str(uuid.uuid4())
+    conf = {r.movie_id: confidence_of(r) for r in recs}
     rows = [
         Recommendation(
             user_id=user.id,
@@ -79,6 +94,8 @@ def personalized(
             reason=r.reason[:300],
             reason_code=r.reason_code,
             signals=r.signals,
+            confidence=conf[r.movie_id][0],
+            confidence_kind=conf[r.movie_id][1],
         )
         for r in recs
         if r.movie_id in movies
@@ -107,6 +124,8 @@ def personalized(
                 "secondary_reasons": r.secondary_reasons,
                 "anchor_movie_ids": r.anchor_movie_ids,
                 "signals": r.signals,
+                "confidence": conf[r.movie_id][0],
+                "confidence_kind": conf[r.movie_id][1],
             }
         )
     response = {
@@ -135,6 +154,7 @@ def simple_items(db: Session, rows: list[dict[str, Any]]) -> list[dict[str, Any]
         m = movies.get(r["movie_id"])
         if m is None:
             continue
+        confidence, kind = confidence_of(r)
         out.append(
             {
                 "movie_id": m.id,
@@ -145,6 +165,8 @@ def simple_items(db: Session, rows: list[dict[str, Any]]) -> list[dict[str, Any]
                 "score": r["score"],
                 "reason": r.get("reason"),
                 "signals": r.get("signals", {}),
+                "confidence": confidence,
+                "confidence_kind": kind,
             }
         )
     return out

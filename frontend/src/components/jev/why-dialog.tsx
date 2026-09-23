@@ -7,6 +7,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Di
 import { SIGNAL_META, SIGNALS } from "@/lib/signals";
 import type { RecItem } from "@/lib/types";
 
+import { RecConfidence } from "./rec-confidence";
 import { SignalBar } from "./signal-bar";
 
 /** "Why this?" — the exact numbers the ranker used, plus the reasons derived from them. */
@@ -32,6 +33,7 @@ export function WhyDialog({ item, modelVersion, trigger }: { item: RecItem; mode
             {item.secondary_reasons.map((r) => <li key={r}>— {r}</li>)}
           </ul>
         )}
+        <RecConfidence item={item} />
         <div className="mt-2">
           <p className="eyebrow mb-2">How the hybrid score was built</p>
           <SignalBar signals={item.signals} height={10} />

@@ -18,6 +18,24 @@ computed upstream; confidence carries its kind:
 * ``reengagement_campaign`` (boolean, probability): yes iff the lapse model is usable
   (AUC >= reengage_min_auc) and P(at least reengage_min_users of the high-risk users lapse) >= 0.5,
   that probability computed exactly (Poisson-binomial) from the calibrated lapse probabilities.
+* ``editorial_slot_share`` (score, interval): the recommended % of home-rail slots that should carry
+  a film of the genre next quarter. Policy (``slot-share-1.0.0``): *demand-proportional* allocation,
+  i.e. slots follow the forecast share of rating activity. answer = 100 x the mean forecast
+  ``share:genre:<G>`` over the next ``slot_share_window_months`` months (the first months after the
+  last complete month); ``answer_interval`` = 100 x the conformal 80 % interval *of that window mean*
+  (backtest residuals of the window mean, see ``forecast.window_mean_forecast``); both clipped to
+  [0, 100]. confidence = the nominal coverage (0.8), kind ``interval``: it is the coverage the
+  interval is built for, not a probability that the answer is right; the honestly backtested
+  coverage is in ``state``. A film carries several genres, so slot shares of different genres do not
+  sum to 100. Editorial boosts/reductions are the separate ``genre_programming`` question (same
+  batch); this answer is not adjusted by it. Abstains when the genre has no share forecast
+  (history too short), too few complete backtest windows for an interval, or a backtested interval
+  coverage below ``slot_share_min_coverage`` (an interval that covered less than that cannot be
+  reported as an 80 % interval).
+
+Every decision is produced inside a *decision batch* (``intel.batches``); ``batch_id`` links it to
+the shared, hashed state snapshot it was answered from. Non-score decisions carry
+``scale: null`` and ``answer_interval: null``.
 """
 
 from __future__ import annotations
@@ -32,6 +50,17 @@ from jev_ml.intel.config import IntelConfig
 
 Z_CRIT = 1.96
 
+# policy version per decision key (also recorded per batch in decision_batches[].policy_versions)
+POLICY_VERSIONS = {
+    "retrain_model": "retrain-1.0.0",
+    "serving_model": "serving-1.0.0",
+    "genre_programming": "genre-1.0.0",
+    "editorial_slot_share": "slot-share-1.0.0",
+    "rater_action": "rater-1.0.0",
+    "reengagement_campaign": "reengage-1.0.0",
+}
+SLOT_SCALE = {"min": 0.0, "max": 100.0, "unit": "% of home-rail slots"}
+
 
 def _decision(
     key: str,
@@ -39,7 +68,7 @@ def _decision(
     question: str,
     kind: str,
     options: list[str],
-    answer: str | None,
+    answer: str | float | None,
     scores: dict[str, float],
     confidence: float | None,
     confidence_kind: str,
@@ -50,7 +79,11 @@ def _decision(
     entity: str,
     as_of_key: str,
     fallback: str | None = None,
+    scale: dict[str, Any] | None = None,
+    answer_interval: list[float | None] | None = None,
 ) -> dict[str, Any]:
+    if kind == "score" and fallback is None and not isinstance(answer, int | float):
+        raise ValueError(f"{key}: a score decision needs a numeric answer")
     return {
         "id": stable_id("dec", key, entity, as_of_key),
         "key": key,
@@ -70,6 +103,9 @@ def _decision(
         "fallback_reason": fallback,
         "entity_type": entity_type,
         "entity": entity,
+        "scale": scale,
+        "answer_interval": answer_interval,
+        "batch_id": None,  # set by intel.batches.run_batch
     }
 
 
@@ -454,3 +490,323 @@ def reengagement_decision(
         "all",
         as_of_key,
     )
+
+
+# --------------------------------------------------------------------------------------------------
+# score decisions
+
+
+def share_window_inputs(
+    share_forecasts: list[dict[str, Any]], states: dict[str, Any], cfg: IntelConfig
+) -> dict[str, dict[str, Any]]:
+    """Plain-data summary per ``share:genre:*`` forecast (the slot-share decision's input; it goes
+    into the batch's hashed state snapshot, so it holds numbers only, no fitted objects)."""
+    from jev_ml.intel.forecast import window_mean_forecast
+
+    out: dict[str, dict[str, Any]] = {}
+    for f in share_forecasts:
+        st = states.get(f["series_id"])
+        w = window_mean_forecast(st, cfg.slot_share_window_months, cfg) if st is not None else None
+        base = {
+            "forecast_id": f["id"],
+            "model": f["model"],
+            "model_version": f["model_version"],
+            "backtest_mase": f["backtest"].get("mase"),
+            "backtest_naive_mase": f["backtest"].get("naive_mase"),
+        }
+        if w is None:
+            out[f["series_id"]] = {
+                **base,
+                "status": "insufficient",
+                "reason": f"fewer than {cfg.forecast_min_residuals} complete "
+                f"{cfg.slot_share_window_months}-month backtest windows for an interval",
+            }
+            continue
+        out[f["series_id"]] = {
+            **base,
+            "status": "ok",
+            "months": w["months"],
+            "mean": fnum(w["mean"], 6),
+            "lo": fnum(w["lo"], 6),
+            "hi": fnum(w["hi"], 6),
+            "n_residuals": w["n_residuals"],
+            "coverage": fnum(w["coverage"], 4),
+            "coverage_origins": w["coverage_origins"],
+            "nominal": w["nominal"],
+        }
+    return out
+
+
+def _pct(x: float) -> float:
+    return round(100.0 * clip01(x), 2)
+
+
+def slot_share_decisions(
+    trends: list[dict[str, Any]], windows: dict[str, dict[str, Any]], cfg: IntelConfig, as_of_key: str
+) -> list[dict[str, Any]]:
+    """``editorial_slot_share`` per genre (policy in the module docstring)."""
+    out = []
+    shares = {t["entity"]: t for t in trends if t["metric"] == "share"}
+    for g, t in sorted(shares.items()):
+        if (t["recent_mean"] or 0.0) < cfg.genre_min_share:
+            continue
+        sid = f"share:genre:{g}"
+        q = f"What share of home-rail slots should carry {g} films next quarter?"
+        args: tuple[str, str, str, str, list[str]] = (
+            "editorial_slot_share",
+            POLICY_VERSIONS["editorial_slot_share"],
+            q,
+            "score",
+            [],
+        )
+        w = windows.get(sid)
+        reason = None
+        if w is None:
+            reason = "no share forecast for this genre (history too short)"
+        elif w["status"] != "ok":
+            reason = w["reason"]
+        elif w["coverage"] is None:
+            reason = "the window interval's coverage cannot be backtested (too few past windows)"
+        elif w["coverage"] < cfg.slot_share_min_coverage:
+            reason = (
+                f"backtested coverage of the {int(100 * w['nominal'])} % interval is "
+                f"{w['coverage']:.2f} < {cfg.slot_share_min_coverage}: the interval is not trustworthy"
+            )
+        if reason is not None:
+            out.append(
+                _decision(
+                    *args,
+                    None,
+                    {},
+                    None,
+                    "interval",
+                    {"series_id": sid, "window": w},
+                    [],
+                    [],
+                    "genre",
+                    g,
+                    as_of_key,
+                    reason,
+                    scale=SLOT_SCALE,
+                )
+            )
+            continue
+        assert w is not None
+        answer = _pct(w["mean"])
+        interval: list[float | None] = [_pct(w["lo"]), _pct(w["hi"])]
+        months = w["months"]
+        state = {
+            "series_id": sid,
+            "forecast_id": w["forecast_id"],
+            "forecast_model": w["model"],
+            "forecast_model_version": w["model_version"],
+            "window_months": months,
+            "forecast_mean_share": w["mean"],
+            "forecast_interval_share": [w["lo"], w["hi"]],
+            "recent_share": t["recent_mean"],
+            "trend_direction": t["direction"],
+            "interval_nominal": w["nominal"],
+            "interval_backtest_coverage": w["coverage"],
+            "interval_backtest_origins": w["coverage_origins"],
+            "window_residuals": w["n_residuals"],
+            "backtest_mase": w["backtest_mase"],
+            "backtest_naive_mase": w["backtest_naive_mase"],
+            "allocation_rule": "demand-proportional: slot share = forecast share of rating activity",
+        }
+        rationale = [
+            f"{w['model']} forecast of the {g} share of ratings for {months[0][:7]}..{months[-1][:7]}: "
+            f"{answer:.1f} % (80 % interval {interval[0]:.1f}–{interval[1]:.1f} %)",
+            f"recent {cfg.trend_window_months}-month share {100 * (t['recent_mean'] or 0):.1f} %, "
+            f"trend {t['direction']}",
+            f"interval from {w['n_residuals']} backtest window residuals; backtested coverage "
+            f"{100 * w['coverage']:.0f} % over {w['coverage_origins']} origins (nominal "
+            f"{100 * w['nominal']:.0f} %)",
+        ]
+        out.append(
+            _decision(
+                *args,
+                answer,
+                {},
+                w["nominal"],
+                "interval",
+                state,
+                rationale,
+                [
+                    evidence("series", f"{g} share forecast", w["mean"], w["model"], sid),
+                    evidence(
+                        "test",
+                        "window-interval backtest coverage",
+                        w["coverage"],
+                        f"nominal {w['nominal']}",
+                        w["forecast_id"],
+                    ),
+                ],
+                "genre",
+                g,
+                as_of_key,
+                scale=SLOT_SCALE,
+                answer_interval=interval,
+            )
+        )
+    return out
+
+
+# --------------------------------------------------------------------------------------------------
+# decision batches (multi-question calls, contract section 9.1)
+
+
+def build_decision_batches(
+    *,
+    manifest: dict[str, Any] | None,
+    stale: dict[str, Any] | None,
+    boot: dict[str, Any] | None,
+    data_version: str,
+    replayable: bool,
+    trends: list[dict[str, Any]],
+    forecasts_by_series: dict[str, dict[str, Any]],
+    share_windows: dict[str, dict[str, Any]],
+    rater_anoms: list[dict[str, Any]],
+    influence: dict[str, Any] | None,
+    lapse: dict[str, Any],
+    lapse_scored: pd.DataFrame | None,
+    cfg: IntelConfig,
+    as_of_key: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """All decisions of a run, grouped into three batches:
+
+    * ``model_governance``: retrain_model + serving_model (one model/evaluation snapshot),
+    * ``genre_programming``: genre_programming + editorial_slot_share for every eligible genre (one
+      trends/forecasts snapshot),
+    * ``audience``: rater_action + reengagement_campaign (one anomalies/lapse snapshot).
+    Returns (decisions in the historical order, batch records)."""
+    from jev_ml.intel.batches import Question, run_batch
+
+    pv = POLICY_VERSIONS
+    model_ent = [("model", str(manifest.get("version")) if manifest else "none")]
+
+    def genre_entities(st: Any) -> list[tuple[str, str]]:
+        return sorted(
+            ("genre", t["entity"])
+            for t in st["share_trends"]
+            if (t["recent_mean"] or 0.0) >= cfg.genre_min_share
+        )
+
+    def rater_entities(st: Any) -> list[tuple[str, str]]:
+        active = [
+            a for a in st["rater_anomalies"] if not (a["suppression_reason"] or "").startswith("inactive")
+        ]
+        ranked = sorted(active, key=lambda a: (-(a["value"] or 0.0), a["entity"]))
+        return [("user", str(a["entity"])) for a in ranked[: cfg.rater_decisions_max]]
+
+    gov_state = {
+        "manifest": manifest,
+        "staleness": stale,
+        "bootstrap": boot,
+        "data_version": data_version,
+        "model_replayable": replayable,
+    }
+    gov_q = [
+        Question(
+            "retrain_model",
+            pv["retrain_model"],
+            "boolean",
+            "rule",
+            "Should the recommendation model be retrained now?",
+            lambda st: [
+                retrain_decision(
+                    st["manifest"],
+                    st["staleness"],
+                    st["data_version"],
+                    st["model_replayable"],
+                    cfg,
+                    as_of_key,
+                )
+            ],
+            lambda st: model_ent,
+        ),
+        Question(
+            "serving_model",
+            pv["serving_model"],
+            "choice",
+            "probability",
+            "Which evaluated model should serve recommendations?",
+            lambda st: [
+                serving_decision(st["manifest"], st["bootstrap"], st["model_replayable"], cfg, as_of_key)
+            ],
+            lambda st: model_ent,
+        ),
+    ]
+    genre_state = {
+        "share_trends": [t for t in trends if t["metric"] == "share"],
+        "genre_volume_forecasts": {
+            k: v for k, v in forecasts_by_series.items() if k.startswith("volume:genre:")
+        },
+        "share_windows": share_windows,
+    }
+    genre_q = [
+        Question(
+            "genre_programming",
+            pv["genre_programming"],
+            "choice",
+            "margin",
+            "How should each genre be programmed on the home rails?",
+            lambda st: genre_decisions(st["share_trends"], st["genre_volume_forecasts"], cfg, as_of_key),
+            genre_entities,
+        ),
+        Question(
+            "editorial_slot_share",
+            pv["editorial_slot_share"],
+            "score",
+            "interval",
+            "What share of home-rail slots should carry each genre next quarter?",
+            lambda st: slot_share_decisions(st["share_trends"], st["share_windows"], cfg, as_of_key),
+            genre_entities,
+        ),
+    ]
+    audience_state = {
+        "rater_anomalies": rater_anoms,
+        "influence": influence,
+        "lapse": lapse,
+        "lapse_scored": lapse_scored,
+    }
+    audience_q = [
+        Question(
+            "rater_action",
+            pv["rater_action"],
+            "choice",
+            "margin",
+            "What should happen to each flagged rater's ratings?",
+            lambda st: rater_decisions(st["rater_anomalies"], st["influence"], cfg, as_of_key),
+            rater_entities,
+        ),
+        Question(
+            "reengagement_campaign",
+            pv["reengagement_campaign"],
+            "boolean",
+            "probability",
+            "Should a re-engagement campaign target users at high lapse risk now?",
+            lambda st: [reengagement_decision(st["lapse"], st["lapse_scored"], cfg, as_of_key)],
+            lambda st: [("platform", "all")],
+        ),
+    ]
+    decisions: list[dict[str, Any]] = []
+    batches: list[dict[str, Any]] = []
+    for name, question, state, qs in (
+        (
+            "model_governance",
+            "Is the recommendation model current, and which model should serve?",
+            gov_state,
+            gov_q,
+        ),
+        (
+            "genre_programming",
+            "How should each genre be programmed on the home rails, and with what slot share next quarter?",
+            genre_state,
+            genre_q,
+        ),
+        ("audience", "Which audience interventions are warranted now?", audience_state, audience_q),
+    ):
+        ds, rec = run_batch(name, question, state, qs, as_of_key)
+        decisions.extend(ds)
+        batches.append(rec)
+    return decisions, batches

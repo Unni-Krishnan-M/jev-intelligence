@@ -25,7 +25,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { api, errorMessage } from "@/lib/api";
-import { daysBetween, fmtDays, fmtMs, fmtPct, humanize, orderStages, SEVERITIES, useIntelRevalidate } from "@/lib/intel";
+import { daysBetween, fmtAnswer, fmtDays, fmtMs, fmtPct, humanize, orderStages, SEVERITIES, useIntelRevalidate } from "@/lib/intel";
 import type { IntelStatus, Run } from "@/lib/intel-types";
 
 function RunControl({ lastAsOf }: { lastAsOf?: string | null }) {
@@ -287,8 +287,8 @@ function Overview({ s, run }: { s: IntelStatus; run: Run }) {
                     {d.question}
                   </Link>
                   <span className="flex items-center gap-2">
-                    <span className="text-sm">{d.abstained ? <span className="text-muted-foreground">abstained</span> : d.answer}</span>
-                    {!d.abstained && <ConfidenceBadge value={d.confidence} kind={d.confidence_kind} />}
+                    <span className="text-sm">{d.abstained ? <span className="text-muted-foreground">abstained</span> : fmtAnswer(d)}</span>
+                    {!d.abstained && <ConfidenceBadge value={d.confidence} kind={d.confidence_kind} interval={d.answer_interval} />}
                   </span>
                 </li>
               ))}
@@ -305,7 +305,7 @@ function Overview({ s, run }: { s: IntelStatus; run: Run }) {
             <>
               <CountBars data={s.confidence_histogram} />
               <p className="mt-2 text-xs text-muted-foreground">
-                Counts of decisions per confidence bin. Bins mix kinds (probability, margin and rule), so read this as a spread,
+                Counts of decisions per confidence bin. Bins mix kinds (probability, margin, rule and interval coverage), so read this as a spread,
                 not as calibration.
               </p>
               <TableView caption="Decisions per confidence bin" head={["bin", "decisions"]} rows={s.confidence_histogram.map((b) => [b.bin, b.n])} />

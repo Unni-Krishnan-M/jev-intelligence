@@ -100,3 +100,13 @@ def test_model_save_load_roundtrip(tmp_path, tiny_components):
         model.save(tmp_path / model.name)
         loaded = cls.load(tmp_path / model.name)
         assert np.allclose(loaded.score(prof), model.score(prof), atol=1e-4), model.name
+
+
+def test_registry_file_is_world_readable(tmp_path):
+    import stat
+
+    from jev_ml.registry import REGISTRY_FILE, register_version
+
+    register_version({"version": "v-test"}, models_dir=tmp_path)
+    mode = stat.S_IMODE((tmp_path / REGISTRY_FILE).stat().st_mode)
+    assert mode & 0o044 == 0o044  # group and others can read it

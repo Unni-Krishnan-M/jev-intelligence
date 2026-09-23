@@ -1,5 +1,7 @@
 # JEV — Intelligent Hybrid Recommendation Engine
 
+**Version 1.1.0** · [Demo walkthrough](docs/demo.md) · [Changelog](CHANGELOG.md) · [Status report](docs/progress.md)
+
 *A film programme that learns you.* JEV is a personalised movie recommender. It blends **content-based**,
 **collaborative filtering**, **matrix factorization**, **popularity** and **behavioural** signals into one ranked list,
 explains every pick from the model's actual evidence, and measures itself on a held-out test set.
@@ -11,6 +13,9 @@ evidence and an honest confidence, and the layer evaluates itself offline. See
 [Intelligence & early warnings](#intelligence--early-warnings).
 
 ![Home](docs/screenshots/04-home.png)
+
+**See it in five minutes:** [docs/demo.md](docs/demo.md) is a step-by-step walkthrough (commands, URLs, what to click,
+the real numbers you will see), with a 5-minute script.
 
 ## Problem statement
 Single-strategy recommenders fail in predictable ways. Popularity is not personal. Collaborative filtering fails for
@@ -143,7 +148,7 @@ sources  quality    monthly     trends,   forecasts, risk    typed      warnings
 | Series anomalies | 756 spikes/drops injected into real series | 50 % detected overall (73–76 % at ≥ 5σ); 2 % false-alarm rate | — |
 | Change points | synthetic AR(1) matched to real volume | 32.5 % detected; 7 % false alarms (nominal 1 %) | — |
 
-A full run over the real data takes about 0.85 s on a laptop CPU. Design, contract and method notes:
+A full run over the real data takes about 1 s on a laptop CPU (0.85 s pipeline + persistence). Design, contract and method notes:
 [docs/intelligence.md](docs/intelligence.md).
 ```bash
 uv run python scripts/run_intelligence.py --as-of 2017-07-01   # one run, printed as JSON
@@ -154,7 +159,7 @@ uv run python scripts/evaluate_intelligence.py                 # offline evaluat
 REST under FastAPI with JWT (httpOnly cookie or bearer) and CSRF protection for cookie writes. Main endpoints:
 `/auth/*`, `/users/me*`, `/movies*`, `/recommendations` (+ `/similar/{id}`, `/trending`, `/because-you-watched`,
 `/similar-to-favorites`, `/feedback`, `/history`), `/models*`, `/experiments*`, `/health`, `/health/ml`.
-Operators (admins) also get `/intel/*`: status, runs (with replay `as_of`), signals, trends, anomalies, predictions, series, risks, decisions, warnings (lifecycle), actions, scenarios, feedback and evaluation, plus `/admin/metrics`.
+Operators (admins) also get `/intel/*`: status, runs (with replay `as_of`), signals, trends, anomalies, predictions, series, risks, decisions (incl. score decisions and `/intel/decisions/batches`), warnings (lifecycle), actions, scenarios, feedback, evaluation and evaluation runs, evidence search, history across runs and recommender monitoring, plus `/admin/metrics` and `/admin/audit`. Recommendation items carry a calibrated `confidence` (P(rating ≥ 4)), or null.
 Reference: [docs/api.md](docs/api.md). OpenAPI UI is at `http://localhost:8000/docs` in development.
 
 ## Frontend
@@ -162,7 +167,7 @@ Next.js 16 App Router. Pages: `/` landing (live metrics), `/login`, `/register`,
 quick ratings), `/home` (six shelves: Recommended for you, Because you watched, Similar to your favourites, Trending,
 Popular, New discoveries), `/discover`, `/movies/[id]`, `/recommendations` (full ranking with "Why this?"
 breakdowns and feedback), `/profile` (taste profile), `/history`, `/favorites`, `/admin`, `/admin/models`,
-`/admin/experiments`, and the Intelligence console under `/intel` (overview, signals, trends, anomalies, predictions, risks, early warnings, decisions, actions, what-if scenarios, feedback, evaluation, system health).
+`/admin/experiments`, and the Intelligence console under `/intel` (overview, signals, trends, anomalies, predictions, risks, early warnings, decisions, actions, what-if scenarios, feedback, evaluation, recommender monitoring, evidence explorer, audit log, system health).
 
 The design is a festival programme printed for a dark screening room. It uses warm near-black and paper tones, a
 single tungsten-amber accent, serif display type, and typeset covers generated from each film's metadata instead of
@@ -179,13 +184,18 @@ docker compose --profile train run --rm trainer  # first run: data + training in
 docker compose up -d --build                     # postgres, redis, api, web → http://localhost:3000
 uv run python scripts/acceptance_test.py --base http://localhost:3000/api --admin-password "$JEV_ADMIN_PASSWORD"
 ```
-See [docs/deployment.md](docs/deployment.md).
+The trainer also writes the recommendation-confidence calibration and the intelligence evaluation. The API is reachable
+only through the web proxy (`/api/*`), and forwarded headers are not trusted by default. The acceptance test (58 checks:
+the recommender journey plus the intelligence layer end to end) passes against the Docker stack. See
+[docs/deployment.md](docs/deployment.md).
 
 ## Testing
 ```bash
-uv run pytest                   # 99 tests: unit, ML, intelligence, API integration (~13 s; real-data checks skip without data)
+uv run pytest                   # 174 tests: unit 47, ML 9, intelligence 39, API integration 79 (~25 s; 173 pass + 1 PostgreSQL-only skip; real-data checks skip without data)
 uv run ruff check . && uv run ruff format --check . && uv run mypy
+cd frontend && pnpm test         # 65 Vitest tests in 6 files (helpers, CSP, safe redirects, components; jsdom)
 cd frontend && pnpm exec next typegen && pnpm exec tsc --noEmit && pnpm exec eslint src && pnpm build
+uv run python scripts/acceptance_test.py --base http://localhost:3000/api   # 58 end-to-end checks against a running stack
 uv run python scripts/capture_screenshots.py     # real-browser user journey (Chrome) → docs/screenshots
 ```
 
@@ -205,6 +215,8 @@ Intelligence console:
 | ![Forecasts and lapse model](docs/screenshots/16-intel-predictions.png) | ![Early warning](docs/screenshots/17-intel-warning.png) |
 | ![Decision with evidence](docs/screenshots/18-intel-decision.png) | ![What-if scenarios](docs/screenshots/19-intel-scenarios.png) |
 | ![Evaluation](docs/screenshots/20-intel-evaluation.png) | ![Mobile, paper theme](docs/screenshots/21-mobile-intel-light.png) |
+| ![Evidence explorer](docs/screenshots/22-intel-evidence.png) | ![Recommender monitoring](docs/screenshots/23-intel-recommender.png) |
+| ![Audit log](docs/screenshots/24-intel-audit.png) | |
 
 ## Limitations
 - **Cold start**: with about 3 interactions, plain popularity still beats the hybrid on NDCG@10.
@@ -220,6 +232,8 @@ Intelligence console:
     then those stages report "skipped" instead of guessing.
   - On this thin stream (10–15 active raters a month), genre trends rarely survive false-discovery control.
   - The change-point test over-alarms (7 % vs 1 % nominal).
+  - Recommendation confidence is well calibrated (ECE ≤ 0.0014) but discriminates weakly (AUC 0.57–0.63).
+  - Open warnings are never auto-resolved.
   - The rater detector spends much of its 2 % review budget on genuine heavy users.
   - Some impact weights and action efforts are declared estimates, and they are labelled as such.
   - The lapse base rate is high (74 %), so a lapse warning mostly restates that most raters do not return.

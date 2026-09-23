@@ -1,4 +1,4 @@
-# JEV web (Next.js standalone output, ~200 MB).
+# JEV web (Next.js standalone output; measured 305 MB on disk, 76 MB compressed).
 FROM node:24-alpine AS deps
 WORKDIR /web
 RUN corepack enable

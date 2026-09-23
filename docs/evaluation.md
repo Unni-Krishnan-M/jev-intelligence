@@ -74,11 +74,39 @@ roadmap for the planned fix: a separate cold-stage weight set, or learning-to-ra
 - hybrid weights (best of 24 Dirichlet samples + defaults): content 0.067, collaborative 0.111, latent 0.352,
   popularity 0.251, preference 0.191, recency 0.028. MMR λ = 0.8 (the most diverse setting within 2% of the best NDCG).
 
+## Recommendation confidence (calibration)
+
+Model `jev-20260923T100141Z-bbb2e4c9`, calibration `cal-1.0.0-0546c1bffc` (`models/<version>/calibration.json`).
+Target: P(the user rates a recommended film ≥ 4 among their next 5 ratings), top-50 lists. Fit: isotonic regression
+on the **validation** split, with models fitted on train only (401 users, 20 050 candidates per stratum). Evaluation:
+the **test** split, with models refitted on train+validation and the calibrators unchanged (567 users, 28 350
+candidates per stratum). The baseline is the constant validation base rate of the stratum.
+
+| stratum (profile interactions) | feature | test observed | test mean predicted | ECE | Brier | base-rate Brier | AUC |
+|---|---|---|---|---|---|---|---|
+| 0–1 (fitted with 0) | rank | 0.85 % | 0.73 % | 0.0011 | 0.00839 | 0.00840 | 0.58 |
+| 2–5 (fitted with 3) | rank | 0.79 % | 0.71 % | 0.0008 | 0.00787 | 0.00787 | 0.57 |
+| 6–30 (fitted with 10) | score | 0.99 % | 0.85 % | 0.0014 | 0.00982 | 0.00982 | 0.57 |
+| ≥ 31 (full profile) | rank | 1.83 % | 1.76 % | 0.0008 | 0.01789 | 0.01797 | 0.63 |
+
+In the warm stratum, rank 1 maps to 5.7 %, ranks 2–5 to 3.2 %, and rank 50 to 0.75 %. Using the raw hybrid score
+as a probability would give ECE 0.63 and Brier 0.41.
+
+**Honest reading.** The probabilities are *calibrated in level*: ECE ≤ 0.0014, and the predicted mean is within
+0.15 percentage points of the observed rate in every stratum. They carry *little discrimination*: AUC 0.57–0.63, and
+the Brier skill over the constant base rate is +0.45 % warm and about 0 for short profiles. A confidence of 5 % at
+rank 1 means what it says, but it barely separates good recommendations from weak ones within a user's list. Over the
+full test window (about 20 % of each user's ratings, a longer horizon than the calibrator's 5 ratings) the observed
+rate is 5.5 % vs 1.8 % predicted. That gap is expected by construction, because the label horizon differs. It is
+reported so the horizon is not misread. Before the profile-size strata were added, a single warm calibrator
+over-predicted 3-interaction profiles by 2.2× (1.76 % vs 0.79 %).
+
 ## Reproduce
 
 ```bash
 uv run python scripts/train_models.py            # tune + evaluate + train (~4–5 min on CPU)
 uv run python scripts/evaluate_models.py         # re-evaluate the active version's parameters on the same protocol
+uv run python scripts/calibrate_recommendations.py   # recommendation-confidence calibration (~20 s)
 ```
 Outputs: `experiments/<run>/{metrics.json, comparison_test.csv, comparison_cold_start.csv, per_user_ndcg10.json, REPORT.md, plots/*.png, config.yaml, dataset_meta.json}`.
 The admin dashboard (`/admin/experiments`) reads the same files through the API.

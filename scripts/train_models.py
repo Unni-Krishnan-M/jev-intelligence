@@ -17,9 +17,21 @@ def main() -> None:
     )
     parser.add_argument("--quick", action="store_true", help="skip hyper-parameter tuning")
     parser.add_argument("--no-activate", action="store_true", help="register without activating")
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="afterwards fit the recommendation-confidence calibrator (validation split) for the new "
+        "version; same as scripts/calibrate_recommendations.py --model VERSION",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     res = run_pipeline(args.config, quick=args.quick, activate=not args.no_activate)
+    calibration = None
+    if args.calibrate and res["model_version"]:
+        from jev_ml.calibration import calibrate_model
+
+        cal = calibrate_model(res["model_version"])
+        calibration = {"calibration_version": cal["calibration_version"], "headline": cal["headline"]}
     print(
         json.dumps(
             {
@@ -27,6 +39,7 @@ def main() -> None:
                 "model_version": res["model_version"],
                 "seconds": round(res["seconds_total"], 1),
                 "test_ndcg@10": {k: round(v["ndcg@10"], 4) for k, v in res["metrics"]["test"].items()},
+                "calibration": calibration,
             },
             indent=2,
         )

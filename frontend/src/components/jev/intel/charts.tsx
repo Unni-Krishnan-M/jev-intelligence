@@ -16,8 +16,8 @@ import {
 } from "recharts";
 
 import { SEVERITY_META } from "@/components/jev/intel/badges";
-import { fmtMonth, fmtSeriesValue } from "@/lib/intel";
-import type { CalibrationBin, ForecastPoint, Risk, SeriesPoint, Severity } from "@/lib/intel-types";
+import { fmtDay, fmtMonth, fmtScaleValue, fmtSeriesValue, fmtValue } from "@/lib/intel";
+import type { CalibrationBin, DecisionScale, ForecastPoint, Risk, SeriesPoint, Severity } from "@/lib/intel-types";
 import { cn } from "@/lib/utils";
 
 /*
@@ -328,7 +328,7 @@ export function FanChart({ history, points, metric, height = 280 }: { history: S
 // ---- reliability diagram ----------------------------------------------------------------------
 
 /** Predicted vs observed rate per bin, against the y = x line of perfect calibration. */
-export function ReliabilityDiagram({ bins, height = 280 }: { bins: CalibrationBin[]; height?: number }) {
+export function ReliabilityDiagram({ bins, height = 280, observedLabel = "Observed lapse rate per bin" }: { bins: CalibrationBin[]; height?: number; observedLabel?: string }) {
   const data = [...bins].sort((a, b) => a.predicted - b.predicted);
   return (
     <div>
@@ -368,7 +368,7 @@ export function ReliabilityDiagram({ bins, height = 280 }: { bins: CalibrationBi
       </ResponsiveContainer>
       <ChartLegend
         items={[
-          { label: "Observed lapse rate per bin", color: "var(--sig-content)", kind: "line" },
+          { label: observedLabel, color: "var(--sig-content)", kind: "line" },
           { label: "Perfect calibration (y = x)", color: "var(--muted-foreground)", kind: "line" },
         ]}
       />
@@ -378,22 +378,57 @@ export function ReliabilityDiagram({ bins, height = 280 }: { bins: CalibrationBi
 
 // ---- counts per bin ---------------------------------------------------------------------------
 
-export function CountBars({ data, height = 180, name = "decisions" }: { data: { bin: string; n: number }[]; height?: number; name?: string }) {
+export function CountBars({
+  data,
+  height = 180,
+  name = "decisions",
+  binLabel = "confidence",
+  tickFormatter,
+}: {
+  data: { bin: string; n: number }[];
+  height?: number;
+  name?: string;
+  binLabel?: string;
+  /** shorten bin labels on the axis (the tooltip keeps the full bin) */
+  tickFormatter?: (bin: string) => string;
+}) {
   return (
     <ResponsiveContainer width="100%" height={height}>
       <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }} barCategoryGap={2}>
         <CartesianGrid vertical={false} stroke="var(--rule)" strokeWidth={1} />
-        <XAxis dataKey="bin" tick={TICK} axisLine={{ stroke: "var(--rule)" }} tickLine={false} />
+        <XAxis dataKey="bin" tick={TICK} axisLine={{ stroke: "var(--rule)" }} tickLine={false} tickFormatter={tickFormatter} minTickGap={8} />
         <YAxis tick={TICK} axisLine={false} tickLine={false} width={32} allowDecimals={false} />
         <Tooltip
           cursor={{ fill: "var(--accent)", opacity: 0.4 }}
           content={({ active, payload, label }) =>
             active ? (
-              <TipBox title={`confidence ${label}`} rows={asTips(payload).map((p) => ({ key: "n", label: name, value: String(p.value), color: "var(--sig-content)" }))} />
+              <TipBox title={`${binLabel} ${label}`} rows={asTips(payload).map((p) => ({ key: "n", label: name, value: String(p.value), color: "var(--sig-content)" }))} />
             ) : null
           }
         />
         <Bar dataKey="n" fill="var(--sig-content)" radius={[4, 4, 0, 0]} maxBarSize={24} isAnimationActive={false} />
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
+/** Counts per calendar day (served recommendations). Single series, so no legend box. */
+export function DailyBars({ data, height = 180, name = "served" }: { data: { date: string; count: number }[]; height?: number; name?: string }) {
+  return (
+    <ResponsiveContainer width="100%" height={height}>
+      <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }} barCategoryGap={2}>
+        <CartesianGrid vertical={false} stroke="var(--rule)" strokeWidth={1} />
+        <XAxis dataKey="date" tick={TICK} axisLine={{ stroke: "var(--rule)" }} tickLine={false} minTickGap={24} tickFormatter={(t: string) => t.slice(5, 10)} />
+        <YAxis tick={TICK} axisLine={false} tickLine={false} width={40} allowDecimals={false} />
+        <Tooltip
+          cursor={{ fill: "var(--accent)", opacity: 0.4 }}
+          content={({ active, payload, label }) =>
+            active ? (
+              <TipBox title={fmtDay(String(label ?? ""))} rows={asTips(payload).map((p) => ({ key: "n", label: name, value: Number(p.value).toLocaleString(), color: "var(--sig-content)" }))} />
+            ) : null
+          }
+        />
+        <Bar dataKey="count" fill="var(--sig-content)" radius={[4, 4, 0, 0]} maxBarSize={20} isAnimationActive={false} />
       </BarChart>
     </ResponsiveContainer>
   );
@@ -460,6 +495,150 @@ export function OptionScores({ scores, answer, className }: { scores: Record<str
         </li>
       ))}
     </ul>
+  );
+}
+
+/**
+ * A score decision on its scale: the track spans scale.min..max, the answer_interval is a wash of
+ * the accent and the answer a tick with a surface ring. Ends and values are printed, so nothing
+ * depends on reading the bar.
+ */
+export function ScoreRange({
+  value,
+  interval,
+  scale,
+  coverage,
+  className,
+}: {
+  value: number | null;
+  interval?: [number, number] | null;
+  scale: DecisionScale;
+  /** nominal coverage of the interval (the decision's confidence) */
+  coverage?: number | null;
+  className?: string;
+}) {
+  const view = scoreWindow(value, interval ?? null, scale);
+  const span = view.max - view.min || 1;
+  const pos = (v: number) => Math.max(0, Math.min(100, ((v - view.min) / span) * 100));
+  const f = (v: number | null | undefined) => fmtScaleValue(v, scale);
+  const cov = coverage !== null && coverage !== undefined ? `${(coverage * 100).toFixed(0)} % ` : "";
+  const label =
+    `${value === null ? "No answer" : `Answer ${f(value)}`}` +
+    (interval ? `, ${cov}interval ${f(interval[0])} to ${f(interval[1])}` : "") +
+    `, on a scale from ${f(scale.min)} to ${f(scale.max)}`;
+  return (
+    <figure className={cn("w-full min-w-0", className)} role="img" aria-label={label} data-testid="score-range">
+      <div className="relative h-5">
+        <span className={cn("absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-rule", view.zoomed && "border-x border-rule")} aria-hidden />
+        {interval && (
+          <span
+            data-testid="score-range-interval"
+            className="absolute top-1/2 h-2 -translate-y-1/2 rounded-[2px] bg-primary/25"
+            style={{ left: `${pos(interval[0])}%`, width: `${Math.max(pos(interval[1]) - pos(interval[0]), 0.5)}%` }}
+            aria-hidden
+          />
+        )}
+        {value !== null && (
+          <span
+            data-testid="score-range-value"
+            className="absolute top-1/2 h-4 w-1 -translate-x-1/2 -translate-y-1/2 rounded-[2px] bg-primary ring-2 ring-card"
+            style={{ left: `${pos(value)}%` }}
+            aria-hidden
+          />
+        )}
+      </div>
+      <figcaption className="num mt-1 flex flex-wrap justify-between gap-x-2 text-[11px] text-muted-foreground" aria-hidden>
+        <span>{fmtValue(view.min)}</span>
+        {interval && <span className="text-ink-2">{cov}interval {fmtValue(interval[0])}–{fmtValue(interval[1])}</span>}
+        <span>{fmtValue(view.max)}</span>
+      </figcaption>
+      {view.zoomed ? (
+        <p className="mt-0.5 text-[11px] text-muted-foreground" data-testid="score-range-zoom">
+          zoomed in; the full scale is {fmtValue(scale.min)}–{f(scale.max)}
+        </p>
+      ) : (
+        <p className="mt-0.5 text-[11px] text-muted-foreground" data-testid="score-range-scale">
+          scale {fmtValue(scale.min)}–{f(scale.max)}
+        </p>
+      )}
+    </figure>
+  );
+}
+
+/**
+ * The stretch of a decision's scale to draw. When the answer and its interval fill less than a
+ * quarter of the scale (a 1.4 % share on 0–100 %), the track zooms to a rounded window around them
+ * and says so; otherwise it shows the whole scale.
+ */
+export function scoreWindow(value: number | null, interval: [number, number] | null, scale: DecisionScale): { min: number; max: number; zoomed: boolean } {
+  const full = { min: scale.min, max: scale.max, zoomed: false };
+  const span = scale.max - scale.min;
+  if (!interval || span <= 0) return full;
+  const clamp = (v: number) => Math.max(scale.min, Math.min(scale.max, v));
+  const pts = [value, ...interval].filter((v): v is number => typeof v === "number" && Number.isFinite(v)).map(clamp);
+  const lo = Math.min(...pts);
+  const hi = Math.max(...pts);
+  const pad = (hi - lo) * 0.5 || span * 0.02;
+  if ((hi - lo + 2 * pad) / span >= 0.25) return full;
+  const step = 10 ** Math.floor(Math.log10(hi - lo + 2 * pad));
+  const min = Math.max(scale.min, Math.floor((lo - pad) / step) * step);
+  const max = Math.min(scale.max, Math.ceil((hi + pad) / step) * step);
+  return { min, max, zoomed: true };
+}
+
+/**
+ * One reading per run, oldest → newest: a small line with a dot per run (hover shows the run),
+ * the latest in the accent. The x-axis is run order, not time, because replays share an as_of.
+ */
+export function RunTimeline({
+  points,
+  format,
+  className,
+}: {
+  points: { key: string; v: number; title: string }[];
+  format: (v: number) => string;
+  className?: string;
+}) {
+  if (points.length < 2) return null;
+  const vs = points.map((p) => p.v);
+  const min = Math.min(...vs);
+  const max = Math.max(...vs);
+  const range = max - min || 1;
+  // percent coordinates inside a 6 % inset, so dots stay round at any width
+  const x = (i: number) => 3 + (i / (points.length - 1)) * 94;
+  const y = (v: number) => 12 + (1 - (v - min) / range) * 76;
+  return (
+    <div className={cn("flex items-center gap-3", className)}>
+      <span className="num w-14 shrink-0 text-right text-[11px] text-muted-foreground" aria-hidden>{format(vs[0])}</span>
+      <div className="relative h-12 min-w-0 flex-1" aria-hidden>
+        <span className="absolute inset-x-0 bottom-0 h-px bg-rule" />
+        <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="absolute inset-0 size-full overflow-visible">
+          <polyline
+            points={points.map((p, i) => `${x(i)},${y(p.v)}`).join(" ")}
+            fill="none"
+            stroke="var(--ink-2)"
+            strokeWidth={2}
+            vectorEffect="non-scaling-stroke"
+            strokeLinejoin="round"
+            strokeLinecap="round"
+          />
+        </svg>
+        {points.map((p, i) => {
+          const last = i === points.length - 1;
+          return (
+            <span
+              key={p.key}
+              title={p.title}
+              className="group absolute flex size-4 -translate-x-1/2 -translate-y-1/2 items-center justify-center"
+              style={{ left: `${x(i)}%`, top: `${y(p.v)}%` }}
+            >
+              <span className={cn("size-2 rounded-full ring-2 ring-card", last ? "bg-primary" : "bg-ink-2 group-hover:bg-foreground")} />
+            </span>
+          );
+        })}
+      </div>
+      <span className="num w-14 shrink-0 text-[11px] text-foreground" aria-hidden>{format(vs[vs.length - 1])}</span>
+    </div>
   );
 }
 

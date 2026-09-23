@@ -63,6 +63,9 @@ export interface RecItem {
   secondary_reasons: string[];
   anchor_movie_ids: number[];
   signals: Record<SignalName, SignalValue>;
+  /** v1.1: calibrated P(the member rates this film >= 4); null without a calibration file */
+  confidence?: number | null;
+  confidence_kind?: "probability" | null;
 }
 
 export interface RecResponse {
@@ -86,6 +89,9 @@ export interface SimpleItem {
   score: number;
   reason: string | null;
   signals: Record<string, number>;
+  /** v1.1: calibrated P(rating >= 4), see RecItem.confidence */
+  confidence?: number | null;
+  confidence_kind?: "probability" | null;
 }
 
 export interface SimpleResponse {
@@ -192,4 +198,6 @@ export interface ActiveSummary {
   split: string;
   eval_users: number | null;
   comparison: Record<string, Record<string, number>>;
+  /** v1.1: recommendation calibration metrics, null when the model has none */
+  calibration?: Record<string, unknown> | null;
 }

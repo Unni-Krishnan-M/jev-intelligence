@@ -161,6 +161,9 @@ class Recommendation(Base):
     __table_args__ = (
         Index("ix_rec_user_created", "user_id", "created_at"),
         Index("ix_rec_request", "request_id"),
+        CheckConstraint(
+            "confidence_kind IS NULL OR confidence_kind IN ('probability')", name="ck_rec_confidence_kind"
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -174,16 +177,39 @@ class Recommendation(Base):
     reason: Mapped[str] = mapped_column(String(300), nullable=False)
     reason_code: Mapped[str] = mapped_column(String(32), nullable=False)
     signals: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    # calibrated P(rating >= 4) from models/<version>/calibration.json; null without a calibration
+    confidence: Mapped[float | None] = mapped_column(Float)
+    confidence_kind: Mapped[str | None] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     movie: Mapped[Movie] = relationship(lazy="joined")
 
 
+# Partial unique indexes (migration 0004): one verdict (like / dislike / not_interested) and one click per
+# user per served recommendation, or per user per movie for feedback given outside a recommendation.
+# A click is an interaction, not a judgement, so it has its own slot and never replaces a verdict.
+_WITH_REC, _NO_REC = "recommendation_id IS NOT NULL", "recommendation_id IS NULL"
+_VERDICT, _CLICK = "feedback <> 'clicked'", "feedback = 'clicked'"
+FEEDBACK_UNIQUE_INDEXES: tuple[tuple[str, str, str], ...] = (
+    ("uq_feedback_verdict_rec", "recommendation_id", f"{_WITH_REC} AND {_VERDICT}"),
+    ("uq_feedback_verdict_movie", "movie_id", f"{_NO_REC} AND {_VERDICT}"),
+    ("uq_feedback_click_rec", "recommendation_id", f"{_WITH_REC} AND {_CLICK}"),
+    ("uq_feedback_click_movie", "movie_id", f"{_NO_REC} AND {_CLICK}"),
+)
+
+
 class RecommendationFeedback(Base):
+    """A member's latest verdict on a recommendation (or movie), plus at most one click row.
+    POST /recommendations/feedback upserts; it never appends duplicates."""
+
     __tablename__ = "recommendation_feedback"
     __table_args__ = (
         CheckConstraint("feedback IN ('like','dislike','not_interested','clicked')", name="ck_feedback_kind"),
         Index("ix_feedback_user_created", "user_id", "created_at"),
+        *(
+            Index(name, "user_id", col, unique=True, sqlite_where=text(where), postgresql_where=text(where))
+            for name, col, where in FEEDBACK_UNIQUE_INDEXES
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -261,7 +287,19 @@ INTEL_SEVERITIES = ("low", "medium", "high", "critical")
 WARNING_STATUSES = ("new", "acknowledged", "investigating", "resolved", "dismissed")
 WARNING_OPEN_STATUSES = ("new", "acknowledged", "investigating")
 DECISION_KINDS = ("boolean", "choice", "score")
-CONFIDENCE_KINDS = ("probability", "margin", "rule")
+CONFIDENCE_KINDS = ("probability", "margin", "rule", "interval")
+TREND_DIRECTIONS = ("up", "down", "flat")
+EVIDENCE_OWNERS = ("signal", "trend", "anomaly", "forecast", "risk", "decision", "warning", "action")
+AUDIT_ACTIONS = (
+    "intel.run",
+    "warning.transition",
+    "feedback.create",
+    "scenario.save",
+    "model.activate",
+    "auth.login.success",
+    "auth.login.failure",
+    "auth.register",
+)
 FEEDBACK_VERDICTS = {
     "decision": ("correct", "incorrect"),
     "warning": ("useful", "not_useful", "false_positive"),
@@ -404,6 +442,7 @@ class IntelDecision(Base):
         CheckConstraint(_in("confidence_kind", CONFIDENCE_KINDS), name="ck_intel_decision_confidence_kind"),
         Index("ix_intel_decisions_decision_id", "decision_id"),
         Index("ix_intel_decisions_key_created", "key", "created_at"),
+        Index("ix_intel_decisions_batch", "batch_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -426,6 +465,11 @@ class IntelDecision(Base):
     fallback_reason: Mapped[str | None] = mapped_column(Text)
     entity_type: Mapped[str | None] = mapped_column(String(32))
     entity: Mapped[str | None] = mapped_column(String(200))
+    # v1.1 (section 9.1): multi-question batches and numeric "score" answers
+    batch_id: Mapped[str | None] = mapped_column(String(64))
+    answer_value: Mapped[float | None] = mapped_column(Float)  # score decisions; `answer` keeps str()
+    answer_interval: Mapped[list[float] | None] = mapped_column(JSON)
+    scale: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
@@ -468,3 +512,223 @@ class IntelFeedback(Base):
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     run_id: Mapped[str | None] = mapped_column(ForeignKey("intel_runs.run_id", ondelete="SET NULL"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+# --- v1.1: normalised run objects, audit log, evaluation runs (docs/intelligence.md, section 9.3) ------
+# Each run object keeps indexed key columns plus its full contract JSON in `payload`. `run_id` here is
+# the integer intel_runs.id (CASCADE); the API reports the run's uuid. Kinds are an ML-owned, open
+# vocabulary and carry no CHECK, so a new kind can never fail a run; severities/levels/directions do.
+def _nullable_in(column: str, values: tuple[str, ...]) -> str:
+    return f"{column} IS NULL OR {_in(column, values)}"
+
+
+class IntelSignalRow(Base):
+    __tablename__ = "intel_signals"
+    __table_args__ = (
+        UniqueConstraint("run_id", "signal_id", name="uq_intel_signal_run"),
+        CheckConstraint(_nullable_in("direction", TREND_DIRECTIONS), name="ck_intel_signal_direction"),
+        Index("ix_intel_signals_run_kind", "run_id", "kind"),
+        Index("ix_intel_signals_signal_id", "signal_id"),
+        Index("ix_intel_signals_dedup_key", "dedup_key", "run_id"),
+        Index("ix_intel_signals_entity", "entity_type", "entity"),
+        Index("ix_intel_signals_strength", "strength"),
+        Index("ix_intel_signals_observed", "observed_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("intel_runs.id", ondelete="CASCADE"), nullable=False)
+    signal_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    dedup_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    entity_type: Mapped[str | None] = mapped_column(String(32))
+    entity: Mapped[str | None] = mapped_column(String(200))
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    value: Mapped[float | None] = mapped_column(Float)
+    strength: Mapped[float | None] = mapped_column(Float)
+    direction: Mapped[str | None] = mapped_column(String(8))
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+
+class IntelTrendRow(Base):
+    __tablename__ = "intel_trends"
+    __table_args__ = (
+        UniqueConstraint("run_id", "trend_id", name="uq_intel_trend_run"),
+        CheckConstraint(_nullable_in("direction", TREND_DIRECTIONS), name="ck_intel_trend_direction"),
+        Index("ix_intel_trends_run_direction", "run_id", "direction"),
+        Index("ix_intel_trends_trend_id", "trend_id"),
+        Index("ix_intel_trends_series", "series_id", "run_id"),
+        Index("ix_intel_trends_entity", "entity_type", "entity"),
+        Index("ix_intel_trends_p_value", "p_value"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("intel_runs.id", ondelete="CASCADE"), nullable=False)
+    trend_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    series_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    metric: Mapped[str | None] = mapped_column(String(32))
+    entity_type: Mapped[str | None] = mapped_column(String(32))
+    entity: Mapped[str | None] = mapped_column(String(200))
+    direction: Mapped[str | None] = mapped_column(String(8))
+    slope: Mapped[float | None] = mapped_column(Float)
+    p_value: Mapped[float | None] = mapped_column(Float)
+    q_value: Mapped[float | None] = mapped_column(Float)
+    evidence_strength: Mapped[float | None] = mapped_column(Float)
+    has_change_point: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+
+class IntelAnomalyRow(Base):
+    __tablename__ = "intel_anomalies"
+    __table_args__ = (
+        UniqueConstraint("run_id", "anomaly_id", name="uq_intel_anomaly_run"),
+        CheckConstraint(_nullable_in("severity", INTEL_SEVERITIES), name="ck_intel_anomaly_severity"),
+        Index("ix_intel_anomalies_run_kind", "run_id", "kind"),
+        Index("ix_intel_anomalies_anomaly_id", "anomaly_id"),
+        Index("ix_intel_anomalies_dedup_key", "dedup_key", "run_id"),
+        Index("ix_intel_anomalies_series", "series_id"),
+        Index("ix_intel_anomalies_entity", "entity_type", "entity"),
+        Index("ix_intel_anomalies_severity", "severity"),
+        Index("ix_intel_anomalies_score", "score"),
+        Index("ix_intel_anomalies_detected", "detected_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("intel_runs.id", ondelete="CASCADE"), nullable=False)
+    anomaly_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    dedup_key: Mapped[str | None] = mapped_column(String(200))
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    entity_type: Mapped[str | None] = mapped_column(String(32))
+    entity: Mapped[str | None] = mapped_column(String(200))
+    series_id: Mapped[str | None] = mapped_column(String(200))
+    severity: Mapped[str | None] = mapped_column(String(16))
+    score: Mapped[float | None] = mapped_column(Float)
+    value: Mapped[float | None] = mapped_column(Float)
+    detected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    suppressed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+
+class IntelForecastRow(Base):
+    __tablename__ = "intel_forecasts"
+    __table_args__ = (
+        UniqueConstraint("run_id", "forecast_id", name="uq_intel_forecast_run"),
+        Index("ix_intel_forecasts_forecast_id", "forecast_id"),
+        Index("ix_intel_forecasts_series", "series_id", "run_id"),
+        Index("ix_intel_forecasts_entity", "entity_type", "entity"),
+        Index("ix_intel_forecasts_mase", "mase"),
+        Index("ix_intel_forecasts_issued", "issued_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("intel_runs.id", ondelete="CASCADE"), nullable=False)
+    forecast_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    series_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    metric: Mapped[str | None] = mapped_column(String(32))
+    entity_type: Mapped[str | None] = mapped_column(String(32))
+    entity: Mapped[str | None] = mapped_column(String(200))
+    model: Mapped[str | None] = mapped_column(String(40))
+    horizon_months: Mapped[int | None] = mapped_column(Integer)
+    mase: Mapped[float | None] = mapped_column(Float)
+    coverage80: Mapped[float | None] = mapped_column(Float)
+    issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+
+class IntelRiskRow(Base):
+    __tablename__ = "intel_risks"
+    __table_args__ = (
+        UniqueConstraint("run_id", "risk_id", name="uq_intel_risk_run"),
+        CheckConstraint(_nullable_in("level", INTEL_SEVERITIES), name="ck_intel_risk_level"),
+        Index("ix_intel_risks_run_kind", "run_id", "kind"),
+        Index("ix_intel_risks_risk_id", "risk_id"),
+        Index("ix_intel_risks_key", "key", "run_id"),
+        Index("ix_intel_risks_entity", "entity_type", "entity"),
+        Index("ix_intel_risks_level", "level"),
+        Index("ix_intel_risks_score", "score"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("intel_runs.id", ondelete="CASCADE"), nullable=False)
+    risk_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    key: Mapped[str] = mapped_column(String(200), nullable=False)  # risk:<kind>:<entity>, the warning key
+    kind: Mapped[str] = mapped_column(String(40), nullable=False)
+    entity_type: Mapped[str | None] = mapped_column(String(32))
+    entity: Mapped[str | None] = mapped_column(String(200))
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    level: Mapped[str | None] = mapped_column(String(16))
+    score: Mapped[float | None] = mapped_column(Float)
+    likelihood: Mapped[float | None] = mapped_column(Float)
+    impact: Mapped[float | None] = mapped_column(Float)
+    exposure: Mapped[float | None] = mapped_column(Float)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+
+class IntelEvidenceRow(Base):
+    """Every Evidence item of a run, polymorphic over its owner (owner_id = the owner's contract id;
+    warnings, which carry no id in the result, use their dedup key)."""
+
+    __tablename__ = "intel_evidence"
+    __table_args__ = (
+        CheckConstraint(_in("owner_type", EVIDENCE_OWNERS), name="ck_intel_evidence_owner"),
+        Index("ix_intel_evidence_run_owner", "run_id", "owner_type"),
+        Index("ix_intel_evidence_owner", "owner_type", "owner_id"),
+        Index("ix_intel_evidence_kind", "kind"),
+        Index("ix_intel_evidence_ref", "ref"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("intel_runs.id", ondelete="CASCADE"), nullable=False)
+    owner_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    owner_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    owner_title: Mapped[str] = mapped_column(String(300), default="", nullable=False)
+    position: Mapped[int] = mapped_column(Integer, default=0, nullable=False)  # order within the owner
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    label: Mapped[str] = mapped_column(String(300), default="", nullable=False)
+    value_num: Mapped[float | None] = mapped_column(Float)
+    value_text: Mapped[str | None] = mapped_column(Text)
+    detail: Mapped[str | None] = mapped_column(Text)
+    ref: Mapped[str | None] = mapped_column(String(200))
+
+
+class AuditLog(Base):
+    """Who did what, when (never secrets: see services/audit.py)."""
+
+    __tablename__ = "audit_logs"
+    __table_args__ = (
+        CheckConstraint(_in("action", AUDIT_ACTIONS), name="ck_audit_action"),
+        Index("ix_audit_logs_at", "at"),
+        Index("ix_audit_logs_action_at", "action", "at"),
+        Index("ix_audit_logs_actor_at", "actor", "at"),
+        Index("ix_audit_logs_target", "target_type", "target_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    actor_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    actor: Mapped[str] = mapped_column(
+        String(320), nullable=False
+    )  # "system" or an email (attempted, on failure)
+    action: Mapped[str] = mapped_column(String(40), nullable=False)
+    target_type: Mapped[str | None] = mapped_column(String(32))
+    target_id: Mapped[str | None] = mapped_column(String(200))
+    detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    request_id: Mapped[str | None] = mapped_column(String(64))
+
+
+class IntelEvaluationRun(Base):
+    """One offline evaluation of the intelligence layer, synced from experiments/intel-eval-*/report.json."""
+
+    __tablename__ = "intel_evaluation_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_dir: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    pipeline_version: Mapped[str | None] = mapped_column(String(40))
+    data_version: Mapped[str | None] = mapped_column(String(120))
+    as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    headline: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    report_sha1: Mapped[str] = mapped_column(String(40), nullable=False)  # re-synced when the file changes
+    report: Mapped[dict[str, Any]] = mapped_column(JSON, deferred=True, nullable=False)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)

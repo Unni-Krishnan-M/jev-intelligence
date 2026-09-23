@@ -103,3 +103,31 @@ Examples actually produced: *Recommended because of your interest in Christopher
   ratings. With zero events the ranking is popularity + genre preference. Behavioural signals ramp in as described above.
 - **New movie**: metadata-only neighbours via the persisted featurizer (`/recommendations/similar/{id}` falls back
   automatically). Unrated catalogue items keep a non-zero content support prior.
+
+## Recommendation confidence (`calibration.py`)
+Each served recommendation can carry `confidence`: a **calibrated probability** that the user rates the film ≥ 4
+among their next 5 ratings, with `confidence_kind: "probability"`. It comes from
+`models/<version>/calibration.json`, written by `uv run python scripts/calibrate_recommendations.py [--model VERSION]`
+(or `scripts/train_models.py --calibrate`). Without that file, or for ranks beyond the calibrated `k` (50),
+`confidence` is `null`. It is never guessed.
+
+How it is fitted:
+- The served model is trained on every rating, so its own scores on held-out rows would be scores on training data.
+  The calibrator therefore repeats the model's recorded experiment protocol (`manifest.training_config`: same split,
+  same hyper-parameters). Component models are fitted on the **train** split, and each user's top-50 list is labelled
+  against the user's next 5 **validation** ratings (users with ≥ 5 validation ratings).
+- Isotonic regression maps the hybrid score, or the rank, to the observed hit rate. The feature is chosen per stratum
+  by a 2-fold cross-fit inside the validation users (lower Brier). The test split is never used for fitting or
+  selection.
+- Short profiles behave differently: with 3 interactions the hit rate is less than half the warm rate. So there is
+  one calibrator per **profile-size stratum**. Validation users are truncated to 0, 3 or 10 interactions (and folded
+  in, as new app users are) or kept at their full profile. The stratum ranges split at geometric midpoints of the
+  strata's median profile sizes: 0–1, 2–5, 6–30 and ≥ 31 interactions.
+- Serving evaluates the stored knots with `numpy.interp`. That costs about 4 µs per recommendation, and a 20-item page
+  took 19.0 ms with the calibrator vs 18.7 ms without it (median of 100 requests each).
+
+Assumption (it is recorded in the file): the score/rank → relevance mapping learnt from a model fitted on less data
+transfers to the served model. The test evaluation measures exactly this, by refitting the models on train+validation
+and applying the calibrators unchanged. Unrated films count as not relevant, so the probability is a lower bound on
+"would like it". The results are in [evaluation.md](evaluation.md#recommendation-confidence-calibration).
+

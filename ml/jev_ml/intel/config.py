@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-PIPELINE_VERSION = "intel-1.0.0"
+PIPELINE_VERSION = "intel-1.1.0"  # 1.1: score decisions, decision batches (contract section 9.1)
 FORECAST_VERSION = "fc-1.0.0"
 LAPSE_VERSION = "lapse-1.0.0"
 
@@ -139,6 +139,10 @@ class IntelConfig:
     rater_influence_ref: float = 3.0  # removing one user changing >= 3 top-50 films = full influence
     reengage_min_auc: float = 0.65
     reengage_min_users: int = 5
+    slot_share_window_months: int = 3  # "next quarter": slots are planned per quarter
+    # a window interval whose backtested coverage fell below 60 % cannot be reported as an 80 %
+    # interval (at the ~20 origins available, 60 % is ~2.2 binomial SDs under 80 %)
+    slot_share_min_coverage: float = 0.6
 
     # ---- warnings / actions -------------------------------------------------------------------
     warning_min_severity: str = "medium"

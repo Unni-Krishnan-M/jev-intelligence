@@ -5,7 +5,7 @@ import { EmptyState } from "@/components/jev/states";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError, errorMessage } from "@/lib/api";
-import { isNoRun } from "@/lib/intel";
+import { isNoRun, isNotDeployed } from "@/lib/intel";
 import { cn } from "@/lib/utils";
 
 export function NoRunState({ detail, className }: { detail?: string; className?: string }) {
@@ -19,11 +19,24 @@ export function NoRunState({ detail, className }: { detail?: string; className?:
   );
 }
 
+/** The API answering does not have this endpoint yet (an older build than the console). */
+export function NotDeployedState({ what, className }: { what: string; className?: string }) {
+  return (
+    <EmptyState
+      className={className}
+      title="Not available on this API version"
+      body={`The API that answered does not provide ${what} yet. Upgrade the backend to v1.1 or later; nothing is shown rather than guessed.`}
+    />
+  );
+}
+
 /**
  * Error panel for /intel/* calls. A 404/503 on a run-backed endpoint means "no run yet" and gets
  * the empty state instead (pass runBacked={false} for DB-backed lookups where 404 is a real miss).
+ * Pass `what` on v1.1 endpoints: a route-miss 404 then reads "not available on this API version".
  */
-export function IntelError({ error, retry, runBacked = true, className }: { error: unknown; retry?: () => void; runBacked?: boolean; className?: string }) {
+export function IntelError({ error, retry, runBacked = true, what, className }: { error: unknown; retry?: () => void; runBacked?: boolean; what?: string; className?: string }) {
+  if (what && isNotDeployed(error)) return <NotDeployedState what={what} className={className} />;
   if (runBacked && isNoRun(error)) return <NoRunState className={className} detail={error instanceof ApiError ? error.message : undefined} />;
   const status = error instanceof ApiError ? error.status : null;
   const requestId = error instanceof ApiError ? error.requestId : undefined;

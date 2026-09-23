@@ -29,6 +29,7 @@ from jev_ml.intel.series import Series
 
 MODELS = ("naive", "moving_average", "holt_damped")
 FORECAST_PREFIXES = ("volume:all", "active_users:all", "volume:genre:")
+SHARE_PREFIX = "share:genre:"  # forecast separately (predictions.share_forecasts), see forecast_shares
 
 
 @dataclass
@@ -46,6 +47,7 @@ class ForecastState:
     q_hi: np.ndarray
     params: dict[str, Any] = field(default_factory=dict)
     backtest: dict[str, Any] = field(default_factory=dict)
+    bt: _Backtest | None = None  # the selected model's backtest (window aggregates, not serialised)
 
     def months_ahead(self, h: int) -> list[pd.Period]:
         last = self.history_months[-1]
@@ -283,6 +285,7 @@ def forecast_series(
         q_hi=q_hi,
         params=params,
         backtest=sel["metrics"],
+        bt=sel["bt"],
     )
     hist_n = min(len(raw), cfg.forecast_history_months)
     fc_params = {
@@ -344,6 +347,83 @@ def scenario_points(state: ForecastState, path: np.ndarray, horizon: int) -> lis
             }
         )
     return pts
+
+
+def window_mean_forecast(state: ForecastState, window: int, cfg: IntelConfig) -> dict[str, Any] | None:
+    """Mean of the first ``window`` forecast months with a conformal interval for that mean.
+
+    The interval uses the selected model's backtest residuals *of the window mean* (origins whose
+    whole window was observed), with the same finite-sample order statistics as the per-step
+    intervals; averaging per-step bounds instead would ignore how errors of adjacent months
+    correlate. ``coverage`` is measured honestly: each origin's interval uses only window residuals
+    whose last target month precedes that origin. Identity-transform series only (shares, ratings);
+    None when there are too few complete windows."""
+    bt = state.bt
+    if bt is None or state.transform != "identity" or window < 1 or window > bt.resid.shape[1]:
+        return None
+    res = bt.resid[:, :window]
+    full = np.isfinite(res).all(axis=1)
+    wres = np.where(full, res.mean(axis=1) if res.size else np.nan, np.nan)
+    last_target = bt.target[:, window - 1]
+    q = _order_stat_interval(wres[full], cfg)
+    if q is None:
+        return None
+    hits = total = 0
+    for j, o in enumerate(bt.origins):
+        if not full[j]:
+            continue
+        past = wres[full & (last_target < o) & (last_target >= 0)]
+        qj = _order_stat_interval(past, cfg)
+        if qj is None:
+            continue
+        total += 1
+        hits += int(qj[0] - 1e-12 <= wres[j] <= qj[1] + 1e-12)
+    mean = float(np.mean(state.path[:window]))
+    months = state.months_ahead(window)
+    return {
+        "months": [month_str(m) for m in months],
+        "mean": mean,
+        "lo": mean + q[0],
+        "hi": mean + q[1],
+        "n_residuals": int(full.sum()),
+        "coverage": hits / total if total else None,
+        "coverage_origins": total,
+        "nominal": cfg.forecast_interval,
+    }
+
+
+def _order_stat_interval(r: np.ndarray, cfg: IntelConfig) -> tuple[float, float] | None:
+    r = r[np.isfinite(r)]
+    if len(r) < cfg.forecast_min_residuals:
+        return None
+    lo_q = (1 - cfg.forecast_interval) / 2
+    srt = np.sort(r)
+    n = len(srt)
+    k_hi = min(n, int(np.ceil((n + 1) * (1 - lo_q))))
+    k_lo = max(1, int(np.floor((n + 1) * lo_q)))
+    return float(srt[k_lo - 1]), float(srt[k_hi - 1])
+
+
+def forecast_shares(
+    series: list[Series], cfg: IntelConfig, as_of_key: str, data_version: str
+) -> tuple[list[dict[str, Any]], dict[str, ForecastState]]:
+    """Forecasts of ``share:genre:*`` (inputs of the editorial slot-share decision). Only genres with
+    a recent share >= ``genre_min_share`` (the same eligibility as the programming decision)."""
+    out, states = [], {}
+    for s in series:
+        if not s.id.startswith(SHARE_PREFIX):
+            continue
+        _, raw, _ = s.complete()
+        recent = raw[-cfg.trend_window_months :]
+        recent = recent[np.isfinite(recent)]
+        if not len(recent) or float(np.mean(recent)) < cfg.genre_min_share:
+            continue
+        res = forecast_series(s, cfg, as_of_key, data_version)
+        if res is None:
+            continue
+        out.append(res[0])
+        states[s.id] = res[1]
+    return out, states
 
 
 def forecast_all(

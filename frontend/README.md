@@ -1,36 +1,51 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# JEV web app
 
-## Getting Started
+Next.js 16 (App Router), React 19, TypeScript, Tailwind v4, shadcn/ui, Recharts and SWR. Every call
+goes to `/api/*`, which `next.config.ts` proxies to the FastAPI backend (`JEV_API_URL`, default
+`http://127.0.0.1:8000`). `JEV_API_URL` is read when you run `pnpm build`, not at runtime. The Docker image is
+built with `http://api:8000`.
 
-First, run the development server:
+Set `JEV_HTTPS=true` (at runtime) only when the site is served over HTTPS. `src/proxy.ts` then adds
+`Strict-Transport-Security`, and the CSP adds `upgrade-insecure-requests`. Leave it unset for local http.
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+pnpm install
+pnpm dev                      # http://localhost:3000
+pnpm exec next typegen && pnpm exec tsc --noEmit
+pnpm lint
+pnpm test                     # Vitest + Testing Library (jsdom), tests in src/__tests__
+pnpm build && pnpm start
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+The version shown in the footer comes from `src/lib/version.ts`; keep it equal to `package.json`
+(a unit test checks).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Intelligence console (`/intel`)
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Admin-only views over the intelligence layer (contract: `docs/intelligence.md`, sections 4, 6
+and 9). v1.1 adds score decisions and decision batches, run-history timelines on signals, risks
+and trends, the evidence explorer (`/intel/evidence`), recommender monitoring
+(`/intel/recommendations`), the audit log (`/intel/audit`) and the evaluation-run history. When
+the API answering predates an endpoint, the view says "not available on this API version" rather
+than failing.
 
-## Learn More
+## Design references
 
-To learn more about Next.js, take a look at the following resources:
+Structure only; the visual style stays JEV's (serif display, mono data, one amber accent,
+hairlines).
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- **Evidence explorer**: Grafana Explore's logs view
+  (<https://grafana.com/docs/grafana/latest/explore/logs-integration/>). A line-filter search
+  above the results, rows that carry their fields, and "filter on this value" from inside a row
+  (the owner-type chip on each row sets the owner filter).
+- **Audit log**: common audit-trail viewer patterns, for example
+  <https://dev.to/dangtony98/guide-to-building-audit-logs-for-application-software-49fh>. Actor
+  and action filters in one row above a table of time (UTC), action, actor, target and request id.
+  Failed actions are set apart by icon and word, the raw detail sits one click away, and a filter
+  that matches nothing gets its own empty state. Clicking an actor filters by that actor.
+- **Calibration**: scikit-learn's probability calibration guide
+  (<https://scikit-learn.org/stable/modules/calibration.html>) and
+  <https://github.com/hollance/reliability-diagrams>. A reliability diagram against y = x with a
+  per-bin table, ECE and Brier beside it (Brier next to the base-rate forecaster for scale), and
+  the histogram of served confidences below, so sparse bins show. Without a calibration file the
+  page says "Not calibrated" and draws nothing.

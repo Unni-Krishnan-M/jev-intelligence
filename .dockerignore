@@ -12,3 +12,9 @@ experiments
 docs/screenshots
 *.db
 .env
+# frontend unit tests (Vitest) are not part of the web image build
+frontend/src/__tests__
+frontend/vitest.config.mts
+frontend/tsconfig.tsbuildinfo
+jev.egg-info
+.github

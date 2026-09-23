@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Path, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -19,6 +19,33 @@ bearer = HTTPBearer(auto_error=False)
 CSRF_HEADER = "x-jev-csrf"
 
 DB = Annotated[Session, Depends(get_db)]
+
+# Integer inputs that reach SQL are bounded. Every primary key is an INTEGER column (32-bit on
+# PostgreSQL); a larger value overflows the driver (a 500 on SQLite) instead of matching nothing.
+MAX_DB_INT = 2**31 - 1
+MAX_OFFSET = 1_000_000
+MAX_PAGE = 10_000  # page numbers (page_size <= 200)
+MAX_COUNT = 10**9  # rating-count filters
+IdPath = Annotated[int, Path(ge=0, le=MAX_DB_INT)]
+
+
+def client_address(request: Request) -> str:
+    """The client address used for rate limiting and audit rows.
+
+    X-Forwarded-For is never parsed here: its leftmost entries are whatever the client sent. Behind a
+    reverse proxy, run uvicorn with `--proxy-headers --forwarded-allow-ips <proxy address>`; uvicorn
+    then replaces `request.client` with the right-most untrusted hop, and only for connections that
+    come from the listed proxy. A direct client's headers are ignored."""
+    return request.client.host if request.client else "unknown"
+
+
+def parse_db_id(ref: str) -> int | None:
+    """A numeric database id from a path/body string, or None. ASCII digits only
+    (str.isdigit() also accepts "²" and other digits int() rejects) and within MAX_DB_INT."""
+    if not (ref.isascii() and ref.isdigit()) or len(ref) > 10:
+        return None
+    value = int(ref)
+    return value if value <= MAX_DB_INT else None
 
 
 def _token_from_request(

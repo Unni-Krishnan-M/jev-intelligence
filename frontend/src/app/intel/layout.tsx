@@ -10,7 +10,10 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useSession } from "@/hooks/use-session";
 import { cn } from "@/lib/utils";
 
-/** Sections in pipeline order: see what changed, what may happen, what to do, how well it works. */
+/**
+ * Sections in pipeline order: see what changed, what may happen, what to do, how well it works,
+ * and where every claim and change came from.
+ */
 const GROUPS: { label: string; items: { href: string; label: string }[] }[] = [
   { label: "Now", items: [{ href: "/intel", label: "Overview" }] },
   {
@@ -42,7 +45,15 @@ const GROUPS: { label: string; items: { href: string; label: string }[] }[] = [
     items: [
       { href: "/intel/feedback", label: "Feedback" },
       { href: "/intel/evaluation", label: "Evaluation" },
+      { href: "/intel/recommendations", label: "Recommender" },
       { href: "/intel/health", label: "System health" },
+    ],
+  },
+  {
+    label: "Trace",
+    items: [
+      { href: "/intel/evidence", label: "Evidence" },
+      { href: "/intel/audit", label: "Audit log" },
     ],
   },
 ];

@@ -49,4 +49,5 @@ jobs:
       - run: pnpm exec next typegen   # route types (LayoutProps, PageProps) that tsc needs
       - run: pnpm exec tsc --noEmit
       - run: pnpm lint
+      - run: pnpm test
       - run: pnpm build

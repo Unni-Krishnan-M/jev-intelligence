@@ -13,15 +13,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
-import pandas as pd
-
 from jev_ml.intel import anomalies as anom
 from jev_ml.intel import decisions as dec
 from jev_ml.intel import risk as rk
 from jev_ml.intel.actions import build_actions
 from jev_ml.intel.common import clean, iso
 from jev_ml.intel.config import PIPELINE_VERSION, IntelConfig, severity_rank
-from jev_ml.intel.forecast import ForecastState, forecast_all
+from jev_ml.intel.forecast import ForecastState, forecast_all, forecast_shares
 from jev_ml.intel.ingest import PipelineInputs, Prepared, prepare
 from jev_ml.intel.lapse import run_lapse
 from jev_ml.intel.modelstats import bootstrap_models
@@ -128,7 +126,10 @@ def run_pipeline(inputs: PipelineInputs, config: IntelConfig | None = None) -> P
             prep.diagnostics.append(
                 {"stage": "live_feedback", "status": "skipped", "reason": live.get("reason")}
             )
-    forecasts, states = tm.run("forecast", lambda: forecast_all(series, cfg, key, prep.data_version))
+    with tm.stage("forecast"):
+        forecasts, states = forecast_all(series, cfg, key, prep.data_version)
+        share_forecasts, share_states = forecast_shares(series, cfg, key, prep.data_version)
+        states = {**states, **share_states}
     lapse, scored = tm.run("lapse", lambda: run_lapse(prep.ratings, prep.as_of_ts, cfg, prep.data_version))
     if lapse["status"] != "ok":
         prep.diagnostics.append({"stage": "lapse", "status": "insufficient_data", "reason": lapse["detail"]})
@@ -149,13 +150,22 @@ def run_pipeline(inputs: PipelineInputs, config: IntelConfig | None = None) -> P
         risks += rk.rejection_risk(live, dq, cfg, key)
         risks.sort(key=lambda r: (-(r["score"] or 0), r["id"]))
     with tm.stage("decide"):
-        decisions = [
-            dec.retrain_decision(manifest, stale, prep.data_version, prep.model_replayable, cfg, key),
-            dec.serving_decision(manifest, boot, prep.model_replayable, cfg, key),
-            *dec.genre_decisions(trends, fc_by, cfg, key),
-            *dec.rater_decisions(rater_anoms, infl, cfg, key),
-            dec.reengagement_decision(lapse, scored, cfg, key),
-        ]
+        decisions, decision_batches = dec.build_decision_batches(
+            manifest=manifest,
+            stale=stale,
+            boot=boot,
+            data_version=prep.data_version,
+            replayable=prep.model_replayable,
+            trends=trends,
+            forecasts_by_series=fc_by,
+            share_windows=dec.share_window_inputs(share_forecasts, share_states, cfg),
+            rater_anoms=rater_anoms,
+            influence=infl,
+            lapse=lapse,
+            lapse_scored=scored,
+            cfg=cfg,
+            as_of_key=key,
+        )
     all_anoms = series_anoms + rater_anoms[: cfg.top_n] + live_anoms
     last_complete = None
     if series:
@@ -202,19 +212,13 @@ def run_pipeline(inputs: PipelineInputs, config: IntelConfig | None = None) -> P
         "signals": signals,
         "trends": trends,
         "anomalies": all_anoms,
-        "predictions": {"forecasts": forecasts, "lapse": lapse},
+        "predictions": {"forecasts": forecasts, "share_forecasts": share_forecasts, "lapse": lapse},
         "risks": risks,
         "decisions": decisions,
+        "decision_batches": decision_batches,
         "warnings": warnings,
         "actions": actions,
         "summary": summary,
         "diagnostics": prep.diagnostics,
     }
     return PipelineResult(data=data, series_objects=series, forecast_states=states, prepared=prep, config=cfg)
-
-
-def run_default(as_of: str | pd.Timestamp | None = None) -> PipelineResult:
-    """Convenience: load the real inputs and run with the default config."""
-    from jev_ml.intel.ingest import load_default_inputs
-
-    return run_pipeline(load_default_inputs(as_of=as_of))
