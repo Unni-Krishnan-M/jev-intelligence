@@ -6,9 +6,10 @@ import logging
 import secrets
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import Field, SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from jev_ml.paths import EXPERIMENTS_DIR, MODELS_DIR, ROOT
 
@@ -26,7 +27,8 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = 60 * 24
     cookie_name: str = "jev_session"
     cookie_secure: bool = False
-    cors_origins: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    # comma-separated in the environment (NoDecode: skip JSON parsing, see _split_origins)
+    cors_origins: Annotated[list[str], NoDecode] = ["http://localhost:3000", "http://127.0.0.1:3000"]
     rate_limit_per_minute: int = 240
     auth_rate_limit_per_minute: int = 20
     admin_email: str | None = None

@@ -3,7 +3,7 @@
 #   docker compose --profile train run --rm trainer # download data + train + evaluate (first run)
 # Trained artifacts live in ./models, ./experiments and ./data on the host, so they are reused
 # by the API container and by local (non-Docker) runs alike.
-name: jev
+name: jev-recsys  # unique project name → its own containers and volumes (jev-recsys_pgdata)
 
 x-api-env: &api-env
   JEV_ENV: ${JEV_ENV:-development}

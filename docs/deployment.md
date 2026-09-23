@@ -12,7 +12,7 @@ Services: `db` (postgres:17-alpine, volume `pgdata`), `cache` (redis:7-alpine, 1
 `train`; `TRAIN_ARGS=--quick` for a fast run). Model artifacts are bind-mounted, so training on the host and serving
 in Docker (or the reverse) share one registry.
 
-Resource use on a laptop: about 350 MB RAM for api + web + db + cache at idle; training peaks around 1.5 GB.
+Resource use: see the measured figures in the README (quick training peaks at about 620 MB RSS).
 
 ## Production checklist
 - `JEV_ENV=production`: disables `/docs` and makes `JEV_JWT_SECRET` mandatory.

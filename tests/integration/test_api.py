@@ -218,3 +218,10 @@ def test_secret_redaction():
     )
     assert out["password"] == "[REDACTED]" and out["nested"]["api_key"] == "[REDACTED]"
     assert "abc.def" not in out["msg"] and "s3cret" not in out["url"]
+
+
+def test_cors_origins_parse_from_comma_separated_env(monkeypatch):
+    from jev_api.config import Settings
+
+    monkeypatch.setenv("JEV_CORS_ORIGINS", "http://localhost:3000, https://jev.example.com")
+    assert Settings().cors_origins == ["http://localhost:3000", "https://jev.example.com"]

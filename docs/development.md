@@ -2,7 +2,7 @@
 
 Requirements: **Python 3.11–3.14** (managed by [uv](https://docs.astral.sh/uv/)), **Node 20.9+** with pnpm (via
 `corepack enable`). Docker is optional. Tested on Linux x86-64; everything is pure Python/JS, so macOS (Intel/Apple
-silicon) and Windows (WSL2 or native) work the same way. The pipeline needs < 2 GB RAM.
+silicon) and Windows (WSL2 or native) work the same way. A `--quick` training run peaked at 616 MB RSS in our measurement.
 
 ```bash
 git clone … && cd JEV

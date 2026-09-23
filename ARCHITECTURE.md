@@ -40,7 +40,7 @@
 3. **Portable artifacts.** Everything is `.npz` or `.json`, with no pickles. The content featurizer stores its
    vocabulary and IDF, so it can vectorise brand-new movies at inference time (item cold start).
 4. **Runs on any laptop.** The dataset is MovieLens *small* (100k ratings) and everything runs on CPU with numpy,
-   scipy and scikit-learn. A full tuned pipeline takes about 4 minutes, a `--quick` run under 20s, and the
+   scipy and scikit-learn. A full tuned pipeline takes about 4 minutes, a `--quick` run about 21 s (peak RSS about 620 MB), and the
    serving model loads in about 0.1s with about 25ms per recommendation request. Without Docker the API uses
    SQLite plus an in-process cache.
 5. **Files are the source of truth for models.** The API mirrors `models/*/manifest.json` and `experiments/*/metrics.json`
