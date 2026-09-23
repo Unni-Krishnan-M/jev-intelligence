@@ -185,7 +185,7 @@ See [docs/deployment.md](docs/deployment.md).
 ```bash
 uv run pytest                   # 99 tests: unit, ML, intelligence, API integration (~13 s; real-data checks skip without data)
 uv run ruff check . && uv run ruff format --check . && uv run mypy
-cd frontend && pnpm exec tsc --noEmit && pnpm exec eslint src && pnpm build
+cd frontend && pnpm exec next typegen && pnpm exec tsc --noEmit && pnpm exec eslint src && pnpm build
 uv run python scripts/capture_screenshots.py     # real-browser user journey (Chrome) → docs/screenshots
 ```
 
