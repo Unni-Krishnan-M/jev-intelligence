@@ -1,0 +1,77 @@
+# JEV experiment configuration. Every value here is recorded with the experiment run and the
+# model version, so a run can be reproduced exactly with:  uv run python scripts/train_models.py
+experiment_name: jev-hybrid-v1
+seed: 42
+
+split:
+  strategy: user_temporal   # user_temporal | global_temporal (see jev_ml/evaluation/split.py)
+  val_frac: 0.1
+  test_frac: 0.2
+
+evaluation:
+  ks: [5, 10, 20]
+  relevance_threshold: 4.0   # a held-out rating >= 4 counts as relevant
+  selection_metric: ndcg@10  # used to pick hyper-parameters on the validation split
+  cold_start_profile_size: 3 # extra protocol: users truncated to their first N interactions
+
+models:
+  popularity:
+    trending_half_life_days: 365
+    bayes_prior_votes: 10
+  content:
+    min_df: 2
+    n_neighbors: 50
+    field_weights:
+      genres: 1.0
+      directors: 1.0
+      cast: 0.6
+      keywords: 0.8
+      tags: 0.8
+      title: 0.2
+      description: 0.3
+      decade: 0.3
+  itemknn:
+    k: 100
+    shrinkage: 10
+    binary: false
+  als:
+    factors: 64
+    regularization: 0.05
+    alpha: 10
+    iterations: 15
+  hybrid:
+    weights:
+      content: 0.20
+      collaborative: 0.30
+      latent: 0.35
+      popularity: 0.08
+      preference: 0.05
+      recency: 0.02
+    behavioral_ramp: 10
+    candidates_per_source: 200
+    normalization: minmax
+    diversity_lambda: 0.9
+    diversity_pool: 100
+    max_per_genre: null
+    quality_floor: 2.0
+    recency_tau_years: 15
+    cold_start_boost: 2.0
+    content_support_damping: 1.0
+
+# Hyper-parameter search on the validation split. Kept small so the whole pipeline finishes in
+# a few minutes on an ordinary laptop CPU; use --quick to skip it entirely.
+tuning:
+  enabled: true
+  itemknn:
+    k: [50, 100, 200]
+    shrinkage: [0, 10, 50]
+  als:
+    factors: [32, 64, 128]
+    regularization: [0.01, 0.1]
+    alpha: [5, 20]
+  hybrid:
+    random_trials: 24
+    diversity_lambda: [1.0, 0.9, 0.8]
+    behavioral_ramp: [5, 15, 30]
+    cold_start_boost: [2.0, 5.0, 10.0]
+    content_support_damping: [0.5, 1.0, 2.0]

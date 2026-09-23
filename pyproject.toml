@@ -1,0 +1,79 @@
+[project]
+name = "jev"
+version = "1.0.0"
+description = "JEV - Intelligent Hybrid Recommendation Engine"
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+  # ML core
+  "numpy>=1.26",
+  "scipy>=1.11",
+  "pandas>=2.1",
+  "scikit-learn>=1.4",
+  "pyyaml>=6.0",
+  "matplotlib>=3.8",
+  "requests>=2.31",
+  # API
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "pydantic>=2.7",
+  "pydantic-settings>=2.3",
+  "email-validator>=2.1",
+  "sqlalchemy>=2.0.30",
+  "alembic>=1.13",
+  "psycopg[binary]>=3.1",
+  "redis>=5.0",
+  "pyjwt>=2.8",
+  "argon2-cffi>=23.1",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.2",
+  "pytest-cov>=5.0",
+  "httpx>=0.27",
+  "ruff>=0.5",
+  "mypy>=1.10",
+  "pandas-stubs",
+  "types-requests",
+  "types-PyYAML",
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["ml", "backend"]
+include = ["jev_ml*", "jev_api*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = ["frontend", "data", "models", "experiments"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "N", "RUF", "S"]
+ignore = ["S101", "B008", "RUF001", "RUF002", "RUF003", "N806"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["jev_ml", "jev_api"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "N802"]
+"scripts/**" = ["S603", "S607"]
+"backend/jev_api/migrations/**" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "e2e: end-to-end tests that run the full API against trained artifacts",
+  "slow: tests that train models",
+]
+filterwarnings = ["ignore::DeprecationWarning:passlib.*"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_ignores = true
+files = ["ml/jev_ml", "backend/jev_api"]

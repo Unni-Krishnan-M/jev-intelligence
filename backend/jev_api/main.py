@@ -1,0 +1,163 @@
+"""FastAPI application factory."""
+
+from __future__ import annotations
+
+import logging
+import time
+import uuid
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+
+from jev_api import __version__
+from jev_api.cache import build_cache
+from jev_api.config import Settings, get_settings
+from jev_api.db import SessionLocal
+from jev_api.logging_setup import configure_logging, request_id_var
+from jev_api.routers import admin, auth, health, movies, recommendations, users
+from jev_api.services.ml import EngineHolder
+from jev_api.services.sync import ensure_admin, sync_all
+
+log = logging.getLogger("jev_api")
+
+AUTH_PATHS = ("/auth/login", "/auth/register")
+
+
+def run_migrations(settings: Settings) -> None:
+    from alembic import command
+    from alembic.config import Config
+
+    from jev_ml.paths import ROOT
+
+    cfg = Config(str(ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(ROOT / "backend" / "jev_api" / "migrations"))
+    cfg.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
+    command.upgrade(cfg, "head")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    settings: Settings = app.state.settings
+    if settings.auto_migrate:
+        run_migrations(settings)
+    app.state.engines.load()
+    with SessionLocal() as db:
+        synced = sync_all(db)
+        ensure_admin(db)
+    log.info("startup complete", extra={"extra_fields": {"synced": synced, "cache": app.state.cache.backend}})
+    yield
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or get_settings()
+    configure_logging(settings.log_level)
+    app = FastAPI(
+        title="JEV API",
+        version=__version__,
+        lifespan=lifespan,
+        docs_url=None if settings.is_production else "/docs",
+        redoc_url=None,
+        openapi_url=None if settings.is_production else "/openapi.json",
+    )
+    app.state.settings = settings
+    app.state.log = log
+    app.state.cache = build_cache(settings.redis_url)
+    app.state.engines = EngineHolder(settings.models_dir)
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-JEV-CSRF"],
+    )
+
+    @app.middleware("http")
+    async def request_context(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        rid = request.headers.get("x-request-id") or str(uuid.uuid4())
+        rid = rid[:64]
+        token = request_id_var.set(rid)
+        start = time.perf_counter()
+        try:
+            limited = _rate_limited(request, settings)
+            if limited is not None:
+                return limited
+            try:
+                response = await call_next(request)
+            except Exception:
+                # log the traceback server-side; clients get a generic message plus the request id
+                log.exception("unhandled error on %s %s", request.method, request.url.path)
+                response = JSONResponse(
+                    {"detail": "internal server error", "request_id": rid}, status_code=500
+                )
+        finally:
+            request_id_var.reset(token)
+        elapsed = (time.perf_counter() - start) * 1000
+        response.headers["X-Request-ID"] = rid
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Cache-Control"] = response.headers.get("Cache-Control", "no-store")
+        log.info(
+            "request",
+            extra={
+                "extra_fields": {
+                    "request_id": rid,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": response.status_code,
+                    "ms": round(elapsed, 1),
+                }
+            },
+        )
+        return response
+
+    @app.exception_handler(HTTPException)
+    async def http_error(request: Request, exc: HTTPException) -> JSONResponse:
+        return JSONResponse(
+            {"detail": exc.detail, "request_id": request_id_var.get()},
+            status_code=exc.status_code,
+            headers=getattr(exc, "headers", None),
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        errors = [
+            {"loc": list(e.get("loc", ())), "msg": e.get("msg"), "type": e.get("type")} for e in exc.errors()
+        ]
+        return JSONResponse(
+            {"detail": "validation error", "errors": errors, "request_id": request_id_var.get()},
+            status_code=422,
+        )
+
+    for r in (health.router, auth.router, users.router, movies.router, recommendations.router, admin.router):
+        app.include_router(r)
+    return app
+
+
+def _rate_limited(request: Request, settings: Settings) -> JSONResponse | None:
+    if request.method == "OPTIONS" or request.url.path.startswith("/health"):
+        return None
+    client = request.headers.get("x-forwarded-for", "").split(",")[0].strip() if settings.trust_proxy else ""
+    client = client or (request.client.host if request.client else "unknown")
+    is_auth = request.url.path in AUTH_PATHS
+    limit = settings.auth_rate_limit_per_minute if is_auth else settings.rate_limit_per_minute
+    bucket = int(time.time() // 60)
+    key = f"rl:{'auth' if is_auth else 'api'}:{client}:{bucket}"
+    count = request.app.state.cache.incr_window(key, 60)
+    if count > limit:
+        return JSONResponse(
+            {"detail": "rate limit exceeded", "request_id": request_id_var.get()},
+            status_code=429,
+            headers={"Retry-After": str(60 - int(time.time()) % 60)},
+        )
+    return None
+
+
+app = create_app()
