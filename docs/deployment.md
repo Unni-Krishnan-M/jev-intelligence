@@ -126,3 +126,24 @@ Resource use for training: quick training peaks at about 620 MB RSS.
   (`/intel/warnings`, docs/EARLY_WARNING_SYSTEM.md).
 - Per-client rate limits behind the web proxy need `JEV_PROXY_SECRET` in `.env` (compose passes it to web and
   api); unset, all clients share one bucket.
+
+## Home deployment (API on your own machine, web app on Vercel)
+Free option: the API, PostgreSQL and Redis run on an always-on machine, exposed through Tailscale Funnel.
+The Next.js app on Vercel proxies `/api/*` to the Funnel URL.
+
+1. Create `.env.home`, which git ignores:
+   - `JEV_ENV=production`
+   - `POSTGRES_PASSWORD`, `JEV_JWT_SECRET` and `JEV_PROXY_SECRET`, each a random value
+   - `JEV_ADMIN_EMAIL`, `JEV_ADMIN_PASSWORD`
+   - `JEV_CORS_ORIGINS=https://<your-domain>`, `JEV_COOKIE_SECURE=true`
+2. Start the stack. The API is published on `127.0.0.1:8100` only, and the containers restart on boot.
+   ```bash
+   docker compose -p jev-home -f docker-compose.yml -f docker-compose.home.yml --env-file .env.home up -d --build db cache api
+   ```
+3. Expose it with `tailscale funnel --bg 8100`. This needs Funnel enabled once for your tailnet, gives a fixed
+   `https://<machine>.<tailnet>.ts.net` URL, and persists across reboots.
+4. On Vercel, set `JEV_API_URL=<funnel URL>`, `JEV_HTTPS=true` and `JEV_PROXY_SECRET=<same value>`, then
+   run `vercel deploy --prod`. `JEV_API_URL` is read at build time.
+
+To update after pulling new code, re-run step 2. To stop, run `docker compose -p jev-home down` (the database
+volume is kept). The site only works while the machine is on and awake.

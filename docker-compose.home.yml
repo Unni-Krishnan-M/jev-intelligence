@@ -1,0 +1,10 @@
+# Home deployment: run the API on this machine and expose it through a tunnel (docs/deployment.md).
+# The API is published on loopback only, so nothing but the local tunnel (e.g. `tailscale funnel`) can
+# reach it; the web app runs elsewhere (Vercel) and proxies /api/* to the tunnel URL.
+#   docker compose -f docker-compose.yml -f docker-compose.home.yml --env-file .env.home up -d --build db cache api
+services:
+  api:
+    ports: ["127.0.0.1:${JEV_API_HOST_PORT:-8100}:8000"]
+    environment:
+      # requests arrive from the host's tunnel via the Docker gateway, not from a trusted proxy
+      FORWARDED_ALLOW_IPS: ""
