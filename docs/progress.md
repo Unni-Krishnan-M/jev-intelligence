@@ -335,4 +335,39 @@ movie recommender as the first domain adapter and a generic structured-dataset a
 - [x] Preference drift + recommendation strategy + user scenarios + drift evaluation: 37 tests; detector precision 0.92, recall 0.29 (splice 20); adaptation not proven (7 users) → policy serves standard
 - [x] Frontend platform restructure (identity, nav, domain switcher, /me/intelligence): Vitest 88, tsc/lint/build clean (signed-in pages await the backend)
 - [x] Backend: domain dimension (migration 0005, SQLite + PostgreSQL 17), /intel/domains, /me/intelligence*, recommendations intelligence block: 276 passed; acceptance 69/69; strategy step p50 0.37 ms cached, ~5.5 ms uncached
-- [ ] Integration, end-to-end demo, docs, final report
+- [x] Integration, end-to-end demo, docs, final report (see "Final report: platform migration v1.2.0")
+
+## Final report: platform migration v1.2.0 (2026-09-24)
+**Before:**
+- JEV was a movie recommender. An intelligence layer (`ml/jev_ml/intel`) was hard-wired to ratings, genres, raters,
+  lapse and model governance.
+- Warnings came straight from risk and anomaly levels.
+- The UI was a movie app with an admin console.
+
+**Preserved:**
+- All recommender models (popularity, TF-IDF, item-kNN, ALS, hybrid with adaptive weights and MMR).
+- Evaluation, calibration, registry and artifacts.
+- Every v1.1 endpoint, table and page.
+- The `jev_ml.intel` API, now a compatibility shim.
+- Movie intelligence outputs: golden tests confirm the same ids, keys, answers, warning set and numbers on synthetic
+  and real data. The only differences are the additive fields and the new early-warning decisions.
+
+**Added:**
+
+| Area | Status | Evidence |
+|---|---|---|
+| Domain-independent core (`ml/jev_ml/core`) + `DomainAdapter` protocol + registry | DONE | never imports recommender code (checked by grep); `run_domain` runs both domains |
+| Movie adapter | DONE | golden tests (4 synthetic variants + 2 real runs) |
+| Generic CSV + YAML adapter; US unemployment (BLS via FRED) | DONE | real runs: default, 2008-06-01 (10 warnings, IL/NY critical) and 2020-05-01 |
+| Early-warning decision gating warnings (`ewl-1.0.0`) | DONE | randomised monotonicity tests; every warning carries `decision_id` |
+| Preference drift, recommendation strategy, preference scenarios | DONE | 38 tests; `/recommendations` is served downstream of the strategy decision |
+| Evaluations | DONE | `platform-eval-20260924T051637Z`, `drift-eval-20260924T045528Z` (README tables) |
+| API: `/intel/domains`, `?domain=`, `/me/intelligence*`, recommendations `intelligence` block | DONE | 16 platform API tests; acceptance 69/69 on real data |
+| Migration 0005 (domain column, per-domain open-warning index, user_intel_feedback) | DONE | round trip on SQLite and PostgreSQL 17 |
+| Platform-first UI: landing, navigation, domain switcher, `/me/intelligence` | DONE | real-browser walk of both domains; 0 overflow on 132 page visits; Vitest 91+ |
+| Code review (`/code-review high`) and security review | DONE | security: no findings; code review: 10 findings, 9 fixed, 1 documented (state hash) |
+| Drift adaptation enabled by default | DEFERRED | the effect is shown on only 7 users; the policy requires ≥ 30 |
+| Domain-specific stages for generic datasets | DEFERRED | the generic adapter runs core stages only |
+| Warning quality on the generic domain | PARTIAL | precision 0.36 and recall 0.52; warnings lag turning points |
+
+**Known limitations:** see README → Limitations.

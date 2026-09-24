@@ -31,11 +31,14 @@ export function EvidenceList({
     <ul className={cn("divide-y hairline border-y hairline text-sm", className)}>
       {items.map((e, i) => {
         const href = linkRefs ? refHref(e.ref) : null;
+        // a long text value reads as a sentence under the label, not a squeezed right-hand column
+        const longText = typeof e.value === "string" && e.value.length > 24;
         return (
           <li key={`${e.label}-${i}`} className="grid grid-cols-1 gap-x-4 gap-y-0.5 py-2 sm:grid-cols-[72px_1fr_auto]">
             <span className="eyebrow pt-0.5">{KIND_LABEL[e.kind] ?? e.kind}</span>
             <div className="min-w-0">
               <p className="text-foreground">{e.label}</p>
+              {longText && <p className="mt-0.5 text-sm text-ink-2">{e.value}</p>}
               {e.detail && <p className="mt-0.5 text-xs text-muted-foreground">{e.detail}</p>}
               {e.ref && (
                 href ? (
@@ -48,7 +51,7 @@ export function EvidenceList({
                 )
               )}
             </div>
-            {e.value !== null && e.value !== undefined && <span className="num text-right text-ink-2 sm:pt-0.5">{fmtValue(e.value)}</span>}
+            {e.value !== null && e.value !== undefined && !longText && <span className="num text-right text-ink-2 sm:pt-0.5">{fmtValue(e.value)}</span>}
           </li>
         );
       })}

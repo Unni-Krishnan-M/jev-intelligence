@@ -92,6 +92,18 @@ def main() -> None:
         page.goto(f"{base}/discover?genre=Film-Noir&sort=rating")
         shot(page, "09-discover", full=False)
 
+        # v1.2: the member's own intelligence (drift, strategy decision, what-ifs)
+        page.goto(f"{base}/me/intelligence")
+        page.wait_for_selector("h1")
+        shot(page, "29-me-intelligence", full=False)
+        page.get_by_role("button", name="Project my taste").click()
+        page.wait_for_selector("text=Recommendations under this scenario", timeout=30000)
+        page.evaluate(
+            "document.querySelector('#whatif-h').scrollIntoView({block: 'start'}); window.scrollBy(0, -96)"
+        )
+        page.wait_for_timeout(400)
+        shot(page, "30-me-scenarios", full=False)
+
         # admin
         page.goto(f"{base}/")
         ctx.clear_cookies()
@@ -100,6 +112,8 @@ def main() -> None:
         page.fill("#password", args.admin_password)
         page.click("button[type=submit]")
         page.wait_for_url("**/home")
+        page.goto(f"{base}/")
+        shot(page, "25-landing-platform")
         page.goto(f"{base}/admin")
         shot(page, "10-admin-overview")
         page.goto(f"{base}/admin/models")
@@ -122,6 +136,25 @@ def main() -> None:
         page.get_by_role("button", name="Run scenarios").click()
         page.wait_for_timeout(1500)
         shot(page, "19-intel-scenarios")
+
+        # v1.2: the generic US-unemployment domain, replayed as of 2008-06-01
+        unemp = "generic:us-unemployment"
+        r = page.request.post(
+            f"{base}/api/intel/runs",
+            data={"domain": unemp, "as_of": "2008-06-01"},
+            headers={"X-JEV-CSRF": "1"},
+        )
+        print("replay", unemp, r.status, r.json().get("status"))
+        page.goto(f"{base}/intel?domain={unemp}")
+        shot(page, "26-intel-unemployment-overview")
+        warnings = page.request.get(f"{base}/api/intel/warnings?domain={unemp}&limit=20").json()["items"]
+        warning = next((w for w in warnings if w.get("decision_id")), warnings[0] if warnings else None)
+        if warning:
+            page.goto(f"{base}/intel/warnings/{warning['id']}?domain={unemp}")
+            shot(page, "27-intel-unemployment-warning")
+            if warning.get("decision_id"):
+                page.goto(f"{base}/intel/decisions/{warning['decision_id']}?domain={unemp}")
+                shot(page, "28-intel-ewl-decision")
 
         # v1.1 pages: evidence search, recommender monitoring, audit log
         page.goto(f"{base}/intel/evidence")

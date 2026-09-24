@@ -82,7 +82,7 @@ function Pipeline() {
                       {!last && <span className="w-px flex-1 bg-rule lg:h-px lg:w-auto" aria-hidden />}
                     </div>
                     <div className="min-w-0 lg:mt-3 lg:pr-2">
-                      <p className={cn("font-display text-[22px] leading-tight", s.key && "text-primary")}>{s.title}</p>
+                      <p className={cn("font-display text-[22px] leading-tight hyphens-auto", s.key && "text-primary")}>{s.title}</p>
                       <p className="mt-1 text-[13px] leading-relaxed text-ink-2">{s.body}</p>
                     </div>
                   </li>

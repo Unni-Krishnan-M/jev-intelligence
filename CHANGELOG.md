@@ -26,6 +26,9 @@ JEV becomes a domain-independent decision and early-warning engine. The movie re
   "My intelligence" page.
 - `npm run dev` starts the API and the web app together.
 ### Changed
+- Early-warning questions and titles now read as plain language (e.g. "Should CA unemployment rate trigger an early
+  warning?"). The situation label is part of the hashed decision state, so `early_warning_level` state hashes from
+  pre-release 1.2 builds differ from 1.2.0 hashes for identical evidence. The policy (`ewl-1.0.0`) is unchanged.
 - `jev_ml.intel.run_pipeline` is a compatibility shim over `run_domain(MovieAdapter)`. Movie outputs are unchanged
   (golden tests on synthetic and real data), apart from the additional early-warning decisions and batch.
 

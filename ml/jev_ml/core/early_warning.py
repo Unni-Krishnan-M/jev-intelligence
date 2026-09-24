@@ -245,7 +245,12 @@ def build_situations(
         if key not in sits:
             s = series_by_id[sid]
             sits[key] = Situation(
-                key, s.entity_type, s.entity, sid, s.adverse_direction, f"{s.entity} {s.metric} ({sid})"
+                key,
+                s.entity_type,
+                s.entity,
+                sid,
+                s.adverse_direction,
+                f"{s.entity} {s.metric}",
             )
         return sits[key]
 

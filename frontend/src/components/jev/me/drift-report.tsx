@@ -25,6 +25,8 @@ export function DriftReport({ drift }: { drift: Drift }) {
   const head = driftHeadline(drift);
   const Icon = HEADLINE_ICON[head.verdict];
   const rows = drift.aspects.map(driftAspectView);
+  // when every aspect gives the same reason (e.g. too little history), say it once under the table
+  const shared = rows.length > 1 && rows.every((r) => r.detail && r.detail === rows[0].detail) ? rows[0].detail : null;
 
   return (
     <div>
@@ -48,7 +50,7 @@ export function DriftReport({ drift }: { drift: Drift }) {
         ] as const).map(([label, w]) => (
           <div key={label} className="rounded border hairline px-3 py-2">
             <dt className="eyebrow">{label}</dt>
-            <dd className="num mt-1 text-xs">{fmtDay(w.start)} – {fmtDay(w.end)} · {w.n.toLocaleString()} events</dd>
+            <dd className="num mt-1 text-xs">{w.start ? `${fmtDay(w.start)} – ${fmtDay(w.end)} · ` : ""}{w.n.toLocaleString()} events</dd>
           </div>
         ))}
       </dl>
@@ -56,7 +58,7 @@ export function DriftReport({ drift }: { drift: Drift }) {
       {rows.length === 0 ? (
         <p className="mt-4 text-sm text-muted-foreground">No aspects were tested.</p>
       ) : (
-        <div className="mt-4 overflow-x-auto rounded-lg border bg-card">
+        <div className="relative mt-4 overflow-x-auto rounded-lg border bg-card">
           <table className="w-full min-w-[640px] text-sm">
             <caption className="sr-only">Drift tests per aspect, historical against recent window, with Holm-adjusted p-values</caption>
             <thead>
@@ -76,7 +78,7 @@ export function DriftReport({ drift }: { drift: Drift }) {
                   <tr key={r.aspect} className="border-b hairline align-top last:border-0">
                     <td className="px-4 py-2.5">
                       <p>{r.label}</p>
-                      {r.detail && <p className="mt-0.5 max-w-xs text-xs text-muted-foreground">{r.detail}</p>}
+                      {r.detail && !shared && <p className="mt-0.5 max-w-xs text-xs text-muted-foreground">{r.detail}</p>}
                     </td>
                     <td className="px-2 py-2.5 text-xs text-ink-2">{r.test}</td>
                     <td className="num px-2 py-2.5 text-right">{r.statistic}</td>
@@ -95,6 +97,7 @@ export function DriftReport({ drift }: { drift: Drift }) {
           </table>
         </div>
       )}
+      {shared && <p className="mt-2 text-sm text-ink-2">Every aspect: {shared}.</p>}
       <p className="mt-2 text-xs text-muted-foreground">
         Each aspect needs a minimum sample; below it the aspect reports insufficient data instead of a number. p-values are Holm-adjusted across
         aspects, and drift is detected when at least one adjusted p is significant.

@@ -279,6 +279,18 @@ Intelligence console:
 | ![Audit log](docs/screenshots/24-intel-audit.png) | |
 
 ## Limitations
+- **Platform, generic domain:**
+  - Unemployment forecasts are no better than naive (MASE 1.52 vs 1.41), and their 80 % intervals cover only 61 %.
+  - Warnings lag turning points: warning precision is 0.36 overall, 0.44 in 2006–10 but 0.11 in 2019–21.
+  - Replays use today's revised FRED figures, not the first-published ones.
+  - The generic adapter adds no domain-specific stages.
+- **Platform, movie domain:** genre-decline warnings almost never fire under the strict FDR control. Lapse warning
+  precision is uninformative, because the base rate is 1.0.
+- **Preference drift:**
+  - The detector is precise but conservative (recall 0.29 at a 20-event splice).
+  - Adapting to drift is not yet shown to help: only 7 users were eligible. The policy therefore serves `standard`
+    until an evaluation on at least 30 drifting users shows a benefit.
+  - New app members rate everything on one day, so their drift tests abstain until they have history over time.
 - **Cold start**: with about 3 interactions, plain popularity still beats the hybrid on NDCG@10.
 - MovieLens-small is small (610 users) and old (ratings to 2018), so absolute metrics are modest and results may not
   transfer to other domains. The evaluation split allows cross-user temporal leakage (documented; a global temporal

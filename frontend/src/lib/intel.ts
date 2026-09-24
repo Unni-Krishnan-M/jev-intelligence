@@ -6,6 +6,7 @@
 import { useSWRConfig } from "swr";
 
 import { ApiError } from "./api";
+import { isEarlyWarningDecision, isEarlyWarningLevel, LEVEL_LABEL } from "./levels";
 import type { CalibrationBin, CalibrationMetrics, ConfidenceKind, Decision, DecisionRecord, DecisionScale, EvidenceOwnerType, HistoryPoint, RecCalibration, Risk, Severity, WarningStatus } from "./intel-types";
 
 export const SEVERITIES: Severity[] = ["critical", "high", "medium", "low"];
@@ -257,10 +258,14 @@ export function fmtScaleValue(v: number | null | undefined, scale?: DecisionScal
   return unit === "%" ? `${fmtValue(v)} %` : `${fmtValue(v)} ${unit}`;
 }
 
-/** The answer as text: score decisions on their scale, the chosen option otherwise. */
-export function fmtAnswer(d: Pick<Decision, "kind" | "answer" | "scale">): string {
+/**
+ * The answer as text: score decisions on their scale, an early_warning_level decision's level as
+ * its word ("Urgent action"), any other chosen option exactly as recorded.
+ */
+export function fmtAnswer(d: Pick<Decision, "kind" | "answer" | "scale"> & Partial<Pick<Decision, "spec_id" | "key" | "options">>): string {
   if (d.answer === null || d.answer === undefined) return "—";
   if (d.kind === "score" && typeof d.answer === "number") return fmtScaleValue(d.answer, d.scale);
+  if (isEarlyWarningLevel(d.answer) && isEarlyWarningDecision(d)) return LEVEL_LABEL[d.answer];
   return String(d.answer);
 }
 

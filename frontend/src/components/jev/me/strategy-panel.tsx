@@ -7,26 +7,17 @@ import { ConfidenceBadge, CONFIDENCE_EXPLAIN } from "@/components/jev/intel/badg
 import { OptionScores } from "@/components/jev/intel/charts";
 import { EvidenceList } from "@/components/jev/intel/evidence-list";
 import { MeFeedback } from "@/components/jev/me/me-feedback";
-import { STRATEGY_MEANING, strategyLabel } from "@/lib/decisions";
-import { fmtValue, humanize } from "@/lib/intel";
+import { flattenState, STRATEGY_MEANING, strategyLabel } from "@/lib/decisions";
 import type { Decision, RecommendationStrategy } from "@/lib/intel-types";
-
-function stateRows(state: Record<string, unknown>) {
-  const rows: { label: string; value: string }[] = [];
-  for (const [k, v] of Object.entries(state ?? {})) {
-    if (v && typeof v === "object" && !Array.isArray(v)) {
-      for (const [k2, v2] of Object.entries(v as Record<string, unknown>)) rows.push({ label: `${humanize(k)} · ${humanize(k2)}`, value: fmtValue(v2, k2) });
-    } else rows.push({ label: humanize(k), value: fmtValue(v, k) });
-  }
-  return rows;
-}
 
 /** The recommendation_strategy decision: answer, option scores, confidence kind, why, and feedback. */
 export function StrategyPanel({ d }: { d: Decision }) {
   const answer = d.abstained ? null : d.answer;
   const meaning = typeof answer === "string" && answer in STRATEGY_MEANING ? STRATEGY_MEANING[answer as RecommendationStrategy] : null;
   const labelled = Object.fromEntries(Object.entries(d.option_scores ?? {}).map(([k, v]) => [strategyLabel(k), v]));
-  const rows = stateRows(d.state);
+  const rows = flattenState(d.state);
+  // what the list was actually produced under, from the policy's structured state
+  const served = typeof d.state?.served_strategy === "string" ? d.state.served_strategy : null;
 
   return (
     <div id={d.id} className="scroll-mt-24">
@@ -44,13 +35,14 @@ export function StrategyPanel({ d }: { d: Decision }) {
       </div>
       {d.abstained ? (
         <p className="mt-2 text-sm text-ink-2">
-          JEV did not choose: {d.fallback_reason ?? "the evidence was insufficient"}. Your list falls back to the standard strategy; no answer is better than a guess here.
+          JEV did not choose: {d.fallback_reason ?? "the evidence was insufficient"}.
+          {served ? ` Your list is served as ${strategyLabel(served)}.` : ""} No answer is better than a guess here.
         </p>
       ) : (
         meaning && <p className="mt-2 text-sm text-ink-2">{meaning}</p>
       )}
       {d.fallback_reason && !d.abstained && <p className="mt-1 text-xs text-muted-foreground">Fallback: {d.fallback_reason}</p>}
-      <p className="mt-2 max-w-2xl text-xs text-muted-foreground">{CONFIDENCE_EXPLAIN[d.confidence_kind]}</p>
+      {!d.abstained && <p className="mt-2 max-w-2xl text-xs text-muted-foreground">{CONFIDENCE_EXPLAIN[d.confidence_kind]}</p>}
 
       <div className="mt-6 grid grid-cols-1 gap-8 lg:grid-cols-2">
         <div>

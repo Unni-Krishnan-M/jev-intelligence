@@ -65,9 +65,29 @@ export function adaptationRows(r: Pick<DriftEvalReport, "adaptation">, setting: 
   }));
 }
 
-/** Warnings raised per replay, as bars: labelled by as-of month when the report lists them. */
-export function replayBars(counts: number[] | undefined, asOf?: string[]): { bin: string; n: number }[] {
-  return (counts ?? []).map((n, i) => ({ bin: asOf?.[i]?.slice(0, 7) ?? String(i + 1), n }));
+function monthIndex(iso: string): number | null {
+  const m = /^(\d{4})-(\d{2})/.exec(iso ?? "");
+  return m ? Number(m[1]) * 12 + Number(m[2]) - 1 : null;
+}
+
+/**
+ * Month labels for `n` replays when `range` is [start, end] and the replays are monthly: n equals
+ * the months from start to end inclusive. Otherwise null (the order is known, the dates are not).
+ */
+export function replayMonths(range: string[] | undefined | null, n: number): string[] | null {
+  if (!range || range.length !== 2 || n < 1) return null;
+  const a = monthIndex(range[0]);
+  const b = monthIndex(range[1]);
+  if (a === null || b === null || b - a + 1 !== n) return null;
+  return Array.from({ length: n }, (_, i) => {
+    const m = a + i;
+    return `${Math.floor(m / 12)}-${String((m % 12) + 1).padStart(2, "0")}`;
+  });
+}
+
+/** Warnings raised per replay as bars, labelled by month when known, else by position (1..n). */
+export function replayBars(counts: number[] | undefined, months?: string[] | null): { bin: string; n: number }[] {
+  return (counts ?? []).map((n, i) => ({ bin: months?.[i] ?? String(i + 1), n }));
 }
 
 /** Movie reports one consistency block; generic domains pool it within their replay windows. */

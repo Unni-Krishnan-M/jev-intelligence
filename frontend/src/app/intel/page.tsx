@@ -192,7 +192,7 @@ function Overview({ s, run }: { s: IntelStatus; run: Run }) {
                 <li key={src.source} className="py-2.5 first:pt-0 last:pb-0">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <span className="font-medium">{src.source}</span>
-                    <FreshnessBadge kind={src.kind} rows={src.rows} days={src.age_days} fresh={src.fresh} />
+                    <FreshnessBadge kind={src.kind} rows={src.rows} days={src.age_days} fresh={src.fresh} lag={src.lag_days} />
                   </div>
                   <p className="mt-1 font-mono text-xs text-muted-foreground">
                     {humanize(src.kind)} · {src.rows.toLocaleString()} rows · last {src.last_event ? fmtDate(src.last_event) : "—"}

@@ -149,12 +149,15 @@ export function FreshnessBadge({
   rows,
   days,
   fresh,
+  lag,
   className,
 }: {
   kind?: string | null;
   rows?: number | null;
   days: number | null;
   fresh?: boolean | null;
+  /** as_of − last event: what freshness means for a dataset replayed at an as-of date */
+  lag?: number | null;
   className?: string;
 }) {
   const k = kind === "movielens" ? "static_snapshot" : kind === "app" ? "live" : kind === "model" ? "artefact" : kind;
@@ -166,6 +169,12 @@ export function FreshnessBadge({
     </span>
   );
   if (k === "static_snapshot") return chip(Archive, "Archival", fmtAge(days));
+  if (k === "dataset") {
+    const behind = lag === null || lag === undefined ? null : `${fmtDays(lag)} before as-of`;
+    if (fresh === true) return chip(CheckCircle2, "Fresh", behind, "var(--status-good)");
+    if (fresh === false) return chip(Clock, "Stale", behind, "var(--status-serious)");
+    return chip(Archive, "Dataset", fmtAge(days));
+  }
   if (k === "artefact") return chip(Package, fmtAge(days), null);
   if (k === "live" && rows === 0) return chip(CircleDashed, "No events yet", null);
   if (fresh === true) return chip(CheckCircle2, "Fresh", fmtAge(days), "var(--status-good)");

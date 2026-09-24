@@ -3,8 +3,9 @@
 import { CheckCircle2, Eye, OctagonAlert, TriangleAlert } from "lucide-react";
 
 import { SpecRows } from "@/components/jev/admin/ui";
+import Link from "@/components/jev/intel/domain-context";
 import { ewlStateGroups, LEVEL_LABEL, LEVEL_MEANING, levelScale } from "@/lib/decisions";
-import { fmtValue } from "@/lib/intel";
+import { fmtValue, humanize, refHref } from "@/lib/intel";
 import type { Decision, EarlyWarningLevel } from "@/lib/intel-types";
 import { cn } from "@/lib/utils";
 
@@ -63,7 +64,7 @@ export function LevelScale({
             >
               <span className="flex min-w-0 items-center gap-1">
                 <m.Icon className="size-3.5 shrink-0" style={{ color: s.reached ? m.color : undefined }} aria-hidden />
-                <span className={cn("truncate text-xs", s.chosen && "font-semibold text-foreground")}>{compact ? s.label.replace("Urgent action", "Urgent") : s.label}</span>
+                <span className={cn("truncate text-xs", s.chosen && "font-semibold text-foreground")}>{compact ? (s.level === "NO_ACTION" ? "None" : s.level === "URGENT_ACTION" ? "Urgent" : s.label) : s.label}</span>
               </span>
               {!compact && (
                 <span className="num text-[11px] text-muted-foreground">
@@ -87,7 +88,7 @@ export function LevelScale({
 
 /** The early-warning state, grouped signal → trend → anomaly → forecast → risk. */
 export function StateSnapshot({ state }: { state: Record<string, unknown> }) {
-  const { groups, other } = ewlStateGroups(state);
+  const { groups, other, components } = ewlStateGroups(state);
   return (
     <div className="space-y-4">
       <ol className="grid grid-cols-1 gap-[2px] overflow-hidden rounded border hairline bg-[var(--rule)] sm:grid-cols-5">
@@ -95,20 +96,46 @@ export function StateSnapshot({ state }: { state: Record<string, unknown> }) {
           <li key={g.stage} className="min-w-0 bg-card px-3 py-2.5">
             <p className="eyebrow">{String(i + 1).padStart(2, "0")} · {g.label}</p>
             {g.observed ? (
-              <dl className="mt-1.5 space-y-0.5 text-xs">
-                {g.rows.map((r) => (
-                  <div key={r.key} className="flex items-baseline justify-between gap-2">
-                    <dt className="min-w-0 truncate text-muted-foreground" title={r.label}>{r.label}</dt>
-                    <dd className="num shrink-0 text-foreground">{r.value}</dd>
-                  </div>
-                ))}
-              </dl>
+              <>
+                <dl className="mt-1.5 space-y-0.5 text-xs">
+                  {g.rows.map((r) => (
+                    <div key={r.key} className="flex items-baseline justify-between gap-2">
+                      <dt className="min-w-0 truncate text-muted-foreground" title={r.label}>{r.label}</dt>
+                      <dd className="num shrink-0 text-foreground">{r.value}</dd>
+                    </div>
+                  ))}
+                </dl>
+                {g.summary && <p className="mt-1.5 line-clamp-3 text-xs text-ink-2" title={g.summary}>{g.summary}</p>}
+              </>
+            ) : g.skippedReason ? (
+              <p className="mt-1.5 text-xs text-muted-foreground">Skipped: {g.skippedReason}</p>
             ) : (
-              <p className="mt-1.5 text-xs text-muted-foreground">Not in the state ({g.what}); the stage found nothing or was skipped.</p>
+              <p className="mt-1.5 text-xs text-muted-foreground">Nothing observed for this situation ({g.what}).</p>
             )}
           </li>
         ))}
       </ol>
+      {components.length > 0 && (
+        <div>
+          <p className="eyebrow mb-1">Point components · highest first</p>
+          <ul className="divide-y hairline border-y hairline text-sm">
+            {components.map((c, i) => {
+              const href = refHref(c.ref);
+              return (
+                <li key={`${c.ref}-${i}`} className="grid grid-cols-[88px_minmax(0,1fr)_56px] items-baseline gap-x-3 py-1.5">
+                  <span className="eyebrow">{humanize(c.stage)}</span>
+                  <span className="min-w-0">
+                    <span className="block">{c.title ?? c.detail ?? "—"}</span>
+                    {c.title && c.detail && <span className="block text-xs text-muted-foreground">{c.detail}</span>}
+                    {c.ref && (href ? <Link href={href} className="font-mono text-xs text-primary hover:underline">{c.ref}</Link> : <span className="font-mono text-xs text-muted-foreground">{c.ref}</span>)}
+                  </span>
+                  <span className="num text-right text-ink-2">{c.points === null ? "—" : fmtValue(c.points)}</span>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
       {other.length > 0 && (
         <div>
           <p className="eyebrow mb-1">Other inputs</p>

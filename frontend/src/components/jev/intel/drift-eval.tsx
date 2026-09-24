@@ -63,7 +63,7 @@ function Report({ r }: { r: DriftEvalReport }) {
         <div className="mb-4 flex flex-col gap-2.5">
           <FilterRow label="Permutation" value={mode} onChange={setMode} options={modes.map((m) => ({ value: m, label: MODE_LABEL[m] ?? humanize(m) }))} />
         </div>
-        <div className="overflow-x-auto rounded-lg border bg-card">
+        <div className="relative overflow-x-auto rounded-lg border bg-card">
           <table className="w-full min-w-[760px] text-sm">
             <caption className="sr-only">Drift detector precision, recall and false-positive rate per splice size</caption>
             <thead>
@@ -102,7 +102,7 @@ function Report({ r }: { r: DriftEvalReport }) {
         {sizes.length > 0 && (
           <div className="mt-6">
             <div className="mb-3"><FilterRow label="Per aspect at" value={size} onChange={setSize} options={sizes.map((s) => ({ value: s, label: `${s} events` }))} /></div>
-            <div className="overflow-x-auto rounded-lg border bg-card">
+            <div className="relative overflow-x-auto rounded-lg border bg-card">
               <table className="w-full min-w-[620px] text-sm">
                 <caption className="sr-only">Detector metrics per aspect</caption>
                 <thead>
@@ -136,7 +136,7 @@ function Report({ r }: { r: DriftEvalReport }) {
         <p className="eyebrow mb-2">Adaptation effect · NDCG@10 against standard, paired bootstrap</p>
         <p className="mb-3 max-w-3xl border-l-2 border-rule pl-3 text-sm leading-relaxed text-ink-2">{r.adaptation.protocol}</p>
         <div className="mb-3"><FilterRow label="Setting" value={setting} onChange={setSetting} options={settings.map((s) => ({ value: s, label: SETTING_LABEL[s] ?? humanize(s) }))} /></div>
-        <div className="overflow-x-auto rounded-lg border bg-card">
+        <div className="relative overflow-x-auto rounded-lg border bg-card">
           <table className="w-full min-w-[760px] text-sm">
             <caption className="sr-only">Change in NDCG@10 per strategy against standard, per user group</caption>
             <thead>

@@ -135,6 +135,10 @@
     @apply bg-background text-foreground;
     font-feature-settings: "ss01", "ss02";
   }
+  /* long machine identifiers (series ids, keys) wrap instead of pushing the page sideways */
+  h1, h2, h3, p, li, dd, dt, a, span, td, th {
+    overflow-wrap: break-word;
+  }
   ::selection {
     background: color-mix(in oklab, var(--primary) 35%, transparent);
   }

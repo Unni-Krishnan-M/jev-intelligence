@@ -13,14 +13,15 @@ import type { RecIntelligence } from "@/lib/types";
  */
 export function WhyThisList({ intel }: { intel: RecIntelligence | null | undefined }) {
   if (!intel) return null;
+  const abstained = intel.abstained ?? intel.strategy === null;
+  // an abstention usually means the drift test could not run, so "no drift" would overstate it
   const drift =
     intel.drift_detected === true
       ? { Icon: GitCompareArrows, label: "Taste drift detected" }
-      : intel.drift_detected === false
+      : intel.drift_detected === false && !abstained
         ? { Icon: Minus, label: "No taste drift detected" }
-        : { Icon: CircleDashed, label: "Drift not tested" };
+        : { Icon: CircleDashed, label: "Drift not established" };
   const n = intel.evidence?.length ?? 0;
-  const abstained = intel.abstained ?? intel.strategy === null;
   const served = intel.served_strategy ?? intel.strategy ?? "standard";
   return (
     <section aria-label="Why this list" className="mb-6 grid gap-x-6 gap-y-3 rounded-lg border hairline px-4 py-3 md:grid-cols-[auto_minmax(0,1fr)_auto] md:items-center">
@@ -40,11 +41,16 @@ export function WhyThisList({ intel }: { intel: RecIntelligence | null | undefin
           <drift.Icon className="size-4 text-muted-foreground" aria-hidden /> {drift.label}
         </span>
       </div>
-      <p className="min-w-0 text-sm text-muted-foreground">
-        {intel.summary ?? "The strategy decision recorded no summary."}
-        {n > 0 && <span className="num"> · {n} evidence item{n === 1 ? "" : "s"}</span>}
-        {intel.policy_version && <span className="font-mono text-xs"> · {intel.policy_version}</span>}
-      </p>
+      <div className="min-w-0 text-sm text-muted-foreground">
+        <p className="line-clamp-2" title={intel.summary ?? undefined}>{intel.summary ?? "The strategy decision recorded no summary."}</p>
+        {(n > 0 || intel.policy_version) && (
+          <p className="mt-0.5 text-xs">
+            {n > 0 && <span className="num">{n} evidence item{n === 1 ? "" : "s"}</span>}
+            {n > 0 && intel.policy_version && " · "}
+            {intel.policy_version && <span className="font-mono">{intel.policy_version}</span>}
+          </p>
+        )}
+      </div>
       <Link href="/me/intelligence" className="inline-flex shrink-0 items-center gap-1 text-sm text-primary hover:underline">
         My intelligence <ArrowRight className="size-3.5" aria-hidden />
       </Link>

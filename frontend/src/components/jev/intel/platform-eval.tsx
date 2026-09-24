@@ -5,13 +5,13 @@ import { CheckCircle2, CircleX } from "lucide-react";
 import { fmtDate, fmtNum, Panel, StatTile } from "@/components/jev/admin/ui";
 import { CountBars, TableView } from "@/components/jev/intel/charts";
 import { SectionHeader } from "@/components/jev/states";
-import { consistencyOf, replayBars } from "@/lib/evaluation";
-import { fmtMs, fmtPct, humanize, seriesLabel } from "@/lib/intel";
+import { consistencyOf, replayBars, replayMonths } from "@/lib/evaluation";
+import { fmtMs, fmtPct, fmtValue, humanize, seriesLabel } from "@/lib/intel";
 import type { PlatformEvaluation, WarningOutcomeCounts } from "@/lib/intel-types";
 
 function OutcomeTable({ rows, caption, first }: { rows: [string, WarningOutcomeCounts][]; caption: string; first: string }) {
   return (
-    <div className="overflow-x-auto rounded-lg border bg-card">
+    <div className="relative overflow-x-auto rounded-lg border bg-card">
       <table className="w-full min-w-[720px] text-sm">
         <caption className="sr-only">{caption}</caption>
         <thead>
@@ -46,6 +46,22 @@ function OutcomeTable({ rows, caption, first }: { rows: [string, WarningOutcomeC
         </tbody>
       </table>
     </div>
+  );
+}
+
+/** Warnings per replay; bars carry month labels only when the replays are provably monthly. */
+function ReplayPanel({ title, counts, range, note }: { title: string; counts: number[]; range?: string[] | null; note?: string }) {
+  const months = replayMonths(range, counts.length);
+  const bars = replayBars(counts, months);
+  return (
+    <Panel title={title}>
+      <CountBars data={bars} name="warnings" binLabel={months ? "as of" : "replay"} />
+      <p className="mt-2 text-xs text-muted-foreground">
+        {months ? "One bar per monthly replay, labelled by its as-of month" : "Replays in replay order; the report gives no date per replay"}
+        {note ? ` · ${note}` : ""}.
+      </p>
+      <TableView caption="Warnings per replay" head={[months ? "as of" : "replay", "warnings"]} rows={bars.map((b) => [b.bin, b.n])} />
+    </Panel>
   );
 }
 
@@ -138,20 +154,21 @@ export function PlatformEvaluationView({ p, index }: { p: PlatformEvaluation; in
         )}
         <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
           {r.warnings_per_replay && r.warnings_per_replay.length > 0 && (
-            <Panel title="Warnings raised per replay">
-              <CountBars data={replayBars(r.warnings_per_replay, r.replays.as_of)} name="warnings" binLabel="as of" />
-              <TableView caption="Warnings per replay" head={["as of", "warnings"]} rows={replayBars(r.warnings_per_replay, r.replays.as_of).map((b) => [b.bin, b.n])} />
-            </Panel>
+            <ReplayPanel
+              title={`Warnings raised per replay${r.replays.as_of?.length === 2 ? ` · ${r.replays.as_of[0].slice(0, 7)} – ${r.replays.as_of[1].slice(0, 7)}` : ""}`}
+              counts={r.warnings_per_replay}
+              range={r.replays.as_of}
+            />
           )}
           {windows.map((x) =>
             x.warnings_per_replay?.length ? (
-              <Panel key={x.window[0]} title={`Warnings per replay · ${x.window[0].slice(0, 7)} – ${x.window[1].slice(0, 7)}`}>
-                <CountBars data={replayBars(x.warnings_per_replay)} name="warnings" binLabel="replay" />
-                <p className="mt-2 text-xs text-muted-foreground">
-                  Monthly replays in order · flip rate {fmtPct(x.consistency.flip_rate ?? null, 1)} · boundary flips {fmtPct(x.consistency.warning_boundary_flip_rate ?? null, 1)}
-                </p>
-                <TableView caption="Warnings per replay in this window" head={["replay", "warnings"]} rows={replayBars(x.warnings_per_replay).map((b) => [b.bin, b.n])} />
-              </Panel>
+              <ReplayPanel
+                key={x.window[0]}
+                title={`Warnings per replay · ${x.window[0].slice(0, 7)} – ${x.window[1].slice(0, 7)}`}
+                counts={x.warnings_per_replay}
+                range={x.window}
+                note={`flip rate ${fmtPct(x.consistency.flip_rate ?? null, 1)} · boundary flips ${fmtPct(x.consistency.warning_boundary_flip_rate ?? null, 1)}`}
+              />
             ) : null,
           )}
         </div>
@@ -164,12 +181,12 @@ export function PlatformEvaluationView({ p, index }: { p: PlatformEvaluation; in
           <StatTile label="Median MASE" value={fmtNum(fs.median_mase, 2)} hint={`naive on the same points: ${fmtNum(fs.median_naive_mase, 2)}`} />
           <StatTile label="Beating naive" value={fmtPct(fs.share_beating_naive)} hint={`of ${fs.n_series} series`} />
           <StatTile label="Mean 80 % coverage" value={fmtPct(fs.mean_coverage80)} hint="target 80 %" />
-          <StatTile label="Median RMSE" value={fmtNum(fs.median_rmse, 3)} hint={`median MAE ${fmtNum(fs.median_mae, 3)}`} />
+          <StatTile label="Median RMSE" value={fmtValue(fs.median_rmse)} hint={`median MAE ${fmtValue(fs.median_mae)}`} />
         </div>
         <TableView
           caption="Forecast backtest per series"
           head={["series", "model", "MASE", "naive MASE", "RMSE", "coverage 80"]}
-          rows={r.forecast.per_series.map((s) => [seriesLabel(s.series_id), humanize(s.model), fmtNum(s.mase, 2), fmtNum(s.naive_mase, 2), fmtNum(s.rmse, 3), fmtPct(s.coverage80)])}
+          rows={r.forecast.per_series.map((s) => [seriesLabel(s.series_id), humanize(s.model), fmtNum(s.mase, 2), fmtNum(s.naive_mase, 2), fmtValue(s.rmse), fmtPct(s.coverage80)])}
         />
       </section>
     </div>

@@ -321,6 +321,11 @@ function EvaluationRuns({ current }: { current: string | null }) {
   );
 }
 
+function sentence(s: string): string {
+  const t = s.trim();
+  return t ? `${t[0].toUpperCase()}${t.slice(1)}${/[.!?]$/.test(t) ? "" : "."}` : t;
+}
+
 export default function EvaluationPage() {
   const { q: dq, can, domain, name } = useIntelDomain();
   const { data, error, mutate } = useSWR<EvaluationResponse>(dq("/intel/evaluation"));
@@ -363,7 +368,7 @@ export default function EvaluationPage() {
             data.reason && (
               <p className="flex items-start gap-2 rounded border border-dashed hairline px-3 py-2 text-sm text-muted-foreground">
                 <Info className="mt-0.5 size-4 shrink-0" aria-hidden />
-                <span>Intelligence-layer report not shown: {data.reason}.</span>
+                <span>{sentence(data.reason)}</span>
               </p>
             )
           )}

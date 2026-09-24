@@ -896,7 +896,11 @@ def evaluation(_: AdminUser, request: Request, domain: Domain) -> dict[str, Any]
             "report": None,
             "domain": domain,
             "reason": "the intelligence-layer evaluation (intel-eval) covers the movie domain; "
-            "see `platform` for this domain's platform evaluation",
+            + (
+                "the platform evaluation below covers this domain"
+                if platform is not None
+                else "no platform evaluation has been run for this domain yet (scripts/evaluate_domains.py)"
+            ),
             "platform": platform,
         }
     run_dir, report = _newest_report(request, "intel-eval-")

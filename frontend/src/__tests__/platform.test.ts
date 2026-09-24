@@ -197,3 +197,99 @@ describe("preference shares", () => {
     expect(shareAxisMax(rows)).toBe(0.6);
   });
 });
+
+describe("state flattening and evaluation helpers", () => {
+  it("flattens nested state without JSON", async () => {
+    const { flattenState } = await import("@/lib/decisions");
+    const rows = flattenState({ drift: { status: "ok", q: 0.0004 }, effects: { adapt: { delta: 0.0063, ci95: [0.0014, 0.0134], n_users: 7 } }, skipped: [] });
+    expect(rows).toContainEqual({ label: "drift · status", value: "ok" });
+    expect(rows).toContainEqual({ label: "drift · q", value: "< 0.001" });
+    expect(rows.find((r) => r.label === "effects · adapt")?.value).toBe("delta 0.0063 · ci95 [0.0014, 0.0134] · n users 7");
+    expect(rows).toContainEqual({ label: "skipped", value: "none" });
+    expect(rows.every((r) => !r.value.includes("{"))).toBe(true);
+  });
+
+  it("collects early-warning point components, highest first", () => {
+    const { components, groups } = ewlStateGroups({ forecast: null, components: [{ stage: "trend", points: 2.5, ref: "trend-1" }, { stage: "risk", points: 3.6, title: "t" }] });
+    expect(components.map((c) => c.stage)).toEqual(["risk", "trend"]);
+    expect(groups.find((g) => g.stage === "forecast")?.observed).toBe(false);
+  });
+
+  it("formats paired deltas and their verdict", async () => {
+    const { deltaVerdict, fmtDelta, fmtWithCi, replayBars, consistencyOf } = await import("@/lib/evaluation");
+    const d = { delta: 0.00633, ci95: [0.00138, 0.01343] as [number, number], p_better: 0.98, n_users: 7, n_improved: 3, n_worse: 0 };
+    expect(fmtDelta(d)).toBe("+0.0063 [0.0014, 0.0134]");
+    expect(deltaVerdict(d)).toBe("better");
+    expect(deltaVerdict({ ...d, ci95: [-0.001, 0.007] })).toBe("unclear");
+    expect(fmtWithCi(0.2195, [0.1436, 0.3205])).toBe("0.22 [0.14, 0.32]");
+    expect(fmtWithCi(null)).toBe("—");
+    expect(replayBars([0, 2])).toEqual([{ bin: "1", n: 0 }, { bin: "2", n: 2 }]);
+    const pooled = consistencyOf({ consistency_pooled_within_windows: { situation_pairs: 946, flips: 156, warning_boundary_flips: 69 } } as never);
+    expect(pooled?.pooled).toBe(true);
+    expect(pooled?.flipRate).toBeCloseTo(156 / 946);
+  });
+});
+
+describe("review fixes", () => {
+  const situation = {
+    key: "series:unemployment_rate:region:Midwest",
+    entity_type: "census_region",
+    entity: "Midwest",
+    series_id: "unemployment_rate:region:Midwest",
+    adverse_direction: "up",
+    label: "Midwest unemployment_rate",
+    components: [
+      { stage: "trend", stage_group: "trend", ref: "trend-1", points: 2.5, title: "Midwest trend up", detail: "trend up (q 0.0)" },
+      { stage: "change_point", stage_group: "trend", ref: "trend-1", points: 2.497, title: "Midwest shifted up" },
+      { stage: "risk", stage_group: "risk", ref: "risk-1", points: 3.59, title: "Midwest rising (adverse)" },
+    ],
+    skipped: [{ stage: "forecast", reason: "series too short for a backtest" }],
+  };
+
+  it("derives stage cells from the components and the skipped list", () => {
+    const { groups, other } = ewlStateGroups(situation);
+    const by = Object.fromEntries(groups.map((g) => [g.stage, g]));
+    expect(by.trend.observed).toBe(true);
+    expect(by.trend.rows).toEqual([{ key: "trend.points", label: "points", value: "2.5" }, { key: "trend.n", label: "components", value: "2" }]);
+    expect(by.trend.summary).toBe("Midwest trend up");
+    expect(by.risk.observed).toBe(true);
+    expect(by.risk.rows[0].value).toBe("3.59");
+    expect(by.forecast.observed).toBe(false);
+    expect(by.forecast.skippedReason).toBe("series too short for a backtest");
+    expect(by.anomaly.observed).toBe(false);
+    expect(by.anomaly.skippedReason).toBeNull();
+    expect(by.signal.skippedReason).toBeNull();
+    expect(other.map((r) => r.label)).toEqual(["key", "entity type", "entity", "series id", "adverse direction", "label"]);
+  });
+
+  it("never prints raw JSON for lists of objects or deep objects", async () => {
+    const { fmtStateValue, flattenState, isScalarMap } = await import("@/lib/decisions");
+    expect(fmtStateValue([{ stage: "forecast", reason: "too short" }, { stage: "anomaly", reason: "no data" }])).toBe("forecast: too short; anomaly: no data");
+    expect(fmtStateValue({ a: { b: { c: 1 } } })).toBe("a (b (c 1))");
+    expect(fmtStateValue([{ x: 1, y: null }])).toBe("x 1 · y —");
+    const rows = flattenState({ skipped: [{ stage: "forecast", reason: "too short" }], deep: { a: { b: { c: { d: 1 } } } } });
+    expect(rows).toContainEqual({ label: "skipped · forecast", value: "too short" });
+    expect(rows.every((r) => !/[{}"]/.test(r.value))).toBe(true);
+    expect(isScalarMap({ a: 1, b: null, c: [1, null] })).toBe(true);
+    expect(isScalarMap({ a: { b: 1 } })).toBe(false);
+  });
+
+  it("uses level words only for early-warning decisions", async () => {
+    const { fmtAnswer } = await import("@/lib/intel");
+    expect(fmtAnswer({ kind: "choice", answer: "URGENT_ACTION", scale: null, spec_id: "early_warning_level", key: "k", options: [] })).toBe("Urgent action");
+    expect(fmtAnswer({ kind: "choice", answer: "WARNING", scale: null, spec_id: "some_other_spec", key: "k", options: ["WARNING", "OK"] })).toBe("WARNING");
+    expect(fmtAnswer({ kind: "choice", answer: "MONITOR", scale: null })).toBe("MONITOR");
+  });
+
+  it("labels replays by month only when they are provably monthly", async () => {
+    const { replayBars, replayMonths } = await import("@/lib/evaluation");
+    const months = replayMonths(["2016-09-01", "2018-08-01"], 24);
+    expect(months?.[0]).toBe("2016-09");
+    expect(months?.[4]).toBe("2017-01");
+    expect(months?.[23]).toBe("2018-08");
+    expect(replayMonths(["2016-09-01", "2018-08-01"], 23)).toBeNull();
+    expect(replayMonths(undefined, 3)).toBeNull();
+    expect(replayBars([1, 2], ["2020-01", "2020-02"])).toEqual([{ bin: "2020-01", n: 1 }, { bin: "2020-02", n: 2 }]);
+    expect(replayBars([1, 2], null).map((b) => b.bin)).toEqual(["1", "2"]);
+  });
+});

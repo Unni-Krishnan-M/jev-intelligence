@@ -15,22 +15,9 @@ import { IntelError } from "@/components/jev/intel/states";
 import { EmptyState } from "@/components/jev/states";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError, qs } from "@/lib/api";
-import { isEarlyWarningDecision, isEarlyWarningLevel, LEVEL_LABEL } from "@/lib/decisions";
+import { flattenState, isEarlyWarningDecision } from "@/lib/decisions";
 import { fmtAnswer, fmtValue, humanize } from "@/lib/intel";
 import type { DecisionBatchList, DecisionRecord, Page, RunList } from "@/lib/intel-types";
-
-/** Flatten the policy's input snapshot into label/value rows (one level of nesting). */
-function stateRows(state: Record<string, unknown>) {
-  const rows: { label: string; value: string }[] = [];
-  for (const [k, v] of Object.entries(state ?? {})) {
-    if (v && typeof v === "object" && !Array.isArray(v)) {
-      for (const [k2, v2] of Object.entries(v as Record<string, unknown>)) rows.push({ label: `${humanize(k)} · ${humanize(k2)}`, value: fmtValue(v2, k2) });
-    } else {
-      rows.push({ label: humanize(k), value: fmtValue(v, k) });
-    }
-  }
-  return rows;
-}
 
 /** What this decision cannot tell you, derived from its own fields. */
 function limitations(d: DecisionRecord): string[] {
@@ -123,7 +110,7 @@ export default function DecisionDetailPage() {
     );
   }
 
-  const rows = stateRows(d.state);
+  const rows = flattenState(d.state);
   const ewl = isEarlyWarningDecision(d);
 
   return (
@@ -141,7 +128,7 @@ export default function DecisionDetailPage() {
             </p>
           ) : (
             <>
-              <p className="text-lg">Answer: <strong className="font-semibold">{ewl && isEarlyWarningLevel(d.answer) ? LEVEL_LABEL[d.answer] : fmtAnswer(d)}</strong></p>
+              <p className="text-lg">Answer: <strong className="font-semibold">{fmtAnswer(d)}</strong></p>
               <ConfidenceBadge value={d.confidence} kind={d.confidence_kind} interval={d.answer_interval} />
             </>
           )}

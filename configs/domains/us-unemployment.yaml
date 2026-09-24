@@ -33,7 +33,7 @@ value_range: [0, 100]
 series:
   - id: "unemployment_rate:{group}"
     metric: level
-    name: unemployment_rate
+    name: unemployment rate
     anomaly_basis: change         # score month-over-month jumps; slow drifts are the trend's job
     resolution: 0.1               # rates are published to one decimal
     group_by: entity
@@ -45,7 +45,7 @@ series:
     count_noun: observations
   - id: "unemployment_rate:region:{group}"
     metric: mean
-    name: unemployment_rate
+    name: unemployment rate
     anomaly_basis: change
     resolution: 0.05              # a mean of rates given to one decimal
     group_by: census_region
