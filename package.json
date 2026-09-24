@@ -1,0 +1,10 @@
+{
+  "name": "jev",
+  "private": true,
+  "description": "Dev entry point: `npm run dev` starts the API and the web app together",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "test": "uv run pytest -q",
+    "build": "pnpm --dir frontend build"
+  }
+}

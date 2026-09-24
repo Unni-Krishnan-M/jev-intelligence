@@ -174,6 +174,8 @@ single tungsten-amber accent, serif display type, and typeset covers generated f
 posters. A light "paper" theme is included. It is responsive from 360 px phones to 1440 px laptops, keyboard
 accessible, and respects reduced-motion settings.
 ```bash
+npm run dev                                      # API :8000 + web :3000 together; Ctrl+C stops both
+# or separately:
 uv run uvicorn jev_api.main:app --port 8000      # SQLite + in-memory cache by default
 cd frontend && pnpm dev                          # http://localhost:3000
 ```
