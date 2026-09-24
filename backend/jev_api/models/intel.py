@@ -1,8 +1,10 @@
-"""ORM models. Portable types only (JSON, not JSONB), so the schema runs on PostgreSQL and SQLite."""
+"""Intelligence layer tables (docs/intelligence.md, sections 5 and 9.3): runs, warnings and their events,
+decisions, scenarios, operator feedback, the normalised run objects with their evidence, and offline
+evaluation runs. Owned by WS4."""
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
@@ -21,313 +23,25 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from jev_api.db import Base
-
-
-def utcnow() -> datetime:
-    return datetime.now(UTC)
-
-
-class TimestampMixin:
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
-    )
-
-
-class User(TimestampMixin, Base):
-    __tablename__ = "users"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    email: Mapped[str] = mapped_column(String(320), unique=True, index=True, nullable=False)
-    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    display_name: Mapped[str] = mapped_column(String(80), nullable=False)
-    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    onboarding_completed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    # bumped on every taste-relevant event; part of the recommendation cache key
-    profile_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    recommendation_prefs: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-
-    genre_preferences: Mapped[list[UserGenrePreference]] = relationship(
-        back_populates="user", cascade="all, delete-orphan"
-    )
-
-
-class Genre(Base):
-    __tablename__ = "genres"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
-
-
-class Movie(TimestampMixin, Base):
-    __tablename__ = "movies"
-
-    # MovieLens movieId, so ids line up with model artifacts
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
-    title: Mapped[str] = mapped_column(String(300), nullable=False)
-    year: Mapped[int | None] = mapped_column(Integer, index=True)
-    description: Mapped[str | None] = mapped_column(Text)
-    runtime_min: Mapped[int | None] = mapped_column(Integer)
-    directors: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
-    cast: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
-    keywords: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
-    tags: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
-    countries: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
-    imdb_id: Mapped[str | None] = mapped_column(String(16))
-    tmdb_id: Mapped[int | None] = mapped_column(Integer)
-    n_ratings: Mapped[int] = mapped_column(Integer, default=0, nullable=False, index=True)
-    mean_rating: Mapped[float | None] = mapped_column(Float)
-    # lower-cased title + directors + cast, for simple portable search
-    search_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
-
-    genres: Mapped[list[Genre]] = relationship(
-        secondary="movie_genres", lazy="selectin", order_by="Genre.name"
-    )
-
-
-class MovieGenre(Base):
-    __tablename__ = "movie_genres"
-
-    movie_id: Mapped[int] = mapped_column(ForeignKey("movies.id", ondelete="CASCADE"), primary_key=True)
-    genre_id: Mapped[int] = mapped_column(
-        ForeignKey("genres.id", ondelete="CASCADE"), primary_key=True, index=True
-    )
-
-
-class UserGenrePreference(Base):
-    __tablename__ = "user_genre_preferences"
-
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
-    genre_id: Mapped[int] = mapped_column(ForeignKey("genres.id", ondelete="CASCADE"), primary_key=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-
-    user: Mapped[User] = relationship(back_populates="genre_preferences")
-    genre: Mapped[Genre] = relationship(lazy="joined")
-
-
-class Rating(TimestampMixin, Base):
-    __tablename__ = "ratings"
-    __table_args__ = (
-        UniqueConstraint("user_id", "movie_id", name="uq_rating_user_movie"),
-        CheckConstraint("rating >= 0.5 AND rating <= 5.0", name="ck_rating_range"),
-        Index("ix_ratings_user_updated", "user_id", "updated_at"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    movie_id: Mapped[int] = mapped_column(
-        ForeignKey("movies.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    rating: Mapped[float] = mapped_column(Float, nullable=False)
-
-    movie: Mapped[Movie] = relationship(lazy="joined")
-
-
-class WatchHistory(Base):
-    __tablename__ = "watch_history"
-    __table_args__ = (
-        Index("ix_watch_user_time", "user_id", "watched_at"),
-        Index("ix_watch_time", "watched_at"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    movie_id: Mapped[int] = mapped_column(ForeignKey("movies.id", ondelete="CASCADE"), nullable=False)
-    watched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-
-    movie: Mapped[Movie] = relationship(lazy="joined")
-
-
-class Favorite(Base):
-    __tablename__ = "favorites"
-    __table_args__ = (UniqueConstraint("user_id", "movie_id", name="uq_favorite_user_movie"),)
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    movie_id: Mapped[int] = mapped_column(ForeignKey("movies.id", ondelete="CASCADE"), nullable=False)
-    source: Mapped[str] = mapped_column(String(16), default="user", nullable=False)  # user | onboarding
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-
-    movie: Mapped[Movie] = relationship(lazy="joined")
-
-
-class Recommendation(Base):
-    """Every recommendation served, with score, reason and contributing signals."""
-
-    __tablename__ = "recommendations"
-    __table_args__ = (
-        Index("ix_rec_user_created", "user_id", "created_at"),
-        Index("ix_rec_request", "request_id"),
-        Index("ix_rec_user_decision", "user_id", "decision_id"),
-        CheckConstraint(
-            "confidence_kind IS NULL OR confidence_kind IN ('probability')", name="ck_rec_confidence_kind"
-        ),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    movie_id: Mapped[int] = mapped_column(ForeignKey("movies.id", ondelete="CASCADE"), nullable=False)
-    request_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    model_version: Mapped[str] = mapped_column(String(80), nullable=False)
-    context: Mapped[str] = mapped_column(String(32), default="feed", nullable=False)
-    rank: Mapped[int] = mapped_column(Integer, nullable=False)
-    score: Mapped[float] = mapped_column(Float, nullable=False)
-    reason: Mapped[str] = mapped_column(String(300), nullable=False)
-    reason_code: Mapped[str] = mapped_column(String(32), nullable=False)
-    signals: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    # calibrated P(rating >= 4) from models/<version>/calibration.json; null without a calibration
-    confidence: Mapped[float | None] = mapped_column(Float)
-    confidence_kind: Mapped[str | None] = mapped_column(String(16))
-    # v1.2: the recommendation_strategy decision the list was served under (docs/platform.md, section 4)
-    decision_id: Mapped[str | None] = mapped_column(String(40))
-    strategy: Mapped[str | None] = mapped_column(String(24))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-
-    movie: Mapped[Movie] = relationship(lazy="joined")
-
-
-# Partial unique indexes (migration 0004): one verdict (like / dislike / not_interested) and one click per
-# user per served recommendation, or per user per movie for feedback given outside a recommendation.
-# A click is an interaction, not a judgement, so it has its own slot and never replaces a verdict.
-_WITH_REC, _NO_REC = "recommendation_id IS NOT NULL", "recommendation_id IS NULL"
-_VERDICT, _CLICK = "feedback <> 'clicked'", "feedback = 'clicked'"
-FEEDBACK_UNIQUE_INDEXES: tuple[tuple[str, str, str], ...] = (
-    ("uq_feedback_verdict_rec", "recommendation_id", f"{_WITH_REC} AND {_VERDICT}"),
-    ("uq_feedback_verdict_movie", "movie_id", f"{_NO_REC} AND {_VERDICT}"),
-    ("uq_feedback_click_rec", "recommendation_id", f"{_WITH_REC} AND {_CLICK}"),
-    ("uq_feedback_click_movie", "movie_id", f"{_NO_REC} AND {_CLICK}"),
+from jev_api.models.base import Base, TimestampMixin, domain_column, in_, nullable_in, utcnow
+from jev_api.models.enums import (
+    CONFIDENCE_KINDS,
+    DECISION_KINDS,
+    EVIDENCE_OWNERS,
+    FEEDBACK_VERDICTS,
+    INTEL_RUN_MODES,
+    INTEL_RUN_STATUSES,
+    INTEL_RUN_TRIGGERS,
+    INTEL_SEVERITIES,
+    TREND_DIRECTIONS,
+    WARNING_OPEN_STATUSES,
+    WARNING_STATUSES,
 )
 
-
-class RecommendationFeedback(Base):
-    """A member's latest verdict on a recommendation (or movie), plus at most one click row.
-    POST /recommendations/feedback upserts; it never appends duplicates."""
-
-    __tablename__ = "recommendation_feedback"
-    __table_args__ = (
-        CheckConstraint("feedback IN ('like','dislike','not_interested','clicked')", name="ck_feedback_kind"),
-        Index("ix_feedback_user_created", "user_id", "created_at"),
-        *(
-            Index(name, "user_id", col, unique=True, sqlite_where=text(where), postgresql_where=text(where))
-            for name, col, where in FEEDBACK_UNIQUE_INDEXES
-        ),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    movie_id: Mapped[int] = mapped_column(ForeignKey("movies.id", ondelete="CASCADE"), nullable=False)
-    recommendation_id: Mapped[int | None] = mapped_column(
-        ForeignKey("recommendations.id", ondelete="SET NULL"), index=True
-    )
-    feedback: Mapped[str] = mapped_column(String(16), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-
-
-class ModelVersion(Base):
-    __tablename__ = "model_versions"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    version: Mapped[str] = mapped_column(String(80), unique=True, nullable=False)
-    model_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    dataset_version: Mapped[str] = mapped_column(String(120), nullable=False)
-    training_config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    training_seed: Mapped[int] = mapped_column(Integer, nullable=False)
-    metrics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    artifact_path: Mapped[str] = mapped_column(String(500), nullable=False)
-    artifact_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    trained_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-
-
-class Experiment(Base):
-    __tablename__ = "experiments"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    run_id: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
-    experiment_name: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
-    dataset_version: Mapped[str] = mapped_column(String(120), nullable=False)
-    model_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    parameters: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    training_seed: Mapped[int] = mapped_column(Integer, nullable=False)
-    split: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    summary: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    model_version_id: Mapped[int | None] = mapped_column(ForeignKey("model_versions.id", ondelete="SET NULL"))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-
-    metrics: Mapped[list[EvaluationMetric]] = relationship(
-        back_populates="experiment", cascade="all, delete-orphan", lazy="selectin"
-    )
-    model_version: Mapped[ModelVersion | None] = relationship(lazy="joined")
-
-
-class EvaluationMetric(Base):
-    __tablename__ = "evaluation_metrics"
-    __table_args__ = (
-        UniqueConstraint("experiment_id", "model_name", "protocol", "metric", "k", name="uq_metric"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    experiment_id: Mapped[int] = mapped_column(
-        ForeignKey("experiments.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    model_name: Mapped[str] = mapped_column(String(32), nullable=False)
-    protocol: Mapped[str] = mapped_column(String(16), nullable=False)  # test | cold_start
-    metric: Mapped[str] = mapped_column(String(32), nullable=False)
-    k: Mapped[int] = mapped_column(Integer, default=0, nullable=False)  # 0 = metric without a cut-off
-    value: Mapped[float] = mapped_column(Float, nullable=False)
-
-    experiment: Mapped[Experiment] = relationship(back_populates="metrics")
-
-
-# --- intelligence layer (docs/intelligence.md, section 5) -------------------------------------------
-# Enum values live here once; the CHECK constraints and the API validation both use them.
-INTEL_RUN_TRIGGERS = ("startup", "manual", "script", "schedule")
-INTEL_RUN_STATUSES = ("running", "succeeded", "failed")
-INTEL_SEVERITIES = ("low", "medium", "high", "critical")
-WARNING_STATUSES = ("new", "acknowledged", "investigating", "resolved", "dismissed")
-WARNING_OPEN_STATUSES = ("new", "acknowledged", "investigating")
-DECISION_KINDS = ("boolean", "choice", "score")
-CONFIDENCE_KINDS = ("probability", "margin", "rule", "interval")
-TREND_DIRECTIONS = ("up", "down", "flat")
-EVIDENCE_OWNERS = ("signal", "trend", "anomaly", "forecast", "risk", "decision", "warning", "action")
-AUDIT_ACTIONS = (
-    "intel.run",
-    "warning.transition",
-    "feedback.create",
-    "scenario.save",
-    "model.activate",
-    "auth.login.success",
-    "auth.login.failure",
-    "auth.register",
-    "me.feedback",  # v1.2: a member's verdict on a strategy decision or recommendation
-)
-DEFAULT_DOMAIN = "movie"  # v1.2 (docs/platform.md): rows before migration 0005 belong to the movie domain
-ME_FEEDBACK_TARGETS = ("strategy", "recommendation")
-ME_FEEDBACK_VERDICTS = ("accepted", "rejected")
-FEEDBACK_VERDICTS = {
-    "decision": ("correct", "incorrect"),
-    "warning": ("useful", "not_useful", "false_positive"),
-    "action": ("useful", "not_useful"),
-    "prediction": ("correct", "incorrect"),
-}
-
-
-def _in(column: str, values: tuple[str, ...]) -> str:
-    return f"{column} IN ({','.join(repr(v) for v in values)})"
-
-
-_OPEN_WARNING = _in("status", WARNING_OPEN_STATUSES)
+_OPEN_WARNING = in_("status", WARNING_OPEN_STATUSES)
 _VERDICT_MATCHES_TARGET = " OR ".join(
-    f"(target_type = '{t}' AND {_in('verdict', v)})" for t, v in FEEDBACK_VERDICTS.items()
+    f"(target_type = '{t}' AND {in_('verdict', v)})" for t, v in FEEDBACK_VERDICTS.items()
 )
-
-
-def _domain_column() -> Mapped[str]:
-    return mapped_column(String(64), default=DEFAULT_DOMAIN, server_default=DEFAULT_DOMAIN, nullable=False)
 
 
 class IntelRun(Base):
@@ -336,17 +50,22 @@ class IntelRun(Base):
     __tablename__ = "intel_runs"
     __table_args__ = (
         # quoted: TRIGGER is a keyword in SQL
-        CheckConstraint(_in('"trigger"', INTEL_RUN_TRIGGERS), name="ck_intel_run_trigger"),
-        CheckConstraint(_in("status", INTEL_RUN_STATUSES), name="ck_intel_run_status"),
+        CheckConstraint(in_('"trigger"', INTEL_RUN_TRIGGERS), name="ck_intel_run_trigger"),
+        CheckConstraint(in_("status", INTEL_RUN_STATUSES), name="ck_intel_run_status"),
+        CheckConstraint(in_("mode", INTEL_RUN_MODES), name="ck_intel_run_mode"),
         Index("ix_intel_runs_status_started", "status", "started_at"),
         Index("ix_intel_runs_domain_started", "domain", "status", "started_at"),
+        Index("ix_intel_runs_domain_mode_started", "domain", "mode", "status", "started_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     run_id: Mapped[str] = mapped_column(String(36), unique=True, nullable=False)
-    domain: Mapped[str] = _domain_column()
+    domain: Mapped[str] = domain_column()
     trigger: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(16), default="running", nullable=False)
+    # Phase 2 (migration 0006): "replay" when the run was asked for an explicit as_of (run_mode()).
+    # Replays must never touch live state; "latest" reads mean the latest live run (WS4).
+    mode: Mapped[str] = mapped_column(String(8), default="live", server_default="live", nullable=False)
     requested_as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # resolved by the pipeline
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
@@ -363,16 +82,21 @@ class IntelRun(Base):
     created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
 
 
+def run_mode(requested_as_of: datetime | None) -> str:
+    """The mode a new run is recorded with: an explicit as_of makes it a replay (P2.0 acceptance)."""
+    return "live" if requested_as_of is None else "replay"
+
+
 class IntelWarning(TimestampMixin, Base):
     """An early warning with a lifecycle. At most one open warning per (domain, key) (partial unique
     index; v1.2 made it per domain)."""
 
     __tablename__ = "intel_warnings"
     __table_args__ = (
-        CheckConstraint(_in("severity", INTEL_SEVERITIES), name="ck_intel_warning_severity"),
-        CheckConstraint(_in("status", WARNING_STATUSES), name="ck_intel_warning_status"),
+        CheckConstraint(in_("severity", INTEL_SEVERITIES), name="ck_intel_warning_severity"),
+        CheckConstraint(in_("status", WARNING_STATUSES), name="ck_intel_warning_status"),
         CheckConstraint(
-            f"dismissed_severity IS NULL OR {_in('dismissed_severity', INTEL_SEVERITIES)}",
+            f"dismissed_severity IS NULL OR {in_('dismissed_severity', INTEL_SEVERITIES)}",
             name="ck_intel_warning_dismissed_severity",
         ),
         CheckConstraint("occurrences >= 1", name="ck_intel_warning_occurrences"),
@@ -392,7 +116,7 @@ class IntelWarning(TimestampMixin, Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     key: Mapped[str] = mapped_column(String(200), nullable=False)
-    domain: Mapped[str] = _domain_column()
+    domain: Mapped[str] = domain_column()
     title: Mapped[str] = mapped_column(String(300), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     severity: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -432,9 +156,9 @@ class IntelWarningEvent(Base):
     __tablename__ = "intel_warning_events"
     __table_args__ = (
         CheckConstraint(
-            f"from_status IS NULL OR {_in('from_status', WARNING_STATUSES)}", name="ck_intel_event_from"
+            f"from_status IS NULL OR {in_('from_status', WARNING_STATUSES)}", name="ck_intel_event_from"
         ),
-        CheckConstraint(_in("to_status", WARNING_STATUSES), name="ck_intel_event_to"),
+        CheckConstraint(in_("to_status", WARNING_STATUSES), name="ck_intel_event_to"),
         Index("ix_intel_events_warning_at", "warning_id", "at"),
     )
 
@@ -459,8 +183,8 @@ class IntelDecision(Base):
     __tablename__ = "intel_decisions"
     __table_args__ = (
         UniqueConstraint("run_id", "decision_id", name="uq_intel_decision_run"),
-        CheckConstraint(_in("kind", DECISION_KINDS), name="ck_intel_decision_kind"),
-        CheckConstraint(_in("confidence_kind", CONFIDENCE_KINDS), name="ck_intel_decision_confidence_kind"),
+        CheckConstraint(in_("kind", DECISION_KINDS), name="ck_intel_decision_kind"),
+        CheckConstraint(in_("confidence_kind", CONFIDENCE_KINDS), name="ck_intel_decision_confidence_kind"),
         Index("ix_intel_decisions_decision_id", "decision_id"),
         Index("ix_intel_decisions_key_created", "key", "created_at"),
         Index("ix_intel_decisions_batch", "batch_id"),
@@ -470,7 +194,7 @@ class IntelDecision(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     run_id: Mapped[str] = mapped_column(ForeignKey("intel_runs.run_id", ondelete="CASCADE"), nullable=False)
     decision_id: Mapped[str] = mapped_column(String(40), nullable=False)  # contract id "dec-..."
-    domain: Mapped[str] = _domain_column()
+    domain: Mapped[str] = domain_column()
     key: Mapped[str] = mapped_column(String(64), nullable=False)
     spec_id: Mapped[str] = mapped_column(String(64), nullable=False)
     policy_version: Mapped[str] = mapped_column(String(40), nullable=False)
@@ -505,7 +229,7 @@ class IntelScenario(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
-    domain: Mapped[str] = _domain_column()
+    domain: Mapped[str] = domain_column()
     series_id: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
     as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     input: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
@@ -521,7 +245,7 @@ class IntelFeedback(Base):
 
     __tablename__ = "intel_feedback"
     __table_args__ = (
-        CheckConstraint(_in("target_type", tuple(FEEDBACK_VERDICTS)), name="ck_intel_feedback_target"),
+        CheckConstraint(in_("target_type", tuple(FEEDBACK_VERDICTS)), name="ck_intel_feedback_target"),
         CheckConstraint(_VERDICT_MATCHES_TARGET, name="ck_intel_feedback_verdict"),
         Index("ix_intel_feedback_target", "target_type", "target_id"),
         Index("ix_intel_feedback_created", "created_at"),
@@ -529,7 +253,7 @@ class IntelFeedback(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    domain: Mapped[str] = _domain_column()
+    domain: Mapped[str] = domain_column()
     target_type: Mapped[str] = mapped_column(String(16), nullable=False)
     target_id: Mapped[str] = mapped_column(String(64), nullable=False)
     verdict: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -541,19 +265,17 @@ class IntelFeedback(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
-# --- v1.1: normalised run objects, audit log, evaluation runs (docs/intelligence.md, section 9.3) ------
+# --- v1.1: normalised run objects and evaluation runs (docs/intelligence.md, section 9.3) -------------
 # Each run object keeps indexed key columns plus its full contract JSON in `payload`. `run_id` here is
 # the integer intel_runs.id (CASCADE); the API reports the run's uuid. Kinds are an ML-owned, open
 # vocabulary and carry no CHECK, so a new kind can never fail a run; severities/levels/directions do.
-def _nullable_in(column: str, values: tuple[str, ...]) -> str:
-    return f"{column} IS NULL OR {_in(column, values)}"
 
 
 class IntelSignalRow(Base):
     __tablename__ = "intel_signals"
     __table_args__ = (
         UniqueConstraint("run_id", "signal_id", name="uq_intel_signal_run"),
-        CheckConstraint(_nullable_in("direction", TREND_DIRECTIONS), name="ck_intel_signal_direction"),
+        CheckConstraint(nullable_in("direction", TREND_DIRECTIONS), name="ck_intel_signal_direction"),
         Index("ix_intel_signals_run_kind", "run_id", "kind"),
         Index("ix_intel_signals_signal_id", "signal_id"),
         Index("ix_intel_signals_dedup_key", "dedup_key", "run_id"),
@@ -581,7 +303,7 @@ class IntelTrendRow(Base):
     __tablename__ = "intel_trends"
     __table_args__ = (
         UniqueConstraint("run_id", "trend_id", name="uq_intel_trend_run"),
-        CheckConstraint(_nullable_in("direction", TREND_DIRECTIONS), name="ck_intel_trend_direction"),
+        CheckConstraint(nullable_in("direction", TREND_DIRECTIONS), name="ck_intel_trend_direction"),
         Index("ix_intel_trends_run_direction", "run_id", "direction"),
         Index("ix_intel_trends_trend_id", "trend_id"),
         Index("ix_intel_trends_series", "series_id", "run_id"),
@@ -609,7 +331,7 @@ class IntelAnomalyRow(Base):
     __tablename__ = "intel_anomalies"
     __table_args__ = (
         UniqueConstraint("run_id", "anomaly_id", name="uq_intel_anomaly_run"),
-        CheckConstraint(_nullable_in("severity", INTEL_SEVERITIES), name="ck_intel_anomaly_severity"),
+        CheckConstraint(nullable_in("severity", INTEL_SEVERITIES), name="ck_intel_anomaly_severity"),
         Index("ix_intel_anomalies_run_kind", "run_id", "kind"),
         Index("ix_intel_anomalies_anomaly_id", "anomaly_id"),
         Index("ix_intel_anomalies_dedup_key", "dedup_key", "run_id"),
@@ -666,7 +388,7 @@ class IntelRiskRow(Base):
     __tablename__ = "intel_risks"
     __table_args__ = (
         UniqueConstraint("run_id", "risk_id", name="uq_intel_risk_run"),
-        CheckConstraint(_nullable_in("level", INTEL_SEVERITIES), name="ck_intel_risk_level"),
+        CheckConstraint(nullable_in("level", INTEL_SEVERITIES), name="ck_intel_risk_level"),
         Index("ix_intel_risks_run_kind", "run_id", "kind"),
         Index("ix_intel_risks_risk_id", "risk_id"),
         Index("ix_intel_risks_key", "key", "run_id"),
@@ -698,7 +420,7 @@ class IntelEvidenceRow(Base):
 
     __tablename__ = "intel_evidence"
     __table_args__ = (
-        CheckConstraint(_in("owner_type", EVIDENCE_OWNERS), name="ck_intel_evidence_owner"),
+        CheckConstraint(in_("owner_type", EVIDENCE_OWNERS), name="ck_intel_evidence_owner"),
         Index("ix_intel_evidence_run_owner", "run_id", "owner_type"),
         Index("ix_intel_evidence_owner", "owner_type", "owner_id"),
         Index("ix_intel_evidence_kind", "kind"),
@@ -719,31 +441,6 @@ class IntelEvidenceRow(Base):
     ref: Mapped[str | None] = mapped_column(String(200))
 
 
-class AuditLog(Base):
-    """Who did what, when (never secrets: see services/audit.py)."""
-
-    __tablename__ = "audit_logs"
-    __table_args__ = (
-        CheckConstraint(_in("action", AUDIT_ACTIONS), name="ck_audit_action"),
-        Index("ix_audit_logs_at", "at"),
-        Index("ix_audit_logs_action_at", "action", "at"),
-        Index("ix_audit_logs_actor_at", "actor", "at"),
-        Index("ix_audit_logs_target", "target_type", "target_id"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-    actor_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
-    actor: Mapped[str] = mapped_column(
-        String(320), nullable=False
-    )  # "system" or an email (attempted, on failure)
-    action: Mapped[str] = mapped_column(String(40), nullable=False)
-    target_type: Mapped[str | None] = mapped_column(String(32))
-    target_id: Mapped[str | None] = mapped_column(String(200))
-    detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    request_id: Mapped[str | None] = mapped_column(String(64))
-
-
 class IntelEvaluationRun(Base):
     """One offline evaluation of the intelligence layer, synced from experiments/intel-eval-*/report.json."""
 
@@ -759,29 +456,3 @@ class IntelEvaluationRun(Base):
     report_sha1: Mapped[str] = mapped_column(String(40), nullable=False)  # re-synced when the file changes
     report: Mapped[dict[str, Any]] = mapped_column(JSON, deferred=True, nullable=False)
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-
-
-class UserIntelFeedback(TimestampMixin, Base):
-    """A member's verdict (accepted | rejected) on their recommendation-strategy decision or on a
-    recommendation (POST /me/intelligence/feedback). One row per member per target: a repeat is a
-    no-op and a new verdict replaces the old one. Kept apart from recommendation_feedback: it judges
-    the decision layer, and must not silently exclude movies or move the taste profile."""
-
-    __tablename__ = "user_intel_feedback"
-    __table_args__ = (
-        UniqueConstraint("user_id", "target_type", "target_id", name="uq_user_intel_feedback_target"),
-        CheckConstraint(_in("target_type", ME_FEEDBACK_TARGETS), name="ck_user_intel_feedback_target"),
-        CheckConstraint(_in("verdict", ME_FEEDBACK_VERDICTS), name="ck_user_intel_feedback_verdict"),
-        Index("ix_user_intel_feedback_user_created", "user_id", "created_at"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    target_type: Mapped[str] = mapped_column(String(16), nullable=False)
-    target_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    verdict: Mapped[str] = mapped_column(String(16), nullable=False)
-    note: Mapped[str | None] = mapped_column(String(1000))
-    # the strategy decision the target belongs to (the decision itself, or the one a recommendation was
-    # served under), and the movie of a recommendation target
-    decision_id: Mapped[str | None] = mapped_column(String(40))
-    movie_id: Mapped[int | None] = mapped_column(ForeignKey("movies.id", ondelete="CASCADE"))

@@ -12,9 +12,17 @@ Metrics per period and group:
 * ``mean``: mean ``value`` of the group's observations, NaN when fewer than ``min_count``;
 * ``nunique``: distinct values of ``value_column`` (e.g. ``entity_id`` = active entities);
 * ``level``: mean ``value`` (NaN when absent), for data that already is a level per period
-  (e.g. an unemployment rate); equals ``mean`` with ``min_count = 1``.
+  (e.g. an unemployment rate); equals ``mean`` with ``min_count = 1``;
+* ``sum``: sum of ``value`` (e.g. daily boardings summed to weeks), NaN when fewer than
+  ``min_count`` observations fall in the period (a week with a missing day is not a low week).
 
-Periods: calendar months (``freq="M"``, required) or weeks (``freq="W"``, optional). Grid end:
+Derived values (opt-in, applied after the metric): ``rolling = k`` replaces each point by the mean
+of the trailing k periods (NaN unless all k are defined), and ``ratio_lag = L`` then divides by the
+same quantity L periods earlier (e.g. ``rolling: 28, ratio_lag: 364``: the last four weeks against
+the same, weekday-aligned four weeks a year earlier; weekly and yearly seasonality cancel).
+
+Periods: calendar months (``freq="M"``, required), weeks (``freq="W"``, Monday..Sunday) or days
+(``freq="D"``). Grid end:
 
 * ``"as_of"``: a period is *complete* when the first instant of the next period is <= as_of; the
   period containing as_of (if as_of is past its first instant) is the last point with
@@ -24,7 +32,17 @@ Periods: calendar months (``freq="M"``, required) or weeks (``freq="W"``, option
 
 Series order: specs in order, except that consecutive specs with the same ``group_by`` form a block
 emitted group by group (for each group, every spec of the block), so an entity's series are adjacent.
-``counts`` holds the observations behind each point (the min-volume guard's input).
+``counts`` holds the observations behind each point (the min-volume guard's input). Gaps are
+NaN points (never zeros for ``level``/``mean``/``sum``); duplicates are removed by the core validator
+before building.
+
+Seasonality (opt-in per spec; every default reproduces the monthly behaviour byte for byte):
+``seasonal_period`` (7 for daily data with a weekly cycle, 52 weekly, 12 monthly) and ``calendar``
+define each period's *season class* (``season_classes``): day of week for days (with
+``calendar: weekday_us_holidays`` the six US holidays a transit operator runs a Sunday service on
+count as Sundays), week of year for weeks, month for months. Forecasting (``forecast_models``) and
+``anomaly_basis: seasonal`` (a point is compared with the previous points of its own class, so a
+Sunday is compared with Sundays) read them.
 """
 
 from __future__ import annotations
@@ -40,8 +58,11 @@ import pandas as pd
 from jev_ml.core.common import fnum, period_str
 
 COUNT_METRICS = ("volume", "active_users", "count", "nunique")
-METRICS = ("count", "share", "mean", "nunique", "level")
-FREQS = {"M": "M", "month": "M", "W": "W", "week": "W"}
+METRICS = ("count", "share", "mean", "nunique", "level", "sum")
+FREQS = {"M": "M", "month": "M", "W": "W", "week": "W", "D": "D", "day": "D"}
+FREQ_NAMES = {"M": "month", "W": "week", "D": "day"}
+ANOMALY_BASES = ("level", "change", "seasonal")
+CALENDARS = ("weekday", "weekday_us_holidays")
 
 
 @dataclass(frozen=True)
@@ -77,16 +98,40 @@ class SeriesSpec:
     # published precision of the values (e.g. 0.1 for a rate given to one decimal): an anomaly whose
     # deviation is not larger than this is suppressed ("within data resolution")
     resolution: float | None = None
+    # ---- opt-in seasonality and derived values (defaults: none, the v1.2 behaviour) ----------
+    seasonal_period: int | None = None  # periods per seasonal cycle (7 = weekly cycle of days)
+    calendar: str | None = None  # season classes of days: weekday | weekday_us_holidays
+    forecast_models: tuple[str, ...] | None = None  # candidate models (None = the v1.2 trio)
+    rolling: int | None = None  # trailing mean over this many periods
+    ratio_lag: int | None = None  # divide by the (rolled) value this many periods earlier
 
     def __post_init__(self) -> None:
         if self.metric not in METRICS:
             raise ValueError(f"series spec {self.id}: metric must be one of {METRICS}")
         if self.adverse_direction not in ("up", "down", "both", "none"):
             raise ValueError(f"series spec {self.id}: adverse_direction must be up|down|both|none")
-        if self.anomaly_basis not in ("level", "change"):
-            raise ValueError(f"series spec {self.id}: anomaly_basis must be level|change")
+        if self.anomaly_basis not in ANOMALY_BASES:
+            raise ValueError(f"series spec {self.id}: anomaly_basis must be one of {ANOMALY_BASES}")
         if self.group_by is not None and "{group}" not in self.id:
             raise ValueError(f"series spec {self.id}: a grouped spec needs {{group}} in its id")
+        if self.calendar is not None and self.calendar not in CALENDARS:
+            raise ValueError(f"series spec {self.id}: calendar must be one of {CALENDARS}")
+        for name in ("seasonal_period", "rolling", "ratio_lag"):
+            v = getattr(self, name)
+            if v is not None and (not isinstance(v, int) or isinstance(v, bool) or v < 1):
+                raise ValueError(f"series spec {self.id}: {name} must be a positive integer")
+        if self.anomaly_basis == "seasonal" and self.seasonal_period is None and self.calendar is None:
+            raise ValueError(f"series spec {self.id}: anomaly_basis seasonal needs seasonal_period or calendar")
+        if self.forecast_models is not None:
+            from jev_ml.core.forecast import ALL_MODELS, SEASONAL_MODELS
+
+            bad = [m for m in self.forecast_models if m not in ALL_MODELS]
+            if bad or not self.forecast_models:
+                raise ValueError(f"series spec {self.id}: unknown forecast models {bad} (known: {ALL_MODELS})")
+            if "naive" not in self.forecast_models:
+                raise ValueError(f"series spec {self.id}: forecast_models must include the naive benchmark")
+            if any(m in SEASONAL_MODELS for m in self.forecast_models) and self.seasonal_period is None:
+                raise ValueError(f"series spec {self.id}: seasonal forecast models need seasonal_period")
 
     @property
     def output_metric(self) -> str:
@@ -123,6 +168,9 @@ class Series:
     trend_unit: str | None = None
     anomaly_basis: str = "level"
     resolution: float | None = None
+    seasonal_period: int | None = None
+    calendar: str | None = None
+    forecast_models: tuple[str, ...] | None = None
 
     @property
     def is_count(self) -> bool:
@@ -130,7 +178,18 @@ class Series:
 
     @property
     def freq(self) -> str:
-        return "W" if self.months.freqstr.startswith("W") else "M"
+        fs = self.months.freqstr
+        return "W" if fs.startswith("W") else "D" if fs.startswith("D") else "M"
+
+    @property
+    def seasonal(self) -> bool:
+        """Whether the series opted into the seasonal forecasting path (``forecast_models`` or
+        ``seasonal_period`` declared)."""
+        return self.forecast_models is not None or self.seasonal_period is not None
+
+    def classes(self, periods: pd.PeriodIndex | None = None) -> np.ndarray:
+        """Season class of each period (``season_classes``) of the grid, or of ``periods``."""
+        return season_classes(self.months if periods is None else periods, self.seasonal_period, self.calendar)
 
     @property
     def periods(self) -> pd.PeriodIndex:
@@ -168,10 +227,72 @@ class Series:
         }
         out["entity_id"] = self.entity_id or f"{self.entity_type}:{self.entity}"
         out["adverse_direction"] = self.adverse_direction
-        out["frequency"] = "week" if self.freq == "W" else "month"
+        out["frequency"] = FREQ_NAMES[self.freq]
         if self.domain is not None:
             out["domain"] = self.domain
         return out
+
+
+# --------------------------------------------------------------------------------------------------
+# season classes
+
+
+def us_transit_holidays(start: pd.Timestamp, end: pd.Timestamp) -> pd.DatetimeIndex:
+    """The six US holidays on which transit operators commonly run a Sunday schedule: New Year's
+    Day, Memorial Day, Independence Day, Labor Day, Thanksgiving and Christmas. Fixed-date holidays
+    that fall on a weekend are observed on the nearest weekday (Saturday -> Friday, Sunday ->
+    Monday), as for US federal holidays."""
+    from pandas.tseries.holiday import (
+        AbstractHolidayCalendar,
+        Holiday,
+        USLaborDay,
+        USMemorialDay,
+        USThanksgivingDay,
+        nearest_workday,
+    )
+
+    class _Cal(AbstractHolidayCalendar):
+        rules = [  # noqa: RUF012 (pandas API: a class attribute list)
+            Holiday("New Year's Day", month=1, day=1, observance=nearest_workday),
+            USMemorialDay,
+            Holiday("Independence Day", month=7, day=4, observance=nearest_workday),
+            USLaborDay,
+            USThanksgivingDay,
+            Holiday("Christmas Day", month=12, day=25, observance=nearest_workday),
+        ]
+
+    out: pd.DatetimeIndex = _Cal().holidays(start - pd.Timedelta(days=7), end + pd.Timedelta(days=7))
+    return out
+
+
+def season_classes(periods: pd.PeriodIndex, seasonal_period: int | None, calendar: str | None) -> np.ndarray:
+    """Season class per period: days -> day of week 0..6 (Monday = 0; with ``weekday_us_holidays``
+    a holiday gets the Sunday class 6), weeks -> week of year 0..51 (ISO week 53 joins week 52),
+    months -> month 0..11. Any other ``seasonal_period`` p -> period ordinal mod p."""
+    if not len(periods):
+        return np.zeros(0, dtype=np.int64)
+    fs = periods.freqstr
+    start = periods.start_time
+    if fs.startswith("D") and (seasonal_period in (None, 7) or calendar is not None):
+        cls = np.asarray(start.dayofweek, dtype=np.int64)
+        if calendar == "weekday_us_holidays":
+            hol = us_transit_holidays(start.min(), start.max())
+            cls = np.where(start.normalize().isin(hol), 6, cls)
+        return cls
+    if fs.startswith("W") and seasonal_period in (None, 52):
+        wk = np.asarray(periods.end_time.isocalendar().week, dtype=np.int64)
+        return np.minimum(wk, 52) - 1
+    if fs.startswith("M") and seasonal_period in (None, 12):
+        return np.asarray(start.month, dtype=np.int64) - 1
+    p = int(seasonal_period or 1)
+    return (np.asarray(periods.asi8, dtype=np.int64) % p).astype(np.int64)  # type: ignore[attr-defined]
+
+
+def seasonal_baseline_rows(classes: np.ndarray, i: int, n: int) -> np.ndarray:
+    """Indices of the (at most) ``n`` periods before ``i`` with the same season class as ``i``, in
+    time order: the anomaly baseline of ``anomaly_basis: seasonal``."""
+    same = np.flatnonzero(classes[:i] == classes[i])
+    return same[-n:]
 
 
 # --------------------------------------------------------------------------------------------------
@@ -229,6 +350,13 @@ def _values(
         with np.errstate(invalid="ignore", divide="ignore"):
             share = np.where(total > 0, cnt / np.where(total > 0, total, 1), np.nan)
         return share, cnt
+    if spec.metric == "sum":
+        val = obs[spec.value_column].to_numpy(dtype=float)
+        v = val if rows is None else val[rows]
+        ok = np.isfinite(v)
+        n_ok = np.bincount(c[ok], minlength=n_m).astype(float)
+        tot = np.bincount(c[ok], weights=v[ok], minlength=n_m)
+        return np.where(n_ok >= max(1, spec.min_count), tot, np.nan), cnt
     if spec.metric == "nunique":
         col = obs[spec.value_column].to_numpy()
         v = col if rows is None else col[rows]
@@ -244,6 +372,22 @@ def _values(
     with np.errstate(invalid="ignore", divide="ignore"):
         mean = np.where(n_ok >= min_count, s / np.where(n_ok > 0, n_ok, 1), np.nan)
     return mean, cnt
+
+
+def derive(values: np.ndarray, rolling: int | None, ratio_lag: int | None) -> np.ndarray:
+    """``rolling`` trailing mean (NaN unless every period of the window is defined), then
+    ``ratio_lag`` ratio to the value that many periods earlier (NaN when either is undefined or 0)."""
+    v = np.asarray(values, dtype=float)
+    if rolling is not None and rolling > 1:
+        r = pd.Series(v).rolling(rolling, min_periods=rolling).mean().to_numpy()
+        v = np.asarray(r, dtype=float)
+    if ratio_lag is not None:
+        prev = np.full(len(v), np.nan)
+        if ratio_lag < len(v):
+            prev[ratio_lag:] = v[:-ratio_lag]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            v = np.where(np.isfinite(prev) & (prev != 0), v / np.where(prev != 0, prev, 1.0), np.nan)
+    return v
 
 
 def _blocks(specs: Sequence[SeriesSpec]) -> list[list[SeriesSpec]]:
@@ -289,6 +433,8 @@ def build_series(
     out: list[Series] = []
 
     def make(sp: SeriesSpec, group: str | None, values: np.ndarray, counts: np.ndarray) -> Series:
+        if sp.rolling is not None or sp.ratio_lag is not None:
+            values = derive(values, sp.rolling, sp.ratio_lag)
         entity = group if group is not None else sp.entity
         sid = sp.id.format(group=group) if group is not None else sp.id
         return Series(
@@ -316,6 +462,9 @@ def build_series(
             trend_unit=sp.trend_unit,
             anomaly_basis=sp.anomaly_basis,
             resolution=sp.resolution,
+            seasonal_period=sp.seasonal_period,
+            calendar=sp.calendar,
+            forecast_models=tuple(sp.forecast_models) if sp.forecast_models is not None else None,
         )
 
     for block in _blocks(specs):

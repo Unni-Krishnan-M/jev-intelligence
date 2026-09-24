@@ -28,6 +28,48 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run mypy
       - run: uv run pytest -q
+      # the chain gate on SQLite (single head, round trip, CHECK parity) runs inside pytest above;
+      # schema drift between the models and the migrations:
+      - run: uv run alembic upgrade head && uv run alembic check
+        env:
+          JEV_DATABASE_URL: sqlite:///${{ runner.temp }}/alembic-check.db
+
+  # PostgreSQL-only tests (every test with "postgres" in its name skips without JEV_TEST_POSTGRES_URL):
+  # migration round trips and CHECK parity on the production database engine
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: jev
+          POSTGRES_PASSWORD: jev-ci-only
+          POSTGRES_DB: jev_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jev -d jev_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      JEV_TEST_POSTGRES_URL: postgresql+psycopg://jev:jev-ci-only@localhost:5432/jev_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: PostgreSQL-only tests (a skip means the database was not reachable, so it fails the job)
+        run: |
+          set -o pipefail
+          uv run pytest -q -k postgres -rs | tee pytest-postgres.txt
+          ! grep -q skipped pytest-postgres.txt
+      - name: alembic check on PostgreSQL
+        run: uv run alembic upgrade head && uv run alembic check
+        env:
+          JEV_DATABASE_URL: ${{ env.JEV_TEST_POSTGRES_URL }}
 
   web:
     runs-on: ubuntu-latest

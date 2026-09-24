@@ -14,6 +14,11 @@ Adaptive weighting (cold start → warm): collaborative and latent signals need 
 so their weights ramp linearly with the number of interactions up to `behavioral_ramp`. Popularity
 and explicit genre preferences carry the ranking while that happens. Weights are renormalized to
 sum to 1, so hybrid scores stay on a comparable [0, 1] scale for every user.
+
+Cold stages (optional, `HybridConfig.cold_stages`): separate weight sets for short profiles, tuned
+on the validation split per profile-size bucket. A stage either replaces the weights outright
+(`weights`) or blends the adaptive weights with popularity (`popularity_blend`). Stages only change
+the weights, so every served item still carries its per-signal contributions and its explanation.
 """
 
 from __future__ import annotations
@@ -56,6 +61,11 @@ class HybridConfig:
     # pure-metadata matches on obscure titles don't swamp the list; +1 keeps unrated (new) movies
     # discoverable. 0 disables it.
     content_support_damping: float = 1.0
+    # profile-size conditioned weights, e.g. [{"name": "cold_0", "max_profile": 0, "weights": {...}},
+    # {"name": "cold_1_3", "min_profile": 1, "max_profile": 3, "popularity_blend": 0.5}]. The first
+    # stage with min_profile <= n_interactions <= max_profile applies (min_profile defaults to 0);
+    # other profiles use the adaptive weights. None = off.
+    cold_stages: list[dict[str, Any]] | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> HybridConfig:
@@ -145,7 +155,42 @@ class HybridRanker:
             "recency": self._recency,
         }
 
+    def cold_stage(self, profile: UserProfile) -> dict[str, Any] | None:
+        """The cold stage that applies to this profile size, or None (adaptive weights)."""
+        n = profile.n_interactions
+        for st in self.config.cold_stages or []:
+            if int(st.get("min_profile", 0)) <= n <= int(st["max_profile"]):
+                return st
+        return None
+
+    def weight_strategy(self, profile: UserProfile) -> str:
+        """Name of the weighting used for this profile: a cold stage's name or "adaptive"."""
+        st = self.cold_stage(profile)
+        return "adaptive" if st is None else str(st.get("name") or f"stage_le_{st['max_profile']}")
+
     def effective_weights(self, profile: UserProfile) -> dict[str, float]:
+        st = self.cold_stage(profile)
+        if st is None:
+            return self._adaptive_weights(profile)
+        if "popularity_blend" in st:
+            a = float(np.clip(st["popularity_blend"], 0.0, 1.0))
+            base = self._adaptive_weights(profile)
+            return {k: (1.0 - a) * v + (a if k == "popularity" else 0.0) for k, v in base.items()}
+        n = profile.n_interactions
+        n_pos = int(np.sum(profile.pref_weights > 0)) if n else 0
+        has_pref = bool(profile.genre_prefs) or n_pos > 0
+        w = {k: max(float((st.get("weights") or {}).get(k, 0.0)), 0.0) for k in SIGNALS}
+        if n == 0:  # behavioural signals are all zero without history
+            w["collaborative"] = w["latent"] = 0.0
+        w["content"] *= min(1.0, n_pos / 3.0)
+        if not has_pref:
+            w["preference"] = 0.0
+        total = sum(w.values())
+        if total <= 0:
+            return {k: (1.0 if k == "popularity" else 0.0) for k in SIGNALS}
+        return {k: v / total for k, v in w.items()}
+
+    def _adaptive_weights(self, profile: UserProfile) -> dict[str, float]:
         cfg = self.config
         n = profile.n_interactions
         n_pos = int(np.sum(profile.pref_weights > 0)) if n else 0

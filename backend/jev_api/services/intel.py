@@ -56,6 +56,7 @@ from jev_api.models import (
     Rating,
     Recommendation,
     User,
+    run_mode,
 )
 from jev_api.services import audit
 from jev_api.services.feedback import latest_feedback
@@ -634,6 +635,7 @@ class IntelService:
             domain=domain,
             trigger=trigger,
             status="running",
+            mode=run_mode(requested),  # recorded only; replay isolation is WS4 (P2.4)
             requested_as_of=requested,
             started_at=now,
             pipeline_version=PIPELINE_VERSION if movie else str(getattr(adapter, "pipeline_version", "core")),
@@ -946,14 +948,20 @@ class IntelService:
     # ---- reading runs -------------------------------------------------------------------------------
     @staticmethod
     def latest_run(
-        db: Session, status: str | None = "succeeded", domain: str | None = DEFAULT_DOMAIN
+        db: Session,
+        status: str | None = "succeeded",
+        domain: str | None = DEFAULT_DOMAIN,
+        mode: str | None = None,
     ) -> IntelRun | None:
-        """The newest run of `domain` (None: of any domain) with `status` (None: any status)."""
+        """The newest run of `domain` (None: of any domain) with `status` (None: any status) and `mode`
+        ("live" | "replay"; None: either, the pre-Phase-2 behaviour every caller still uses)."""
         q = select(IntelRun)
         if status:
             q = q.where(IntelRun.status == status)
         if domain is not None:
             q = q.where(IntelRun.domain == domain)
+        if mode is not None:
+            q = q.where(IntelRun.mode == mode)
         return db.scalar(q.order_by(IntelRun.started_at.desc(), IntelRun.id.desc()).limit(1))
 
     @staticmethod

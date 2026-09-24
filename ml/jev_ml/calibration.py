@@ -32,6 +32,15 @@ Two one-dimensional isotonic calibrators are considered: on the hybrid ``score``
 users* (folds by user id parity) is kept, then refitted on all validation candidates. The test split
 is only ever used for the reported evaluation.
 
+Optional logistic calibrator (``method="logistic"``)
+--------------------------------------------------
+A small, explainable logistic regression pooled over all strata, on features every served item
+already carries: the hybrid score, log(rank), log1p(profile size), the item's popularity signal,
+the agreement of the active signals (share with a normalised value >= 0.5), and the interactions of
+score and log(rank) with the profile size. Features are standardised with validation statistics;
+the L2 strength is chosen by the same 2-fold user-parity cross-fit inside validation. The isotonic
+strata are always fitted too: they are the fallback for callers that pass no per-item signals.
+
 At serving time the engine evaluates the stored isotonic knots with ``numpy.interp`` (identical to
 ``IsotonicRegression.predict`` with ``out_of_bounds="clip"``), so no scikit-learn is needed and the
 cost is a few microseconds per recommendation. Ranks beyond the fitted ``k`` get no confidence
@@ -76,6 +85,19 @@ N_BINS = 10
 DEFAULT_K = 50  # served pages are 20 long and paginate; 50 covers the first pages
 STRATA: tuple[int | None, ...] = (0, 3, 10, None)  # profile truncations; None = full profile
 DEFAULT_HORIZON = 5  # label horizon: the next 5 ratings (401 of 610 users have >= 5 validation rows)
+CALIBRATION_VERSION_LOGISTIC = "cal-1.1.0"
+METHODS = ("isotonic", "logistic")
+AGREEMENT_SIGNALS = ("content", "collaborative", "latent", "popularity", "preference")
+LOGISTIC_FEATURES = (
+    "score",
+    "log_rank",
+    "log1p_profile",
+    "popularity",
+    "agreement",
+    "score_x_log1p_profile",
+    "log_rank_x_log1p_profile",
+)
+LOGISTIC_C_GRID = (0.01, 0.1, 1.0, 10.0)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -102,13 +124,75 @@ class Stratum:
         return np.interp(v, self.x, self.y)
 
 
+def signal_agreement(signals: dict[str, dict[str, float]]) -> float:
+    """Share of the active signals (weight > 0) whose normalised value is >= 0.5."""
+    active = [s for s in AGREEMENT_SIGNALS if (signals.get(s) or {}).get("weight", 0.0) > 0]
+    if not active:
+        return 0.0
+    return float(np.mean([signals[s].get("normalized", 0.0) >= 0.5 for s in active]))
+
+
+def logistic_design(
+    score: np.ndarray, rank: np.ndarray, n_profile: np.ndarray, popularity: np.ndarray, agreement: np.ndarray
+) -> np.ndarray:
+    """Rows of LOGISTIC_FEATURES (raw, before standardisation)."""
+    score = np.asarray(score, dtype=np.float64)
+    lr = np.log(np.maximum(np.asarray(rank, dtype=np.float64), 1.0))
+    lp = np.log1p(np.maximum(np.asarray(n_profile, dtype=np.float64), 0.0))
+    return np.column_stack(
+        [score, lr, lp, np.asarray(popularity, dtype=np.float64), np.asarray(agreement, np.float64), score * lp, lr * lp]
+    )
+
+
+@dataclass(frozen=True)
+class LogisticMap:
+    """Standardised logistic regression over LOGISTIC_FEATURES (numpy only at serving time)."""
+
+    mean: np.ndarray
+    scale: np.ndarray
+    coef: np.ndarray
+    intercept: float
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> LogisticMap:
+        if tuple(d["features"]) != LOGISTIC_FEATURES:
+            raise ValueError("logistic calibrator features do not match this version")
+        arrs = [np.asarray(d[k], dtype=np.float64) for k in ("mean", "scale", "coef")]
+        if any(a.shape != (len(LOGISTIC_FEATURES),) for a in arrs) or not all(np.isfinite(a).all() for a in arrs):
+            raise ValueError("invalid logistic calibrator parameters")
+        if np.any(arrs[1] <= 0) or not np.isfinite(d["intercept"]):
+            raise ValueError("invalid logistic calibrator scale/intercept")
+        return cls(arrs[0], arrs[1], arrs[2], float(d["intercept"]))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "features": list(LOGISTIC_FEATURES),
+            "mean": [float(v) for v in self.mean],
+            "scale": [float(v) for v in self.scale],
+            "coef": [float(v) for v in self.coef],
+            "intercept": float(self.intercept),
+        }
+
+    def predict_design(self, x: np.ndarray) -> np.ndarray:
+        z = ((x - self.mean) / self.scale) @ self.coef + self.intercept
+        out: np.ndarray = 1.0 / (1.0 + np.exp(-np.clip(z, -35.0, 35.0)))
+        return out
+
+    def predict_frame(self, df: pd.DataFrame) -> np.ndarray:
+        return self.predict_design(
+            logistic_design(df["score"], df["rank"], df["n_profile"], df["popularity"], df["agreement"])
+        )
+
+
 @dataclass(frozen=True)
 class Calibrator:
-    """Serving-side calibrator loaded from calibration.json (profile-size strata of isotonic maps)."""
+    """Serving-side calibrator loaded from calibration.json: profile-size strata of isotonic maps
+    and, for ``method="logistic"`` files, a logistic map used when the item's signals are given."""
 
     strata: tuple[Stratum, ...]
     max_rank: int
     version: str
+    logistic: LogisticMap | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Calibrator:
@@ -128,15 +212,35 @@ class Calibrator:
             strata.append(Stratum(st["name"], int(rng["min"]), rng["max"], m["feature"], x, y))
         if not strata:
             raise ValueError("calibration has no strata")
-        return cls(tuple(strata), int(d["k"]), str(d["calibration_version"]))
+        logistic = LogisticMap.from_dict(d["logistic"]) if d.get("logistic") else None
+        return cls(tuple(strata), int(d["k"]), str(d["calibration_version"]), logistic)
 
     def stratum_for(self, n_profile: int) -> Stratum | None:
         return next((s for s in self.strata if s.applies(n_profile)), None)
 
-    def predict(self, score: float, rank: int, n_profile: int) -> float | None:
-        """Calibrated probability, or None outside the calibrated range (rank > k, no stratum)."""
+    def predict(
+        self,
+        score: float,
+        rank: int,
+        n_profile: int,
+        signals: dict[str, dict[str, float]] | None = None,
+    ) -> float | None:
+        """Calibrated probability, or None outside the calibrated range (rank > k, no stratum).
+
+        With a logistic map and the item's ``signals`` (RankedItem.signals) the logistic model is
+        used; otherwise the isotonic stratum of the profile size (the historical behaviour)."""
         if rank < 1 or rank > self.max_rank or not np.isfinite(score):
             return None
+        if self.logistic is not None and signals is not None:
+            pop = float((signals.get("popularity") or {}).get("raw", 0.0))
+            x = logistic_design(
+                np.array([score]),
+                np.array([rank]),
+                np.array([n_profile]),
+                np.array([pop]),
+                np.array([signal_agreement(signals)]),
+            )
+            return float(self.logistic.predict_design(x)[0])
         st = self.stratum_for(n_profile)
         if st is None:
             return None
@@ -186,6 +290,8 @@ def calibration_summary(d: dict[str, Any]) -> dict[str, Any]:
         "fitted_on": d.get("fitted_on"),
         "headline": d.get("headline"),
         "strata": strata,
+        "logistic": {k: v for k, v in (d.get("logistic") or {}).items() if k in ("features", "coef", "test", "C")}
+        or None,
         "assumptions": d.get("assumptions"),
     }
 
@@ -308,13 +414,25 @@ def collect_candidates(
         int(g["user_id"].iloc[0]): set(idx.indices_of(g["movie_id"].to_numpy()).tolist())
         for _, g in rel.groupby("user_id")
     }
-    rows: list[tuple[int, int, float, int, int]] = []
+    rows: list[tuple[int, int, float, int, int, int, float, float]] = []
     for u in users:
         prof = profiles[u]
         rs = relevant.get(u, set())
         for pos, r in enumerate(ranker.rank(prof, k=k, explain=False), start=1):
-            rows.append((u, pos, float(r.score), int(r.item in rs), int(prof.n_interactions)))
-    return pd.DataFrame(rows, columns=["user_id", "rank", "score", "label", "n_profile"])
+            rows.append(
+                (
+                    u,
+                    pos,
+                    float(r.score),
+                    int(r.item in rs),
+                    int(prof.n_interactions),
+                    int(r.item),
+                    float(r.signals["popularity"]["raw"]),
+                    signal_agreement(r.signals),
+                )
+            )
+    cols = ["user_id", "rank", "score", "label", "n_profile", "item", "popularity", "agreement"]
+    return pd.DataFrame(rows, columns=cols)
 
 
 def next_ratings(target: pd.DataFrame, horizon: int) -> pd.DataFrame:
@@ -363,6 +481,39 @@ def select_feature(val: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+def _fit_logistic_design(x: np.ndarray, y: np.ndarray, c: float) -> LogisticMap:
+    from sklearn.linear_model import LogisticRegression
+
+    mean = x.mean(axis=0)
+    scale = x.std(axis=0)
+    scale = np.where(scale > 1e-12, scale, 1.0)
+    lr = LogisticRegression(C=c, max_iter=2000)
+    lr.fit((x - mean) / scale, y.astype(int))
+    return LogisticMap(mean, scale, lr.coef_.ravel().astype(np.float64), float(lr.intercept_[0]))
+
+
+def fit_logistic(val: pd.DataFrame) -> tuple[LogisticMap, dict[str, Any]]:
+    """Fit the logistic calibrator on validation candidates (all strata pooled). The L2 strength is
+    chosen by a 2-fold user-parity cross-fit (lower Brier), then refitted on all rows."""
+    x = logistic_design(val["score"], val["rank"], val["n_profile"], val["popularity"], val["agreement"])
+    y = val["label"].to_numpy(dtype=np.float64)
+    fold = (val["user_id"].to_numpy() % 2).astype(int)
+    res: dict[str, Any] = {}
+    for c in LOGISTIC_C_GRID:
+        pred = np.empty(len(y))
+        for f in (0, 1):
+            tr, te = fold != f, fold == f
+            pred[te] = _fit_logistic_design(x[tr], y[tr], c).predict_design(x[te])
+        res[str(c)] = {"brier": round(brier(pred, y), 6), "ece": round(ece(pred, y), 5)}
+    best_c = min(LOGISTIC_C_GRID, key=lambda c: (res[str(c)]["brier"], -c))
+    model = _fit_logistic_design(x, y, best_c)
+    return model, {
+        "protocol": "2-fold cross-fit within validation users (user_id parity), all strata pooled",
+        "candidates": res,
+        "chosen_C": best_c,
+    }
+
+
 # --------------------------------------------------------------------------------------------------
 # the offline job
 
@@ -393,14 +544,20 @@ def calibrate(
     k: int = DEFAULT_K,
     horizon: int = DEFAULT_HORIZON,
     strata: tuple[int | None, ...] = STRATA,
+    method: str = "isotonic",
 ) -> dict[str, Any]:
     """Pure computation of the calibration.json payload (no file IO).
+
+    ``method="logistic"`` additionally fits the pooled logistic calibrator on the same validation
+    candidates and serves it for items whose signals are known (isotonic strata stay as fallback).
 
     ``training_config`` is the model's recorded ``manifest.training_config`` (split, models,
     evaluation); ``hybrid_config`` its ``manifest.hybrid_config``. ``strata`` lists the profile
     truncations to calibrate (None = the full training profile)."""
     from jev_ml.training import build_context, fit_components
 
+    if method not in METHODS:
+        raise ValueError(f"unknown calibration method {method!r}; expected one of {METHODS}")
     t0 = time.perf_counter()
     if "split" not in training_config or "models" not in training_config:
         raise ValueError("training_config must record the split and model parameters")
@@ -424,6 +581,7 @@ def calibrate(
     test_target = next_ratings(split.test, horizon)
 
     fitted: list[dict[str, Any]] = []
+    frames: list[tuple[pd.DataFrame, pd.DataFrame]] = []
     for trunc in strata:
         name = "profile_full" if trunc is None else f"profile_{trunc}"
         val = collect_candidates(ranker_tr, split.train, val_target, ctx_tr.user_ids, k, threshold, trunc)
@@ -440,6 +598,7 @@ def calibrate(
         vm["n_users"] = int(val["user_id"].nunique())
         vm["note"] = "in-sample: the calibrator was fitted on these candidates"
         test = collect_candidates(ranker_tv, trainval, test_target, ctx_tv.user_ids, k, threshold, trunc)
+        frames.append((val, test))
         stratum = Stratum(name, 0, None, feat, np.asarray(kx), np.asarray(ky))
         tm = _evaluate(stratum, test, base_rate)
         fitted.append(
@@ -478,7 +637,20 @@ def calibrate(
     )
     for st in fitted:
         del st["_stratum"]
-    mapping_payload = [(st["name"], st["applies_to"], st["mapping"]) for st in fitted]
+    logistic_block: dict[str, Any] | None = None
+    if method == "logistic":
+        lmap, lsel = fit_logistic(pd.concat([v for v, _ in frames], ignore_index=True))
+        per_stratum = {}
+        for st, (v, te) in zip(fitted, frames, strict=True):
+            per_stratum[st["name"]] = {
+                "validation": _evaluate_logistic(lmap, v, float(st["base_rate"])),
+                "test": _evaluate_logistic(lmap, te, float(st["base_rate"])),
+            }
+        logistic_block = {**lmap.to_dict(), "C": lsel["chosen_C"], "selection": lsel, "strata": per_stratum}
+        logistic_block["test"] = per_stratum[fitted[-1]["name"]]["test"]
+    mapping_payload: list[Any] = [(st["name"], st["applies_to"], st["mapping"]) for st in fitted]
+    if logistic_block is not None:
+        mapping_payload.append(("logistic", lmap.to_dict()))
     fitted_on = {
         "split": "validation",
         "strategy": split.strategy,
@@ -503,16 +675,24 @@ def calibrate(
         "brier",
     )
     headline_keys += ("base_rate_brier", "brier_skill_vs_base_rate", "auc")
+    version_prefix = CALIBRATION_VERSION if method == "isotonic" else CALIBRATION_VERSION_LOGISTIC
+    headline_src = warm["test"] if logistic_block is None else logistic_block["test"]
     return {
-        "calibration_version": f"{CALIBRATION_VERSION}-{digest}",
+        "calibration_version": f"{version_prefix}-{digest}",
         "model_version": model_version,
         "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "target": (
             f"P(the user rates the recommended film >= {threshold:g} among their next {horizon} ratings)"
         ),
         "confidence_kind": "probability",
-        "method": "isotonic regression per profile-size stratum (feature chosen per stratum by "
-        "validation cross-fit)",
+        "method": (
+            "isotonic regression per profile-size stratum (feature chosen per stratum by validation cross-fit)"
+            if method == "isotonic"
+            else "logistic regression over score, log rank, profile size, item popularity and signal "
+            "agreement (pooled over strata, validation-fitted); isotonic strata as fallback"
+        ),
+        "method_name": method,
+        "logistic": logistic_block,
         "k": k,
         "horizon_ratings": horizon,
         "relevance_threshold": threshold,
@@ -522,7 +702,8 @@ def calibrate(
         "headline": {
             "stratum": warm["name"],
             "split": "test",
-            **{kk: warm["test"].get(kk) for kk in headline_keys},
+            "method": method,
+            **{kk: headline_src.get(kk) for kk in headline_keys},
             "cold_strata_test": {
                 st["name"]: {
                     kk: st["test"].get(kk) for kk in ("observed_rate", "mean_predicted", "ece", "brier")
@@ -558,6 +739,15 @@ def calibrate(
     }
 
 
+def _evaluate_logistic(lmap: LogisticMap, df: pd.DataFrame, base_rate: float) -> dict[str, Any]:
+    if df.empty:
+        return {"n": 0, "detail": "no evaluable users"}
+    y = df["label"].to_numpy(dtype=np.float64)
+    m = metrics(lmap.predict_frame(df), y, base_rate)
+    m["n_users"] = int(df["user_id"].nunique())
+    return m
+
+
 def _evaluate(stratum: Stratum, df: pd.DataFrame, base_rate: float) -> dict[str, Any]:
     if df.empty:
         return {"n": 0, "detail": "no evaluable users"}
@@ -575,6 +765,7 @@ def calibrate_model(
     k: int = DEFAULT_K,
     horizon: int = DEFAULT_HORIZON,
     write: bool = True,
+    method: str = "isotonic",
 ) -> dict[str, Any]:
     """Calibrate a saved model version on the processed data it was trained on; write the file."""
     model_dir = models_dir / version
@@ -597,6 +788,7 @@ def calibrate_model(
         version,
         k=k,
         horizon=horizon,
+        method=method,
     )
     out["dataset_version"] = manifest.get("dataset_version")
     if write:

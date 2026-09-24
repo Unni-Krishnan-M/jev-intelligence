@@ -371,3 +371,21 @@ movie recommender as the first domain adapter and a generic structured-dataset a
 | Warning quality on the generic domain | PARTIAL | precision 0.36 and recall 0.52; warnings lag turning points |
 
 **Known limitations:** see README → Limitations.
+
+---
+
+# Phase 2: production-grade decision intelligence (started 2026-09-24)
+Audit: [PHASE2_GAP_MATRIX.md](PHASE2_GAP_MATRIX.md) · [PHASE2_ARCHITECTURE_AUDIT.md](PHASE2_ARCHITECTURE_AUDIT.md).
+Baseline: pytest 277 passed / 2 skipped · Vitest 95 · ruff, format, mypy, tsc and lint clean.
+
+| Workstream | Owner area | Status |
+|---|---|---|
+| Enabler (module split, router registry, migration 0006 + stubs 0007–0010, CI guards) | backend shared files | running |
+| WS3 Recommender quality (global temporal split, leakage tests, cold start, calibration, benchmark) | ml models/evaluation | running |
+| WS4b Second domain (CTA ridership, daily/weekly series, seasonal forecasts) | core forecast/series, domains/generic | running |
+| WS4a Decision-intelligence quality + replay/live separation (P0) | core engines, domains/movie, services/intel | queued (needs 0006) |
+| WS1 Events (append-only, idempotency, replay) | new events modules, write paths | queued (needs enabler) |
+| WS2 Feedback → retraining → gated promotion/rollback | training/registry/governance | queued (needs enabler) |
+| WS5 Online experimentation + persisted strategy decisions | serving, experiments | queued (needs enabler) |
+| Frontend productization | frontend | after backend |
+| Security, evaluation review, QA/release, docs, final review | — | after implementation |

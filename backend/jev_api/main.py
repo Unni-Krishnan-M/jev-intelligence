@@ -22,7 +22,7 @@ from jev_api.db import SessionLocal
 from jev_api.deps import client_address
 from jev_api.logging_setup import configure_logging, request_id_var
 from jev_api.metrics import metrics
-from jev_api.routers import admin, auth, health, intel, me, movies, recommendations, users
+from jev_api.routers import ALL_ROUTERS
 from jev_api.services.intel import IntelService
 from jev_api.services.ml import EngineHolder
 from jev_api.services.sync import ensure_admin, sync_all
@@ -174,16 +174,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             status_code=422,
         )
 
-    for r in (
-        health.router,
-        auth.router,
-        users.router,
-        me.router,
-        movies.router,
-        recommendations.router,
-        admin.router,
-        intel.router,
-    ):
+    # the router registry (routers/__init__.py): new routers are added there, never here
+    for r in ALL_ROUTERS:
         app.include_router(r)
     return app
 

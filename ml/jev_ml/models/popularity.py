@@ -1,4 +1,9 @@
-"""Non-personalized popularity baseline + trending and Bayesian-average quality signals."""
+"""Non-personalized popularity baseline + trending and Bayesian-average quality signals.
+
+Ranking score: ``log1p(likes) + reach_weight * log1p(users)``. With ``score_half_life_days`` set,
+both counts are exponentially time-decayed relative to the newest training interaction, which
+turns the baseline into a "recently popular" ranking (a strong baseline under a global time split).
+The defaults (reach 0.25, no decay) are the historical formula, so saved models are unchanged."""
 
 from __future__ import annotations
 
@@ -14,9 +19,17 @@ from jev_ml.signals import LIKE_THRESHOLD, UserProfile
 class PopularityRecommender(Recommender):
     name = "popularity"
 
-    def __init__(self, trending_half_life_days: float = 365.0, bayes_prior_votes: float = 10.0) -> None:
+    def __init__(
+        self,
+        trending_half_life_days: float = 365.0,
+        bayes_prior_votes: float = 10.0,
+        reach_weight: float = 0.25,
+        score_half_life_days: float | None = None,
+    ) -> None:
         self.trending_half_life_days = trending_half_life_days
         self.bayes_prior_votes = bayes_prior_votes
+        self.reach_weight = float(reach_weight)
+        self.score_half_life_days = None if score_half_life_days is None else float(score_half_life_days)
         self.user_counts = np.zeros(0)
         self.like_counts = np.zeros(0)
         self.trending = np.zeros(0)
@@ -47,7 +60,12 @@ class PopularityRecommender(Recommender):
         self.bayes_rating = (sums + m * global_mean) / (self.user_counts + m)
 
         # ranking score: log-scaled count of *liked* interactions, blended with raw reach
-        self.popularity = np.log1p(self.like_counts) + 0.25 * np.log1p(self.user_counts)
+        likes, reach = self.like_counts, self.user_counts
+        if self.score_half_life_days:
+            d = np.power(0.5, age_days / self.score_half_life_days)
+            likes = np.bincount(items, weights=(ratings >= LIKE_THRESHOLD) * d, minlength=n)
+            reach = np.bincount(items, weights=d, minlength=n)
+        self.popularity = np.log1p(likes) + self.reach_weight * np.log1p(reach)
         return self
 
     def score(self, profile: UserProfile) -> np.ndarray:
@@ -58,8 +76,14 @@ class PopularityRecommender(Recommender):
         return self.user_counts / max(self.n_users, 1)
 
     def params(self) -> dict[str, Any]:
-        return {"trending_half_life_days": self.trending_half_life_days,
-                "bayes_prior_votes": self.bayes_prior_votes}
+        out: dict[str, Any] = {"trending_half_life_days": self.trending_half_life_days,
+                               "bayes_prior_votes": self.bayes_prior_votes}
+        # only non-default scoring params are recorded, so existing manifests stay byte-identical
+        if self.reach_weight != 0.25:
+            out["reach_weight"] = self.reach_weight
+        if self.score_half_life_days is not None:
+            out["score_half_life_days"] = self.score_half_life_days
+        return out
 
     def save(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
@@ -72,7 +96,8 @@ class PopularityRecommender(Recommender):
     @classmethod
     def load(cls, path: Path) -> PopularityRecommender:
         meta = cls._read_json(path / "popularity.json")
-        obj = cls(meta["trending_half_life_days"], meta["bayes_prior_votes"])
+        obj = cls(meta["trending_half_life_days"], meta["bayes_prior_votes"],
+                  meta.get("reach_weight", 0.25), meta.get("score_half_life_days"))
         arrs = np.load(path / "popularity.npz")
         for k in ("user_counts", "like_counts", "trending", "bayes_rating", "popularity"):
             setattr(obj, k, arrs[k])

@@ -64,6 +64,8 @@ known-first-party = ["jev_ml", "jev_api"]
 "tests/**" = ["S", "N802"]
 "scripts/**" = ["S603", "S607"]
 "backend/jev_api/migrations/**" = ["E501"]
+# pydantic models on the shared ORM base (schemas/base.py): ruff cannot see that it is a BaseModel
+"backend/jev_api/schemas/**" = ["RUF012"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
