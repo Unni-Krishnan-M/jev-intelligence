@@ -5,6 +5,15 @@ Intentional differences, filtered before comparing (docs/platform.md, implementa
 ``decision_batches``), so ``summary.counts.decisions``/``decisions_abstained`` grow by their count;
 and each batch's ``state_hash`` changes, because the hashed input snapshot now carries the additive
 fields of trends/anomalies/forecasts (the fingerprint of different bytes, not a behaviour change).
+
+Goldens regenerated on 2026-09-24 for two intentional, measured core-1.1.0 policy changes
+(docs/INTELLIGENCE_ENGINE_AUDIT.md), and nothing else (verified: with both switched off the new code
+reproduces the old goldens exactly):
+- the change-point AR(1) null takes phi from the series' history before the trend window
+  (``change_point_history_*``): false alarms on the synthetic AR(1) study 9.9 % -> 1.3 % at a nominal
+  1 %, so some weak change points (and their signals) are no longer reported;
+- a warning raised from a risk carries the risk's ``confidence_kind`` (``evidence``/``rule``/``margin``)
+  instead of a blanket ``margin``.
 """
 
 from __future__ import annotations

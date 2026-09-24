@@ -9,7 +9,20 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from jev_api.routers import admin, auth, health, intel, me, movies, recommendations, users
+from jev_api.routers import (
+    admin,
+    auth,
+    events,
+    experiments,
+    governance,
+    health,
+    intel,
+    me,
+    movies,
+    recommendations,
+    security,
+    users,
+)
 
 ALL_ROUTERS: tuple[APIRouter, ...] = (
     health.router,
@@ -21,6 +34,10 @@ ALL_ROUTERS: tuple[APIRouter, ...] = (
     admin.router,
     intel.router,
     # Phase 2: WS1 events, WS2 governance, WS5 experiments_online, security: one line each, below
+    experiments.router,
+    events.router,
+    governance.router,
+    security.router,
 )
 
 __all__ = ["ALL_ROUTERS"]

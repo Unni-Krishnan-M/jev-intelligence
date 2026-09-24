@@ -1,0 +1,134 @@
+# Chicago Transit Authority daily ridership: the second reference domain of the generic JEV adapter.
+# Data: uv run python scripts/download_domain_data.py cta-ridership
+#       -> data/raw/domains/cta-ridership/ (gitignored by data/raw/*; never committed)
+# Case study, evaluation and every number quoted below: docs/SECOND_DOMAIN_CASE_STUDY.md
+key: cta-ridership
+name: CTA ridership (Chicago)
+description: >-
+  Daily boardings on Chicago Transit Authority buses and trains (system totals since 2001) and daily
+  entries at the five busiest 'L' stations of 2019, from the City of Chicago Data Portal. Strong
+  weekly cycle (weekday / Saturday / Sunday-holiday service). Adverse direction: down (ridership
+  falling).
+frequency: day
+# the portal publishes whole months some weeks after they end; each published day is final
+grid_end: last_observation
+source:
+  name: chicago-data-portal
+  kind: dataset
+  file: data/raw/domains/cta-ridership/cta_ridership_long.csv
+  provenance: data/raw/domains/cta-ridership/provenance.json
+  license: >-
+    City of Chicago Data Portal, Terms of Use (https://www.chicago.gov/city/en/narr/foia/data_disclaimer.html):
+    data provided "as is" by the City of Chicago / Chicago Transit Authority for any lawful use, no
+    warranty; the City may modify or discontinue it. Dataset licence field: "See Terms of Use".
+    Attribution: Chicago Transit Authority.
+  url: https://data.cityofchicago.org/Transportation/CTA-Ridership-Daily-Boarding-Totals/6iiy-9s97
+  expected_update: monthly
+  # the portal is refreshed about monthly, ~6 weeks after a month ends: at most ~75 days behind
+  max_lag_days: 75
+  # Replays take the operator's view: a day's boardings (farebox / Ventra taps) are known the next
+  # morning. The public portal lags ~45 days; docs/SECOND_DOMAIN_CASE_STUDY.md also reports the
+  # COVID replay under that public lag.
+  availability_lag_days: 1
+columns:
+  timestamp: date
+  entity: entity
+  value: value
+  entity_type: entity_type
+  event_type: entity_type         # routes rows to the specs below (system / mode / station)
+value_range: [0, 5000000]
+# The rule-based calendar (six holidays -> Sunday service) is what forecasts use for future days;
+# this check compares it with CTA's own day_type column on every observed day.
+calendar_check:
+  column: day_type
+  calendar: weekday_us_holidays
+  labels: {weekday: W, saturday: A, sunday_holiday: U}
+series:
+  # Daily boardings (entries for stations). Domain-aware choices, each justified:
+  # - is_count: modelled on log scale, so the weekly cycle is multiplicative (a Sunday is ~40 % of a
+  #   weekday whether ridership is 1.6M or 0.3M).
+  # - anomaly_basis seasonal + anomaly_calendar: a day is compared with the previous 24 days of
+  #   the same class (Mondays with Mondays, Sundays with Sundays, special days with special
+  #   days), so Sundays and holidays are not anomalies. The plain generic config (trailing 24 days) flags nearly every weekend.
+  # - trend: false: a Mann-Kendall test on raw daily values mostly sees the weekly cycle; the trend
+  #   is tested on the seasonally neutral ratio series below instead.
+  - &daily
+    id: "boardings:{group}"
+    metric: level
+    is_count: true
+    name: boardings
+    group_by: entity
+    entity_type: system
+    event_type: system
+    unit: "boardings/day"
+    adverse_direction: down
+    anomaly_basis: seasonal
+    seasonal_period: 7
+    calendar: weekday_us_holidays
+    # Anomaly baseline only: MLK Day, Presidents' Day, the day after Thanksgiving, 24-31 December
+    # and the six holidays form their own class (compared only with each other). Chosen on the
+    # 2010-2014 tuning replays, where those days were most active anomalies (FPR 0.26 -> 0.15);
+    # the forecasts keep weekday_us_holidays (the evaluated calendar).
+    anomaly_calendar: weekday_us_special_days
+    forecast: true
+    forecast_models: [naive, seasonal_naive, seasonal_naive_yearly, calendar_naive, holt_winters,
+                      holt_winters_calendar]
+    trend: false
+    volume_guard: false
+    count_noun: boardings
+  # The last 28 days against the same, weekday-aligned 28 days one year earlier (364 days): weekly
+  # and annual seasonality cancel, so a falling ratio is a genuine decline. Its relative change is
+  # what the adverse-trend risk measures (a 25 % fall of the ratio against the prior window = full
+  # impact, the core default).
+  - &ratio
+    id: "vs_last_year:{group}"
+    metric: level
+    is_count: false
+    rolling: 28
+    ratio_lag: 364
+    name: ridership vs last year
+    group_by: entity
+    entity_type: system
+    event_type: system
+    unit: "ratio (28-day total / same 28 days a year earlier)"
+    adverse_direction: down
+    scan_anomalies: false
+    forecast: false
+    trend: true
+    volume_guard: false
+    trend_unit: "ratio/day"
+  # the same two specs for the bus and rail modes and for the five stations (YAML merge keys)
+  - {<<: *daily, entity_type: mode, event_type: mode}
+  - {<<: *ratio, entity_type: mode, event_type: mode}
+  - {<<: *daily, entity_type: station, event_type: station, unit: "entries/day", count_noun: entries}
+  - {<<: *ratio, entity_type: station, event_type: station}
+thresholds:
+  # windows are in periods, i.e. days here
+  series_output_months: 400       # charts: ~13 months of daily points
+  trend_window_months: 91         # one quarter of the year-over-year ratio
+  trend_min_points: 28
+  change_point_min_segment: 7     # a mean shift needs at least a week on each side
+  anomaly_baseline_months: 24     # 24 earlier days of the same class (about 6 months of Mondays)
+  anomaly_min_baseline_months: 12
+  anomaly_scan_months: 14         # new events: the last two weeks
+  warning_anomaly_recent_months: 7  # an anomaly warns while it is within the last week
+  forecast_horizon: 14            # two whole weeks, so a horizon mean is weekday-balanced
+  forecast_backtest_origins: 56   # eight weeks of daily origins for selection and intervals
+  forecast_history_months: 364    # one year of training history per origin
+  forecast_min_history: 56
+impact_weights: {}                # none declared: impact is measured from the relative change
+download:
+  kind: socrata
+  page_size: 50000
+  terms_of_use: https://www.chicago.gov/city/en/narr/foia/data_disclaimer.html
+  daily:
+    url: https://data.cityofchicago.org/resource/6iiy-9s97.csv
+    order: service_date
+    date: service_date
+    day_type: day_type
+    values: {bus: bus, rail: rail_boardings, total: total_rides}
+    entity_type: {total: system, default: mode}
+  stations:
+    url: https://data.cityofchicago.org/resource/5neh-572f.csv
+    top: 5
+    rank_year: 2019               # busiest stations before COVID (chosen before any evaluation)

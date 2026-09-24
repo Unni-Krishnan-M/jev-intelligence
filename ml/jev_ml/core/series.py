@@ -62,7 +62,7 @@ METRICS = ("count", "share", "mean", "nunique", "level", "sum")
 FREQS = {"M": "M", "month": "M", "W": "W", "week": "W", "D": "D", "day": "D"}
 FREQ_NAMES = {"M": "month", "W": "week", "D": "day"}
 ANOMALY_BASES = ("level", "change", "seasonal")
-CALENDARS = ("weekday", "weekday_us_holidays")
+CALENDARS = ("weekday", "weekday_us_holidays", "weekday_us_special_days")
 
 
 @dataclass(frozen=True)
@@ -104,6 +104,7 @@ class SeriesSpec:
     forecast_models: tuple[str, ...] | None = None  # candidate models (None = the v1.2 trio)
     rolling: int | None = None  # trailing mean over this many periods
     ratio_lag: int | None = None  # divide by the (rolled) value this many periods earlier
+    anomaly_calendar: str | None = None  # season classes of the seasonal anomaly baseline (default: calendar)
 
     def __post_init__(self) -> None:
         if self.metric not in METRICS:
@@ -114,20 +115,25 @@ class SeriesSpec:
             raise ValueError(f"series spec {self.id}: anomaly_basis must be one of {ANOMALY_BASES}")
         if self.group_by is not None and "{group}" not in self.id:
             raise ValueError(f"series spec {self.id}: a grouped spec needs {{group}} in its id")
-        if self.calendar is not None and self.calendar not in CALENDARS:
-            raise ValueError(f"series spec {self.id}: calendar must be one of {CALENDARS}")
+        for cal in (self.calendar, self.anomaly_calendar):
+            if cal is not None and cal not in CALENDARS:
+                raise ValueError(f"series spec {self.id}: calendar must be one of {CALENDARS}")
         for name in ("seasonal_period", "rolling", "ratio_lag"):
             v = getattr(self, name)
             if v is not None and (not isinstance(v, int) or isinstance(v, bool) or v < 1):
                 raise ValueError(f"series spec {self.id}: {name} must be a positive integer")
         if self.anomaly_basis == "seasonal" and self.seasonal_period is None and self.calendar is None:
-            raise ValueError(f"series spec {self.id}: anomaly_basis seasonal needs seasonal_period or calendar")
+            raise ValueError(
+                f"series spec {self.id}: anomaly_basis seasonal needs seasonal_period or calendar"
+            )
         if self.forecast_models is not None:
             from jev_ml.core.forecast import ALL_MODELS, SEASONAL_MODELS
 
             bad = [m for m in self.forecast_models if m not in ALL_MODELS]
             if bad or not self.forecast_models:
-                raise ValueError(f"series spec {self.id}: unknown forecast models {bad} (known: {ALL_MODELS})")
+                raise ValueError(
+                    f"series spec {self.id}: unknown forecast models {bad} (known: {ALL_MODELS})"
+                )
             if "naive" not in self.forecast_models:
                 raise ValueError(f"series spec {self.id}: forecast_models must include the naive benchmark")
             if any(m in SEASONAL_MODELS for m in self.forecast_models) and self.seasonal_period is None:
@@ -171,6 +177,7 @@ class Series:
     seasonal_period: int | None = None
     calendar: str | None = None
     forecast_models: tuple[str, ...] | None = None
+    anomaly_calendar: str | None = None
 
     @property
     def is_count(self) -> bool:
@@ -189,7 +196,13 @@ class Series:
 
     def classes(self, periods: pd.PeriodIndex | None = None) -> np.ndarray:
         """Season class of each period (``season_classes``) of the grid, or of ``periods``."""
-        return season_classes(self.months if periods is None else periods, self.seasonal_period, self.calendar)
+        return season_classes(
+            self.months if periods is None else periods, self.seasonal_period, self.calendar
+        )
+
+    def anomaly_classes(self, periods: pd.PeriodIndex) -> np.ndarray:
+        """Season classes of the seasonal anomaly baseline (``anomaly_calendar``, else ``calendar``)."""
+        return season_classes(periods, self.seasonal_period, self.anomaly_calendar or self.calendar)
 
     @property
     def periods(self) -> pd.PeriodIndex:
@@ -265,9 +278,30 @@ def us_transit_holidays(start: pd.Timestamp, end: pd.Timestamp) -> pd.DatetimeIn
     return out
 
 
+def us_special_days(start: pd.Timestamp, end: pd.Timestamp) -> pd.DatetimeIndex:
+    """Days with atypical ridership outside the six service holidays: the six holidays themselves,
+    Martin Luther King Jr. Day, Presidents' Day, the day after Thanksgiving and 24-31 December
+    (schools and many offices closed)."""
+    from pandas.tseries.holiday import USMartinLutherKingJr, USPresidentsDay, USThanksgivingDay
+
+    s0, e0 = start - pd.Timedelta(days=7), end + pd.Timedelta(days=7)
+    rng = pd.date_range(s0.normalize(), e0.normalize(), freq="D")
+    parts = [
+        us_transit_holidays(start, end),
+        pd.DatetimeIndex(USMartinLutherKingJr.dates(s0, e0)),
+        pd.DatetimeIndex(USPresidentsDay.dates(s0, e0)),
+        pd.DatetimeIndex(USThanksgivingDay.dates(s0, e0)) + pd.Timedelta(days=1),
+        rng[(rng.month == 12) & (rng.day >= 24)],
+    ]
+    days = pd.DatetimeIndex(np.concatenate([p.to_numpy() for p in parts]))
+    return days.unique().sort_values()
+
+
 def season_classes(periods: pd.PeriodIndex, seasonal_period: int | None, calendar: str | None) -> np.ndarray:
     """Season class per period: days -> day of week 0..6 (Monday = 0; with ``weekday_us_holidays``
-    a holiday gets the Sunday class 6), weeks -> week of year 0..51 (ISO week 53 joins week 52),
+    a holiday gets the Sunday class 6; with ``weekday_us_special_days`` every ``us_special_days``
+    day gets its own class 7, so special days are only compared with special days), weeks -> week
+    of year 0..51 (ISO week 53 joins week 52),
     months -> month 0..11. Any other ``seasonal_period`` p -> period ordinal mod p."""
     if not len(periods):
         return np.zeros(0, dtype=np.int64)
@@ -278,6 +312,8 @@ def season_classes(periods: pd.PeriodIndex, seasonal_period: int | None, calenda
         if calendar == "weekday_us_holidays":
             hol = us_transit_holidays(start.min(), start.max())
             cls = np.where(start.normalize().isin(hol), 6, cls)
+        elif calendar == "weekday_us_special_days":
+            cls = np.where(start.normalize().isin(us_special_days(start.min(), start.max())), 7, cls)
         return cls
     if fs.startswith("W") and seasonal_period in (None, 52):
         wk = np.asarray(periods.end_time.isocalendar().week, dtype=np.int64)
@@ -465,6 +501,7 @@ def build_series(
             seasonal_period=sp.seasonal_period,
             calendar=sp.calendar,
             forecast_models=tuple(sp.forecast_models) if sp.forecast_models is not None else None,
+            anomaly_calendar=sp.anomaly_calendar,
         )
 
     for block in _blocks(specs):

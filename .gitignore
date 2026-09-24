@@ -14,12 +14,15 @@ data/raw/*
 !data/raw/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
+data/snapshots/
 models/*
 !models/.gitkeep
 experiments/*
 !experiments/.gitkeep
 !experiments/README.md
 *.db
+*.db.bak-*
+*.db.rebuild-*
 *.sqlite
 
 # Node / Next.js

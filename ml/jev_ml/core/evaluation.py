@@ -11,7 +11,8 @@
   for it. A domain-specific ``outcome`` function says whether the unit's adverse condition
   materialised in the following ``h`` periods (``confirmed``), or ``None`` when that is not
   observable (the horizon runs past the data). From the observable units: precision = TP / (TP + FP),
-  false-positive rate = FP / (FP + TN), recall = TP / (TP + FN), base rate = (TP + FN) / n.
+  false-positive rate = FP / (FP + TN), recall = TP / (TP + FN), base rate = (TP + FN) / n, and the
+  base-rate context of the precision: lift = precision / base rate, flag rate = (TP + FP) / n.
   Outcomes are scored against the data as it is *now* (the latest vintage), which is also what the
   replays see: revisions after first publication are not modelled.
 * **Series outcome** (``series_adverse_move``, used by the generic adapter and the movie genre-share
@@ -19,6 +20,12 @@
   2 sigma sqrt(k) from its value in the replay's last complete period, sigma = 1.4826 x MAD of the 24
   period-over-period changes up to that period (floored at the data resolution): an adverse move
   beyond random-walk noise.
+* **Lift uncertainty** (``lift_uncertainty``, on the per-unit rows ``warning_replay`` keeps with
+  ``keep_rows=True``): units of one replay month share the month's data, so they are not independent.
+  The lift CI is a percentile bootstrap that resamples whole replay months (clusters) with
+  replacement; the year-stratified lift divides TP by the TP expected if, within each calendar year,
+  the same number of units were warned at random (it removes lift that only reflects years with more
+  warnings and more events).
 * **Decision consistency** (``decision_consistency``): the flip rate of ``early_warning_level``
   between consecutive monthly replays, per situation (a situation without a decision in a replay
   counts as NO_ACTION), and the rate of flips across the WARNING boundary (warned <-> not warned).
@@ -197,6 +204,10 @@ def confusion(units: list[dict[str, Any]]) -> dict[str, Any]:
         "false_positive_rate": fnum(fp / (fp + tn), 4) if fp + tn else None,
         "recall": fnum(tp / (tp + fn), 4) if tp + fn else None,
         "base_rate": fnum((tp + fn) / len(obs), 4) if obs else None,
+        # base-rate context (core-1.1.0): lift = precision / base rate (1.0 = no better than flagging
+        # units at random at the same rate), flag_rate = share of observable units warned
+        "lift": fnum((tp / (tp + fp)) / ((tp + fn) / len(obs)), 4) if tp + fp and tp + fn else None,
+        "flag_rate": fnum((tp + fp) / len(obs), 4) if obs else None,
     }
 
 
@@ -205,9 +216,11 @@ def warning_replay(
     units: Callable[[dict[str, Any]], list[dict[str, Any]]],
     outcome: Callable[[dict[str, Any], dict[str, Any]], tuple[bool | None, str]],
     excluded: dict[str, str] | None = None,
+    keep_rows: bool = False,
 ) -> dict[str, Any]:
     """Score warnings per kind. ``units(replay)`` -> [{kind, unit, warned, ...}];
-    ``outcome(replay, unit)`` -> (confirmed | None, detail)."""
+    ``outcome(replay, unit)`` -> (confirmed | None, detail). ``keep_rows`` stores every scored unit
+    (as_of, kind, unit, warned, confirmed) and the month-cluster lift CI, for later re-analysis."""
     rows = []
     for r in replays:
         for u in units(r):
@@ -216,7 +229,7 @@ def warning_replay(
     kinds = sorted({u["kind"] for u in rows})
     by_kind = {k: confusion([u for u in rows if u["kind"] == k]) for k in kinds}
     warned = [u for u in rows if u["warned"]]
-    return {
+    out: dict[str, Any] = {
         "per_kind": by_kind,
         "overall": confusion(rows),
         "excluded_kinds": excluded or {},
@@ -224,6 +237,58 @@ def warning_replay(
             {k: u[k] for k in ("as_of", "kind", "unit", "confirmed", "detail")}
             for u in (warned[:6] + [u for u in rows if not u["warned"] and u["confirmed"]][:3])
         ],
+    }
+    if keep_rows:
+        compact = [{k: u[k] for k in ("as_of", "kind", "unit", "warned", "confirmed")} for u in rows]
+        out["lift_uncertainty"] = lift_uncertainty(compact)
+        out["rows"] = compact
+    return out
+
+
+def lift_uncertainty(
+    rows: list[dict[str, Any]], b: int = 2000, alpha: float = 0.05, seed: int = 0
+) -> dict[str, Any]:
+    """Month-cluster bootstrap CI of the warning lift and the year-stratified lift (module docstring).
+
+    ``rows``: per-unit {as_of, warned, confirmed}; units whose outcome is unobservable are dropped."""
+    obs = [r for r in rows if r["confirmed"] is not None]
+    n = len(obs)
+    warned = np.array([bool(r["warned"]) for r in obs], dtype=bool)
+    conf = np.array([bool(r["confirmed"]) for r in obs], dtype=bool)
+    tp, w, p = int((warned & conf).sum()), int(warned.sum()), int(conf.sum())
+    lift = (tp / w) / (p / n) if w and p else None
+    expected = 0.0
+    years: dict[str, list[int]] = {}
+    months: dict[str, list[int]] = {}
+    for i, r in enumerate(obs):
+        years.setdefault(str(r["as_of"])[:4], []).append(i)
+        months.setdefault(str(r["as_of"]), []).append(i)
+    for idx in years.values():
+        expected += warned[idx].sum() * conf[idx].sum() / len(idx)
+    lo = hi = None
+    if lift is not None and len(months) > 1:
+        rng = np.random.default_rng(seed)
+        groups = [np.asarray(v) for v in months.values()]
+        lifts = []
+        for _ in range(b):
+            ii = np.concatenate([groups[j] for j in rng.integers(0, len(groups), len(groups))])
+            ww, cc = warned[ii], conf[ii]
+            if ww.sum() and cc.sum():
+                lifts.append(((ww & cc).sum() / ww.sum()) / (cc.sum() / len(ii)))
+        if lifts:
+            lo, hi = (float(x) for x in np.percentile(lifts, [100 * alpha / 2, 100 * (1 - alpha / 2)]))
+    return {
+        "observable": n,
+        "warned": w,
+        "tp": tp,
+        "positives": p,
+        "lift": fnum(lift, 4) if lift is not None else None,
+        "lift_ci": [fnum(lo, 4), fnum(hi, 4)] if lo is not None and hi is not None else None,
+        "ci_level": 1 - alpha,
+        "ci_method": f"percentile bootstrap over replay months (clusters), B={b}, seed={seed}",
+        "months": len(months),
+        "expected_tp_year_stratified": fnum(expected, 2),
+        "lift_year_stratified": fnum(tp / expected, 4) if expected else None,
     }
 
 

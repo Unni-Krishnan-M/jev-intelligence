@@ -37,6 +37,7 @@ class Recommendation(Base):
         Index("ix_rec_user_created", "user_id", "created_at"),
         Index("ix_rec_request", "request_id"),
         Index("ix_rec_user_decision", "user_id", "decision_id"),
+        Index("ix_rec_experiment", "experiment_id", "variant"),
         CheckConstraint(nullable_in("confidence_kind", REC_CONFIDENCE_KINDS), name="ck_rec_confidence_kind"),
     )
 
@@ -57,6 +58,10 @@ class Recommendation(Base):
     # v1.2: the recommendation_strategy decision the list was served under (docs/platform.md, section 4)
     decision_id: Mapped[str | None] = mapped_column(String(40))
     strategy: Mapped[str | None] = mapped_column(String(24))
+    # Phase 2 (0009): the online experiment and variant the list was served under (NULL outside one).
+    # No foreign key: a lineage column, kept when an experiment is gone
+    experiment_id: Mapped[int | None] = mapped_column(Integer)
+    variant: Mapped[str | None] = mapped_column(String(40))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     movie: Mapped[Movie] = relationship(lazy="joined")

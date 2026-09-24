@@ -6,7 +6,9 @@ fills the ``app_*`` frames from its database.
 
 Leakage guard: every MovieLens row with ``timestamp > as_of`` is dropped here, before any other
 stage sees the data, and the number dropped is reported. App (live) events are filtered by the wall
-clock ``now`` instead, because they are monitored in real time.
+clock ``now`` in a live run (they are monitored in real time) and by ``as_of`` in a replay (an
+explicit as_of, Phase 2 P2.4): a replay never mixes later app events into an earlier analysis, and
+its live-window stages (live feedback, app freshness) run on the replay clock.
 """
 
 from __future__ import annotations
@@ -89,6 +91,9 @@ class Prepared:
     diagnostics: list[dict[str, Any]]
     excluded_after_as_of: int
     inputs: PipelineInputs | None = None  # the raw inputs (model manifest, per-user NDCG, ...)
+    # P2.4: True for an explicit as_of; app (live) events are then cut at, and windowed on, as_of
+    replay: bool = False
+    event_clock_ts: float | None = None  # the clock of the app-event stages (None: now_ts)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -105,11 +110,17 @@ def load_default_inputs(
     processed_dir: Path | None = None,
     models_dir: Path | None = None,
     experiments_dir: Path | None = None,
+    model_version: str | None = None,
 ) -> PipelineInputs:
     """Read the real processed data, the active model manifest and its experiment run.
 
     Paths default to the project layout in ``jev_ml.paths`` (overridable with JEV_* env vars).
     Missing model/experiment files give ``None`` fields (the pipeline then skips those stages).
+
+    Replay determinism: without ``model_version`` the manifest is the one *active at call time*
+    (registry.json), so a promotion or rollback between two replays of the same ``as_of`` changes
+    the model-based stages. The version used is recorded in ``run.model_version`` of every result
+    (and ``intel_runs.model_version``); pass ``model_version`` to pin a replay to that manifest.
     """
     from jev_ml import paths
 
@@ -122,8 +133,10 @@ def load_default_inputs(
     meta = load_dataset_meta(meta_path) if meta_path.exists() else None
 
     manifest = experiment = per_user = None
+    if model_version is not None and Path(model_version).name != model_version:
+        raise ValueError(f"model_version must be a plain version name, got {model_version!r}")
     reg = _read_json(models_dir / "registry.json") or {}
-    active = reg.get("active")
+    active = model_version or reg.get("active")
     if active:
         manifest = _read_json(models_dir / active / "manifest.json")
     if manifest and manifest.get("experiment_run"):
@@ -385,13 +398,19 @@ def prepare(inputs: PipelineInputs, cfg: IntelConfig) -> Prepared:
     if not len(ratings):
         raise ValueError(f"no MovieLens ratings at or before as_of={iso(as_of)}")
 
+    # Phase 2 (P2.4): a replay (explicit as_of) sees app events only up to as_of, and every live-window
+    # stage (live feedback, app freshness) runs on that clock; a live run keeps the wall clock
+    replay = inputs.as_of is not None
+    clock_ts = min(as_of_ts, now_ts) if replay else now_ts
     app_r_raw = inputs.app_ratings
     if app_r_raw is not None and len(app_r_raw):
-        app_r, _ = _validate_ratings(app_r_raw, "app_ratings", movie_ids, cfg, checks, now_ts, "", now_ts)
+        app_r, _ = _validate_ratings(
+            app_r_raw, "app_ratings", movie_ids, cfg, checks, clock_ts, "as_of" if replay else "", now_ts
+        )
     else:
         app_r = _empty(APP_RATING_COLUMNS)
-    app_f = _validate_events(inputs.app_feedback, "app_feedback", APP_FEEDBACK_COLUMNS, checks, now_ts)
-    app_s = _validate_events(inputs.app_served, "app_served", APP_SERVED_COLUMNS, checks, now_ts)
+    app_f = _validate_events(inputs.app_feedback, "app_feedback", APP_FEEDBACK_COLUMNS, checks, clock_ts)
+    app_s = _validate_events(inputs.app_served, "app_served", APP_SERVED_COLUMNS, checks, clock_ts)
 
     meta = inputs.dataset_meta or {}
     data_version = inputs.data_version or meta.get("dataset_version") or "unknown"
@@ -433,7 +452,7 @@ def prepare(inputs: PipelineInputs, cfg: IntelConfig) -> Prepared:
     app_ts = pd.concat([app_r["timestamp"], app_f["timestamp"], app_s["timestamp"]], ignore_index=True)
     if len(app_ts):
         last = float(app_ts.max())
-        fresh = (now_ts - last) / 86400.0 <= cfg.live_fresh_days
+        fresh = (clock_ts - last) / 86400.0 <= cfg.live_fresh_days
         sources.append(
             _source_row(
                 "app",
@@ -441,7 +460,7 @@ def prepare(inputs: PipelineInputs, cfg: IntelConfig) -> Prepared:
                 len(app_ts),
                 float(app_ts.min()),
                 last,
-                now_ts,
+                clock_ts,
                 None,
                 "daily",
                 bool(fresh),
@@ -510,6 +529,8 @@ def prepare(inputs: PipelineInputs, cfg: IntelConfig) -> Prepared:
         diagnostics=diagnostics,
         excluded_after_as_of=n_after,
         inputs=inputs,
+        replay=replay,
+        event_clock_ts=clock_ts,
     )
 
 

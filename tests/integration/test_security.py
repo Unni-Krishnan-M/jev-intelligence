@@ -17,6 +17,7 @@ from fastapi.routing import APIRoute
 from test_intel_api import synthetic_frames
 
 from jev_api.deps import require_admin
+from jev_api.routers.events import require_observation_writer
 from jev_ml.intel import PipelineInputs
 
 HUGE_INT = "9" * 30  # beyond SQLite/PostgreSQL BIGINT
@@ -97,7 +98,9 @@ def test_every_intel_and_admin_route_requires_admin(client):
     """Fails when a future /intel/* or /admin/* route forgets the AdminUser dependency."""
     routes = _admin_routes(client.app)
     assert len(routes) >= 25  # the enumeration really sees the intel router
-    missing = [f"{sorted(r.methods)} {r.path}" for r in routes if require_admin not in _dependency_calls(r)]
+    # the observation writer admits an admin or a scoped service token (writer_for calls require_admin)
+    guards = {require_admin, require_observation_writer}
+    missing = [f"{sorted(r.methods)} {r.path}" for r in routes if not guards & _dependency_calls(r)]
     assert not missing, f"routes without the admin guard: {missing}"
 
 

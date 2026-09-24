@@ -40,7 +40,9 @@ def health_ml(request: Request, response: Response) -> dict[str, Any]:
     engine = holder.engine
     if engine is None:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return {"status": "unavailable", "error": holder.last_error}
+        # public endpoint: a fixed message only. The load exception (it can contain file paths) stays in
+        # the log and in the admin-only GET /admin/metrics (engine.last_error).
+        return {"status": "unavailable", "error": "no recommendation model is loaded"}
     # live self-check: a cold-start request must produce finite, valid recommendations
     recs = engine.recommend(engine.build_profile([]), k=5)
     valid = bool(recs) and all(

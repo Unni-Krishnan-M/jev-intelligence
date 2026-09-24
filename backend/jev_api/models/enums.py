@@ -21,6 +21,23 @@ REC_CONFIDENCE_KINDS = ("probability",)  # recommendations.confidence_kind (null
 ME_FEEDBACK_TARGETS = ("strategy", "recommendation")
 ME_FEEDBACK_VERDICTS = ("accepted", "rejected")
 
+# --- online experiments (WS5, migration 0009, docs/EXPERIMENTATION.md) --------------------------------
+AB_SURFACES = ("recommendations",)  # ab_experiments.surface
+AB_EXPERIMENT_STATUSES = ("draft", "running", "paused", "stopped", "concluded")
+AB_ACTIVE_STATUSES = ("running", "paused")  # at most one active experiment per surface
+# primary metrics an experiment can be concluded on (all "higher is better")
+AB_PRIMARY_METRICS = (
+    "interaction_rate",
+    "positive_rate",
+    "rating_rate",
+    "feedback_rate",
+    "ndcg_at_10",
+    "diversity",
+    "novelty",
+)
+AB_OUTCOME_KINDS = ("click", "like", "dislike", "not_interested", "rating", "watch", "favorite")
+AB_OUTCOME_SOURCES = ("live", "replay")  # replay = offline logged-data replay, never live traffic
+
 # --- intelligence layer (docs/intelligence.md, section 5) -------------------------------------------
 INTEL_RUN_TRIGGERS = ("startup", "manual", "script", "schedule")
 INTEL_RUN_STATUSES = ("running", "succeeded", "failed")
@@ -40,6 +57,16 @@ FEEDBACK_VERDICTS = {
     "action": ("useful", "not_useful"),
     "prediction": ("correct", "incorrect"),
 }
+
+# --- events and ingestion (WS1, migration 0007, docs/STREAMING_ARCHITECTURE.md) ----------------------
+# events.event_type: member interactions (movie domain) and generic-domain observations
+EVENT_TYPES = ("rating", "rating_removed", "watch", "favorite", "unfavorite", "rec_feedback", "observation")
+
+# --- retraining and model governance (WS2, migration 0008, docs/RETRAINING_AND_MODEL_GOVERNANCE.md) ----
+MODEL_STATES = ("candidate", "active", "retired", "rejected")  # model_governance.state (= jev_ml.registry)
+TRAINING_JOB_KINDS = ("retrain", "evaluate")  # training_jobs.kind
+TRAINING_JOB_STATUSES = ("queued", "running", "succeeded", "failed")  # training_jobs.status
+TRAINING_JOB_TRIGGERS = ("manual", "schedule", "decision", "cli")  # training_jobs.trigger
 
 # --- audit log (ck_audit_action) ----------------------------------------------------------------------
 AUDIT_ACTIONS_V12 = (
@@ -113,6 +140,20 @@ CHECK_ENUMS: dict[str, tuple[str, str, tuple[str, ...], bool]] = {
     "ck_intel_risk_level": ("intel_risks", "level", INTEL_SEVERITIES, True),
     "ck_intel_evidence_owner": ("intel_evidence", "owner_type", EVIDENCE_OWNERS, False),
     "ck_audit_action": ("audit_logs", "action", AUDIT_ACTIONS, False),
+    # WS5 online experiments (0009)
+    "ck_ab_experiment_surface": ("ab_experiments", "surface", AB_SURFACES, False),
+    "ck_ab_experiment_status": ("ab_experiments", "status", AB_EXPERIMENT_STATUSES, False),
+    "ck_ab_experiment_primary_metric": ("ab_experiments", "primary_metric", AB_PRIMARY_METRICS, False),
+    "ck_ab_outcome_kind": ("ab_outcomes", "kind", AB_OUTCOME_KINDS, False),
+    "ck_ab_outcome_source": ("ab_outcomes", "source", AB_OUTCOME_SOURCES, False),
+    "ck_member_decision_confidence_kind": ("member_decisions", "confidence_kind", CONFIDENCE_KINDS, False),
+    # WS1 events (0007)
+    "ck_event_type": ("events", "event_type", EVENT_TYPES, False),
+    # WS2 governance (0008)
+    "ck_model_governance_state": ("model_governance", "state", MODEL_STATES, False),
+    "ck_training_job_kind": ("training_jobs", "kind", TRAINING_JOB_KINDS, False),
+    "ck_training_job_status": ("training_jobs", "status", TRAINING_JOB_STATUSES, False),
+    "ck_training_job_trigger": ("training_jobs", "trigger", TRAINING_JOB_TRIGGERS, False),
 }
 # CHECK constraints that are not a single IN list (range checks, the verdict-per-target rule)
 NON_ENUM_CHECKS = frozenset({"ck_rating_range", "ck_intel_warning_occurrences", "ck_intel_feedback_verdict"})

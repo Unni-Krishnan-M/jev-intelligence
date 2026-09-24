@@ -8,9 +8,23 @@
   stages (signals, risks, decisions) require q <= trend_fdr in addition to ``direction``.
 * Change point: single mean shift. Statistic = max over admissible splits (>= min_segment on each
   side) of the pooled two-sample t statistic; p-value from the same max statistic under a seeded
-  null (so the search over splits is accounted for): permutations when the segment residuals are
-  not autocorrelated, else simulated AR(1) series with the estimated lag-1 coefficient. Reported
-  when p < change_point_alpha.
+  null (so the search over splits is accounted for): permutations when the series is not
+  autocorrelated, else simulated AR(1) series. Reported when p < change_point_alpha.
+  Since core-1.1.0 the AR(1) coefficient comes from the series' own history *before* the window
+  (``change_point_history_min`` to ``change_point_history_max`` periods, mean-centred, Kendall
+  bias-corrected) when that history exists: 24 window points cannot estimate phi (the old in-window
+  estimate gave 8-10 % false alarms at a nominal 1 % for phi = 0.56, 3 % with the history estimate;
+  docs/INTELLIGENCE_ENGINE_AUDIT.md). Series without enough history keep the in-window estimate
+  (``phi_source`` says which).
+
+Recent move (core-1.1.0, ``recent_move``): how far the latest value has retreated against the
+trend, in units of sigma sqrt(r) (r = ``trend_reversal_periods``), sigma = 1.4826 x MAD of the
+period-over-period changes in the trend window (floored at the data resolution), the same noise scale
+the warning evaluation uses for outcomes. Basis ``drawdown`` (default): latest value minus the
+window's maximum (up trend) or minimum (down trend); basis ``recent``: the change over the last r
+periods. ``reversing`` is true when that retreat exceeds ``trend_reversal_z`` units: the window trend
+is still significant, but the series has already turned (a peak or trough). The early-warning
+decision and the adverse-trend risk treat a reversing trend as context, not a live adverse condition.
 
 Additive platform fields (derived from the values above): ``magnitude`` = recent_mean - prior_mean,
 ``velocity`` = slope per period, ``baseline`` = prior_mean, ``supporting_observations`` = n_points,
@@ -80,13 +94,41 @@ def _ar1_phi(x: np.ndarray, k: int) -> float:
     return float(np.clip(phi + (1 + 3 * phi) / len(x), 0.0, 0.95))
 
 
-def change_point(x: np.ndarray, min_segment: int, permutations: int, seed: int) -> dict[str, Any] | None:
-    """Single mean-shift test. Returns {index, before_mean, after_mean, stat, p_value, null, phi}.
+def history_phi(history: np.ndarray | None, min_points: int) -> float | None:
+    """Lag-1 autocorrelation of the pre-window history (mean-centred, Kendall bias-corrected,
+    clipped to [0, 0.95]); None when fewer than ``min_points`` finite values. A regime change inside
+    the history inflates the estimate, which makes the null wider (conservative), never narrower."""
+    if history is None:
+        return None
+    h = np.asarray(history, dtype=float)
+    h = h[np.isfinite(h)]
+    if len(h) < max(min_points, 3):
+        return None
+    d = h - h.mean()
+    den = float(np.dot(d, d))
+    if den <= 0:
+        return 0.0
+    phi = float(np.dot(d[:-1], d[1:]) / den)
+    return float(np.clip(phi + (1 + 3 * phi) / len(h), 0.0, 0.95))
 
-    Null distribution of the max-t statistic: a seeded permutation test when the residuals show no
-    lag-1 autocorrelation (phi <= 0.1); otherwise simulated stationary AR(1) series with the
-    estimated phi, because permutations assume exchangeable months and are badly anti-conservative
-    for autocorrelated monthly data (the statistic is scale/location invariant, so only phi matters).
+
+def change_point(
+    x: np.ndarray,
+    min_segment: int,
+    permutations: int,
+    seed: int,
+    history: np.ndarray | None = None,
+    history_min: int = 24,
+) -> dict[str, Any] | None:
+    """Single mean-shift test. Returns {index, before_mean, after_mean, stat, p_value, null, phi,
+    phi_source}.
+
+    Null distribution of the max-t statistic: a seeded permutation test when phi <= 0.1; otherwise
+    simulated stationary AR(1) series with that phi, because permutations assume exchangeable
+    months and are badly anti-conservative for autocorrelated monthly data (the statistic is
+    scale/location invariant, so only phi matters). phi comes from ``history`` (the periods before
+    the tested window) when it has >= ``history_min`` finite values (``phi_source: "history"``),
+    else from the window's residuals around the two segment means (``"window"``).
     """
     n = len(x)
     if n < 2 * min_segment + 1 or np.allclose(x, x[0]):
@@ -94,7 +136,8 @@ def change_point(x: np.ndarray, min_segment: int, permutations: int, seed: int) 
     rng = np.random.default_rng(seed)
     obs, k = _max_shift_stat(x[None, :], min_segment)
     kk = int(k[0])
-    phi = _ar1_phi(x, kk)
+    hphi = history_phi(history, history_min)
+    phi = hphi if hphi is not None else _ar1_phi(x, kk)
     if phi <= 0.1:
         sims = rng.permuted(np.tile(x, (permutations, 1)), axis=1)
         null_kind = "permutation"
@@ -115,6 +158,7 @@ def change_point(x: np.ndarray, min_segment: int, permutations: int, seed: int) 
         "p_value": p,
         "null": null_kind,
         "phi": phi,
+        "phi_source": "history" if hphi is not None else "window",
     }
 
 
@@ -129,6 +173,41 @@ def bh_qvalues(p: np.ndarray) -> np.ndarray:
     out = np.empty(n)
     out[order] = np.minimum(q, 1.0)
     return out
+
+
+def recent_move(
+    values: np.ndarray, window_values: np.ndarray, direction: str, cfg: CoreConfig, resolution: float | None
+) -> dict[str, Any] | None:
+    """The reversal test of the module docstring; None when disabled or there is too little data."""
+    r = cfg.trend_reversal_periods
+    if r <= 0:
+        return None
+    v = values[np.isfinite(values)]
+    d = np.diff(window_values[np.isfinite(window_values)])
+    if len(v) < r + 1 or len(d) < 6:
+        return None
+    sigma = max(1.4826 * float(np.median(np.abs(d - np.median(d)))), float(resolution or 0.0), 1e-12)
+    change = float(v[-1] - v[-(r + 1)])
+    z = change / (sigma * np.sqrt(r))
+    if cfg.trend_reversal_basis == "drawdown":  # distance from the window's extreme in the trend direction
+        w = window_values[np.isfinite(window_values)]
+        ext = float(w.max()) if direction == "up" else float(w.min())
+        change = float(v[-1] - ext)
+        z = change / (sigma * np.sqrt(r))
+    against = (direction == "up" and z < 0) or (direction == "down" and z > 0)
+    return {
+        "periods": r,
+        "change": fnum(change),
+        "sigma": fnum(sigma),
+        "z": fnum(z, 4),
+        "threshold_z": cfg.trend_reversal_z,
+        "reversing": bool(direction != "flat" and against and abs(z) > cfg.trend_reversal_z),
+    }
+
+
+def is_reversing(trend: dict[str, Any]) -> bool:
+    rm = trend.get("recent_move")
+    return bool(rm and rm.get("reversing"))
 
 
 def trend_of(s: Series, cfg: CoreConfig, as_of_key: str, window: int | None = None) -> dict[str, Any] | None:
@@ -158,8 +237,15 @@ def trend_of(s: Series, cfg: CoreConfig, as_of_key: str, window: int | None = No
     prior_vals = values[-2 * w : -w] if len(values) > w else np.array([])
     prior_ok = prior_vals[np.isfinite(prior_vals)]
     prior_mean = float(prior_ok.mean()) if len(prior_ok) >= max(3, cfg.trend_min_points // 2) else None
+    hmax = cfg.change_point_history_max
+    hist = values[: len(values) - len(wv)][-hmax:] if hmax else None
     cp = change_point(
-        x, cfg.change_point_min_segment, cfg.change_point_permutations, sub_seed(cfg.seed, "cp:" + s.id)
+        x,
+        cfg.change_point_min_segment,
+        cfg.change_point_permutations,
+        sub_seed(cfg.seed, "cp:" + s.id),
+        history=hist,
+        history_min=cfg.change_point_history_min,
     )
     cp_out = None
     if cp is not None and cp["p_value"] < cfg.change_point_alpha:
@@ -171,6 +257,7 @@ def trend_of(s: Series, cfg: CoreConfig, as_of_key: str, window: int | None = No
             "p_value": fnum(cp["p_value"]),
             "null": cp["null"],
             "phi": fnum(cp["phi"], 3),
+            "phi_source": cp["phi_source"],
         }
     return {
         "id": stable_id("trend", "trend", s.id, as_of_key),
@@ -200,6 +287,7 @@ def trend_of(s: Series, cfg: CoreConfig, as_of_key: str, window: int | None = No
         "confidence_kind": "evidence",
         "entity_id": s.entity_id or f"{s.entity_type}:{s.entity}",
         "adverse_direction": s.adverse_direction,
+        "recent_move": recent_move(values, wv, direction, cfg, s.resolution),
     }
 
 

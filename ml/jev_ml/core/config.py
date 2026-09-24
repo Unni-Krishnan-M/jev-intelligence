@@ -12,9 +12,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-CORE_VERSION = "core-1.0.0"
+CORE_VERSION = "core-1.1.0"
 FORECAST_VERSION = "fc-1.0.0"
-EWL_POLICY_VERSION = "ewl-1.0.0"
+EWL_POLICY_VERSION = "ewl-1.1.0"
 
 SEVERITIES = ("low", "medium", "high", "critical")
 EWL_LEVELS = ("NO_ACTION", "MONITOR", "WARNING", "URGENT_ACTION")
@@ -47,6 +47,20 @@ class CoreConfig:
     change_point_min_segment: int = 4  # periods on each side of a mean shift
     change_point_permutations: int = 499
     change_point_alpha: float = 0.01  # stricter than trend_alpha: monthly series are autocorrelated
+    # core-1.1.0: the AR(1) null's phi is estimated on up to 60 periods *before* the trend window
+    # (needs >= 24); 0 = the pre-1.1 in-window estimate (anti-conservative: 8-10 % false alarms at
+    # a nominal 1 % for phi 0.56; about 2 % with the history estimate, INTELLIGENCE_ENGINE_AUDIT.md)
+    change_point_history_min: int = 24
+    change_point_history_max: int = 60
+    # core-1.1.0 recovery-aware trends: a significant window trend whose latest value has already
+    # retreated from the window's extreme (in the trend's direction) by > 2 sigma sqrt(3) (sigma: MAD
+    # of period changes, the warning outcome's noise scale) is "reversing": context for the
+    # early-warning decision, no adverse-trend risk. Basis "drawdown" (distance from the extreme) was
+    # chosen over "recent" (change over the last 3 periods) on the 1990-94 / 1999-2003 tuning
+    # windows only (docs/INTELLIGENCE_ENGINE_AUDIT.md). trend_reversal_periods 0 = off (core-1.0.0)
+    trend_reversal_periods: int = 3
+    trend_reversal_z: float = 2.0
+    trend_reversal_basis: str = "drawdown"
 
     # ---- series anomalies (robust z, Iglewicz & Hoaglin 1993) -------------------------------
     anomaly_baseline_months: int = 24
@@ -88,7 +102,7 @@ class CoreConfig:
     # declared impact weight per entity (0..1), from the domain config; labelled "declared"
     impact_weights: dict[str, float] = field(default_factory=dict)
 
-    # ---- early-warning decision (ewl-1.0.0, contract section 4) -------------------------------
+    # ---- early-warning decision (ewl-1.1.0, contract section 4) -------------------------------
     # level thresholds on the aggregated point score
     ewl_level_points: dict[str, float] = field(
         default_factory=lambda: {"MONITOR": 1.0, "WARNING": 3.0, "URGENT_ACTION": 5.0}

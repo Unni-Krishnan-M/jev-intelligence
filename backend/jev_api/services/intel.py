@@ -1,6 +1,6 @@
 """Intelligence layer service: gather inputs, run the pipeline, persist runs/decisions/warnings.
 
-The pipeline itself (ml/jev_ml/intel) is pure. This module owns everything stateful around it:
+The pipeline itself (ml/jev_ml/core + domains) is pure. This module owns everything stateful around it:
 - inputs: processed MovieLens files and the model manifest (load_default_inputs) plus the app DB
   (ratings, recommendation feedback, served recommendations, dismissed warning keys),
 - one run at a time (a process-wide lock; a second trigger gets IntelBusyError -> HTTP 409),
@@ -53,25 +53,25 @@ from jev_api.models import (
     IntelTrendRow,
     IntelWarning,
     IntelWarningEvent,
-    Rating,
-    Recommendation,
     User,
     run_mode,
 )
 from jev_api.services import audit
-from jev_api.services.feedback import latest_feedback
+from jev_api.services import events as event_log
 from jev_api.services.ml import EngineHolder
 from jev_ml.core import run_domain
+from jev_ml.core.config import severity_rank
+from jev_ml.core.lineage import decision_lineage, warning_lineage
+from jev_ml.core.pipeline import PipelineResult
 from jev_ml.core.quality import to_epoch
 from jev_ml.core.scenario import run_scenario as core_run_scenario
 from jev_ml.domains import available as registry_available
 from jev_ml.domains import get_adapter
 from jev_ml.domains.movie import INFO as MOVIE_INFO
+from jev_ml.domains.movie import PIPELINE_VERSION, IntelConfig, PipelineInputs, load_default_inputs
 from jev_ml.domains.movie import available as movie_available
-from jev_ml.intel import PIPELINE_VERSION, IntelConfig, PipelineInputs, load_default_inputs, run_pipeline
-from jev_ml.intel.config import severity_rank
-from jev_ml.intel.pipeline import PipelineResult
-from jev_ml.intel.scenario import run_scenario
+from jev_ml.domains.movie.scenario import run_movie_pipeline as run_pipeline
+from jev_ml.domains.movie.scenario import run_scenario
 from jev_ml.paths import ROOT
 
 log = logging.getLogger(__name__)
@@ -174,6 +174,8 @@ def run_out(run: IntelRun) -> dict[str, Any]:
         "summary": run.summary,
         "stage_ms": run.stage_ms or {},
         "error": run.error,
+        "event_watermark": run.event_watermark,  # WS1: max event id / ingested_at the run read
+        "mode": run.mode,  # P2.4: live | replay
     }
 
 
@@ -455,6 +457,9 @@ class IntelService:
         self._latest_obj: dict[str, tuple[str, PipelineResult]] = {}
         # replaced in tests with a synthetic dataset; takes the requested as_of (or None)
         self.inputs_factory: Callable[[datetime | None], PipelineInputs] = self._file_inputs
+        # the wall clock of live runs (a live run is "as of now"); tests replace it to run a live run on
+        # a historical synthetic dataset
+        self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
         # where configs/domains/*.yaml (and the relative dataset paths in them) live; tests point it
         # at a temporary directory
         self.domains_root: Path = ROOT
@@ -530,21 +535,44 @@ class IntelService:
                 out[key] = w.dismissed_severity or w.severity
         return out
 
-    def gather_inputs(self, db: Session, as_of: datetime | None, now: datetime) -> PipelineInputs:
+    def gather_inputs(
+        self, db: Session, as_of: datetime | None, now: datetime, knowledge_time: datetime | None = None
+    ) -> PipelineInputs:
+        return self.gather_movie_inputs(db, as_of, now, knowledge_time)[0]
+
+    def gather_movie_inputs(
+        self, db: Session, as_of: datetime | None, now: datetime, knowledge_time: datetime | None = None
+    ) -> tuple[PipelineInputs, dict[str, Any]]:
+        """Movie inputs plus the app's events read bitemporally (WS1, docs/STREAMING_ARCHITECTURE.md):
+        an event counts when event_time <= as_of AND ingested_at <= knowledge_time. Live: both are now.
+        Replay: knowledge_time defaults to as_of, so late-arriving events never change a replay.
+        Returns the inputs and the events watermark the run records."""
         inputs = self.inputs_factory(as_of)
         inputs.as_of = as_of
         inputs.now = now
-        ratings = db.execute(select(Rating.user_id, Rating.movie_id, Rating.rating, Rating.updated_at)).all()
-        inputs.app_ratings = pd.DataFrame(ratings, columns=["user_id", "movie_id", "rating", "timestamp"])
-        # one verdict (and one click) per member per movie: repeats cannot fake or bury a spike
-        latest = latest_feedback()
-        feedback = db.execute(select(latest.c.feedback, latest.c.created_at)).all()
-        inputs.app_feedback = pd.DataFrame(feedback, columns=["feedback", "timestamp"])
-        served = db.execute(select(Recommendation.movie_id, Recommendation.created_at)).all()
-        inputs.app_served = pd.DataFrame(served, columns=["movie_id", "timestamp"])
+        # ratings and feedback are folded from the log (one verdict and one click per member per movie:
+        # repeats cannot fake or bury a spike); served recommendations are cut at as_of in a replay
+        ratings, feedback, served, watermark = event_log.app_frames(db, as_of, now, knowledge_time)
+        inputs.app_ratings = ratings
+        inputs.app_feedback = feedback
+        inputs.app_served = served
         inputs.suppressed_keys = self.suppressed_keys(db, now, DEFAULT_DOMAIN)
         metrics.set("intel_warnings", "suppressed_keys", len(inputs.suppressed_keys))
-        return inputs
+        return inputs, watermark
+
+    def gather_generic_adapter(
+        self,
+        db: Session,
+        domain: str,
+        as_of: datetime | None,
+        now: datetime,
+        knowledge_time: datetime | None = None,
+    ) -> tuple[Any, dict[str, Any]]:
+        """The domain's adapter with the observations pushed through POST /intel/domains/{key}/observations
+        merged in (same bitemporal cut as gather_movie_inputs), plus the events watermark."""
+        base = self.adapter(domain)
+        observations, watermark = event_log.observation_frame(db, domain, as_of, now, knowledge_time)
+        return event_log.adapter_with_observations(base, observations, watermark["max_event_id"]), watermark
 
     @staticmethod
     def check_as_of(inputs: PipelineInputs, as_of: datetime | None, now: datetime) -> None:
@@ -591,38 +619,55 @@ class IntelService:
         as_of: str | datetime | None = None,
         user: User | None = None,
         domain: str = DEFAULT_DOMAIN,
+        knowledge_time: str | datetime | None = None,
     ) -> IntelRun:
         """Run the pipeline of `domain` synchronously and persist it. Raises IntelBusyError /
         IntelInputError / UnknownDomainError / DomainUnavailableError only; every other failure is
-        recorded on the returned (failed) run."""
+        recorded on the returned (failed) run.
+
+        ``knowledge_time`` (replays only): read the events ingested by then (WS1 bitemporal cut);
+        default = as_of for a replay. A live run always knows everything ingested up to now."""
         requested = parse_as_of(as_of)
+        known = parse_as_of(knowledge_time)
+        if known is not None:
+            if requested is None:
+                raise IntelInputError("knowledge_time needs an as_of (a live run knows everything up to now)")
+            if known > self.clock():
+                raise IntelInputError("knowledge_time is in the future")
         self.require_available(domain)
         if not self._lock.acquire(blocking=False):
             raise IntelBusyError("an intelligence run is already in progress")
         metrics.set("intel_pipeline", "in_progress", True)
         try:
             with SessionLocal() as db:
-                return self._run_locked(db, trigger, requested, user, domain)
+                return self._run_locked(db, trigger, requested, user, domain, known)
         finally:
             metrics.set("intel_pipeline", "in_progress", False)
             self._lock.release()
 
     def _run_locked(
-        self, db: Session, trigger: str, requested: datetime | None, user: User | None, domain: str
+        self,
+        db: Session,
+        trigger: str,
+        requested: datetime | None,
+        user: User | None,
+        domain: str,
+        knowledge_time: datetime | None = None,
     ) -> IntelRun:
-        now = datetime.now(UTC)
+        now = self.clock()
         t0 = time.perf_counter()
         movie = domain == DEFAULT_DOMAIN
         inputs: PipelineInputs | None = None
         adapter: Any = None
+        watermark: dict[str, Any] | None = None  # the events the run reads (WS1 lineage)
         suppressed: dict[str, str] = {}
         error: str | None = None
         try:
             if movie:
-                inputs = self.gather_inputs(db, requested, now)
+                inputs, watermark = self.gather_movie_inputs(db, requested, now, knowledge_time)
                 self.check_as_of(inputs, requested, now)
             else:
-                adapter = self.adapter(domain)
+                adapter, watermark = self.gather_generic_adapter(db, domain, requested, now, knowledge_time)
                 self.check_generic_as_of(adapter, requested, now)
                 suppressed = self.suppressed_keys(db, now, domain)
         except IntelInputError:
@@ -630,17 +675,25 @@ class IntelService:
         except Exception as exc:
             log.exception("intelligence inputs failed to load", extra={"extra_fields": {"domain": domain}})
             error = safe_error(exc, "loading inputs failed")
+        mode = run_mode(requested)
+        if mode == "replay":
+            # P2.4: operator suppression is live state; a replay reproduces the analysis as of its date
+            # without it (and so gives the same decisions whatever operators dismissed since)
+            suppressed = {}
+            if inputs is not None:
+                inputs.suppressed_keys = {}
         run = IntelRun(
             run_id=str(uuid.uuid4()),
             domain=domain,
             trigger=trigger,
             status="running",
-            mode=run_mode(requested),  # recorded only; replay isolation is WS4 (P2.4)
+            mode=mode,  # P2.4: a replay never touches live warnings and is never the default "latest"
             requested_as_of=requested,
             started_at=now,
             pipeline_version=PIPELINE_VERSION if movie else str(getattr(adapter, "pipeline_version", "core")),
             stage_ms={},
             created_by_id=user.id if user else None,
+            event_watermark=watermark,
         )
         load_ms = round(1000 * (time.perf_counter() - t0), 2)
         metrics.inc("intel_pipeline", f"runs_{trigger}")
@@ -804,7 +857,10 @@ class IntelService:
             if rows:
                 db.execute(insert(model), rows)
             persisted[model.__tablename__] = len(rows)
-        self._upsert_warnings(db, run, data.get("warnings", []), now)
+        if run.mode == "live":
+            self._upsert_warnings(db, run, data.get("warnings", []), now)
+            persisted["warnings_auto_resolved"] = self._auto_resolve(db, run, data.get("warnings", []), now)
+        # a replay's warnings stay in its result (GET /intel/runs/{id}/warnings): never live state
         return persisted
 
     # ---- warning lifecycle ------------------------------------------------------------------------
@@ -901,6 +957,87 @@ class IntelService:
             )
             metrics.inc("intel_warnings", "reopened" if prev is not None else "created")
 
+    def _auto_resolve(
+        self, db: Session, run: IntelRun, candidates: list[dict[str, Any]], now: datetime
+    ) -> int:
+        """Stale-warning auto-resolution (P2.4): an open warning of this domain whose key was absent from
+        the last ``intel_auto_resolve_runs`` consecutive *live* runs (this one included) moves to
+        resolved, with a system warning event (run id, count) and an audit ``warning.auto_resolve`` row.
+        Only severities up to ``intel_auto_resolve_max_severity`` resolve on their own; a more severe
+        warning waits for an operator. Replays never count (they never reach this method)."""
+        k = self.settings.intel_auto_resolve_runs
+        if k <= 0:
+            return 0
+        present = {str(c["key"])[:200] for c in candidates}
+        cap = severity_rank(self.settings.intel_auto_resolve_max_severity)
+        stale = [
+            w
+            for w in db.scalars(
+                select(IntelWarning).where(
+                    IntelWarning.domain == run.domain, IntelWarning.status.in_(WARNING_OPEN_STATUSES)
+                )
+            )
+            if w.key not in present and severity_rank(w.severity) <= cap
+        ]
+        if not stale:
+            return 0
+        db.flush()  # this run is part of the count
+        n = 0
+        for w in stale:
+            seen = db.execute(
+                select(IntelRun.started_at, IntelRun.id).where(IntelRun.run_id == w.last_seen_run_id)
+            ).first()
+            q = select(func.count(IntelRun.id)).where(
+                IntelRun.domain == run.domain,
+                IntelRun.mode == "live",
+                (IntelRun.status == "succeeded") | (IntelRun.id == run.id),
+            )
+            if seen is not None:  # runs after the last sighting, in (started_at, id) order
+                q = q.where(
+                    (IntelRun.started_at > seen[0])
+                    | ((IntelRun.started_at == seen[0]) & (IntelRun.id > seen[1]))
+                )
+            absent = int(db.scalar(q) or 0)
+            if absent < k:
+                continue
+            note = (
+                f"auto-resolved: key absent from {absent} consecutive live runs (threshold {k}); "
+                f"last seen in run {str(w.last_seen_run_id or '?')[:8]}"
+            )
+            db.add(
+                IntelWarningEvent(
+                    warning_id=w.id,
+                    from_status=w.status,
+                    to_status="resolved",
+                    note=note,
+                    actor="system",
+                    run_id=run.run_id,
+                    at=now,
+                )
+            )
+            audit.record(
+                db,
+                "warning.auto_resolve",
+                None,
+                "intel_warning",
+                w.id,
+                {
+                    "domain": w.domain,
+                    "key": w.key,
+                    "from": w.status,
+                    "severity": w.severity,
+                    "absent_live_runs": absent,
+                    "threshold": k,
+                    "run_id": run.run_id,
+                    "last_seen_run_id": w.last_seen_run_id,
+                },
+            )
+            w.status = "resolved"
+            w.closed_at = now
+            n += 1
+            metrics.inc("intel_warnings", "auto_resolved")
+        return n
+
     def update_warning(
         self, db: Session, w: IntelWarning, status: str, note: str | None, user: User
     ) -> IntelWarning:
@@ -951,10 +1088,10 @@ class IntelService:
         db: Session,
         status: str | None = "succeeded",
         domain: str | None = DEFAULT_DOMAIN,
-        mode: str | None = None,
+        mode: str | None = "live",
     ) -> IntelRun | None:
         """The newest run of `domain` (None: of any domain) with `status` (None: any status) and `mode`
-        ("live" | "replay"; None: either, the pre-Phase-2 behaviour every caller still uses)."""
+        ("live" by default, P2.4: every default read means the latest live run; "replay"; None: either)."""
         q = select(IntelRun)
         if status:
             q = q.where(IntelRun.status == status)
@@ -978,6 +1115,12 @@ class IntelService:
         self._remember(run.run_id, data)
         return data
 
+    def result_for_id(self, run_id: str) -> dict[str, Any]:
+        """The stored result of run ``run_id`` ({} when unknown); scripts and tests."""
+        with SessionLocal() as db:
+            run = db.scalar(select(IntelRun).where(IntelRun.run_id == run_id))
+            return self.result_for(db, run) if run is not None else {}
+
     def _remember(
         self,
         run_id: str,
@@ -993,11 +1136,80 @@ class IntelService:
             if obj is not None:
                 self._latest_obj[domain] = (run_id, obj)
 
+    # ---- lineage (P2.4) -------------------------------------------------------------------------------
+    @staticmethod
+    def run_lineage_node(run: IntelRun, data: dict[str, Any]) -> dict[str, Any]:
+        """The run node of a lineage graph: mode, versions, config hash, input fingerprint, watermark."""
+        info = data.get("run") or {}
+        return {
+            "id": f"run:{run.run_id}",
+            "type": "run",
+            "run_id": run.run_id,
+            "domain": run.domain,
+            "mode": run.mode,
+            "trigger": run.trigger,
+            "as_of": iso(run.as_of),
+            "started_at": iso(run.started_at),
+            "pipeline_version": run.pipeline_version,
+            "core_version": info.get("core_version"),
+            "data_version": run.data_version,
+            "model_version": run.model_version,
+            "config_hash": info.get("config_hash"),
+            "input_fingerprint": info.get("input_fingerprint"),
+            # WS1: the events the run read (null when the run predates the event log)
+            "event_watermark": getattr(run, "event_watermark", None),
+        }
+
+    def _with_run(self, graph: dict[str, Any], run: IntelRun, data: dict[str, Any]) -> dict[str, Any]:
+        node = self.run_lineage_node(run, data)
+        graph["run"] = node
+        graph["nodes"] = [node, *graph["nodes"]]
+        graph["edges"] = [
+            *graph["edges"],
+            *({"from": f"source:{s}", "to": node["id"], "relation": "read_by"} for s in graph["sources"]),
+        ]
+        graph["event_watermark"] = node["event_watermark"]
+        return graph
+
+    def decision_lineage(self, db: Session, d: IntelDecision) -> dict[str, Any] | None:
+        """decision -> evidence -> run objects -> series -> sources -> run (with its events watermark)."""
+        run = db.scalar(select(IntelRun).where(IntelRun.run_id == d.run_id))
+        if run is None:
+            return None
+        data = self.result_for(db, run)
+        graph = decision_lineage(data, d.decision_id)
+        if graph is None:
+            return None
+        graph["root"]["db_id"] = d.id
+        return self._with_run(graph, run, data)
+
+    def warning_lineage(
+        self, db: Session, w: IntelWarning, run_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """The warning's lineage in the run that last saw it (or ``run_id``), with its decision row."""
+        rid = run_id or w.last_seen_run_id
+        run = db.scalar(select(IntelRun).where(IntelRun.run_id == rid, IntelRun.domain == w.domain))
+        if run is None:
+            return None
+        data = self.result_for(db, run)
+        graph = warning_lineage(data, w.key)
+        if graph is None:
+            return None
+        graph["root"]["db_id"] = w.id
+        graph["root"]["status"] = w.status
+        dec = db.scalar(
+            select(IntelDecision.id).where(
+                IntelDecision.run_id == run.run_id, IntelDecision.decision_id == (w.decision_id or "")
+            )
+        )
+        graph["root"]["decision_db_id"] = dec
+        return self._with_run(graph, run, data)
+
     # ---- scenarios ----------------------------------------------------------------------------------
     def scenario(self, db: Session, spec: dict[str, Any], domain: str = DEFAULT_DOMAIN) -> dict[str, Any]:
         """run_scenario on the domain's latest run (its fitted models when still in memory) or, with
         spec.as_of, on freshly prepared inputs at that date. ValueError -> 422 in the router."""
-        now = datetime.now(UTC)
+        now = self.clock()
         as_of = parse_as_of(spec.pop("as_of", None))
         latest = self.latest_run(db, domain=domain)
         if as_of is None and latest is not None:

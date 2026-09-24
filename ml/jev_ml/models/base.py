@@ -103,8 +103,9 @@ def topk_indices(scores: np.ndarray, k: int, mask: np.ndarray | None = None) -> 
     return cand[order][:k].astype(np.int64)
 
 
-def sparse_topk_rows(sim_block: np.ndarray, k: int, row_offset: int, exclude_self: bool = True
-                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def sparse_topk_rows(
+    sim_block: np.ndarray, k: int, row_offset: int, exclude_self: bool = True
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Keep the k largest positive entries per row of a dense block → COO triplets."""
     rows, cols, vals = [], [], []
     n_rows, n_cols = sim_block.shape

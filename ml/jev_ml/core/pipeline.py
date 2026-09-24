@@ -23,7 +23,7 @@ from jev_ml.core import risk as rk
 from jev_ml.core.actions import build_actions
 from jev_ml.core.adapter import CoreContext, DomainAdapter
 from jev_ml.core.anomalies import scan_all_series
-from jev_ml.core.common import clean, iso
+from jev_ml.core.common import clean, iso, short_hash
 from jev_ml.core.config import CORE_VERSION, EWL_LEVELS, CoreConfig, severity_rank
 from jev_ml.core.early_warning import KEY as EWL_KEY
 from jev_ml.core.early_warning import build_early_warning, build_situations
@@ -251,8 +251,11 @@ def run_domain(
             "last_complete_month": last_complete,
             "domain": adapter.key,
             "core_version": CORE_VERSION,
-            "frequency": "week" if data.frequency in ("W", "week") else "month",
+            "frequency": {"W": "week", "week": "week", "D": "day", "day": "day"}.get(data.frequency, "month"),
             "validation": "core" if data.core_checks else f"adapter: {data.core_checks_reason}",
+            # lineage identifiers (core-1.1.0): the exact config, and the inputs as_of saw
+            "config_hash": short_hash(clean(cfg.to_dict()), 16),
+            "input_fingerprint": input_fingerprint(data.sources, data.data_version, key),
         },
         "data": {
             "sources": data.sources,
@@ -282,6 +285,13 @@ def run_domain(
         config=cfg,
         domain=adapter.key,
     )
+
+
+def input_fingerprint(sources: list[dict[str, Any]], data_version: str, as_of_key: str) -> str:
+    """sha1 (16 hex) of what the run read: data version, as_of, and per source its rows and first/last
+    event. Two runs with the same fingerprint and config_hash saw the same inputs (by these counts)."""
+    parts = [[s.get("source"), s.get("rows"), s.get("first_event"), s.get("last_event")] for s in sources]
+    return short_hash(clean([data_version, as_of_key, parts]), 16)
 
 
 def stamp_domain(out: dict[str, Any], domain: str) -> None:

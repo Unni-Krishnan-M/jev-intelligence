@@ -75,3 +75,42 @@ tuning:
     behavioral_ramp: [5, 15, 30]
     cold_start_boost: [2.0, 5.0, 10.0]
     content_support_damping: [0.5, 1.0, 2.0]
+
+# Reproducible recommender benchmark (scripts/benchmark_recommenders.py). Every number in
+# docs/ML_IMPROVEMENT_REPORT.md comes from this section. Baselines get the same tuning budget
+# (12 validation configurations each for popularity, item-kNN and ALS).
+benchmark:
+  protocols: [user_temporal, global_temporal]
+  bootstrap_b: 2000
+  permutations: 10000
+  cold_sizes: [0, 1, 3, 5, 10]
+  stage_tuning:
+    dirichlet: 20      # free six-signal weight sets per bucket
+    profile: 10        # content/profile-only weight sets per bucket
+  non_inferiority_margin: 0.005   # NDCG@10 benchmark adoption rule (the governance gate uses its own power-derived margins, gates.py)
+  calibration:
+    k: 50
+    horizon: 5
+  tuning:
+    popularity:
+      reach_weight: [0.0, 0.25, 1.0]
+      score_half_life_days: [null, 90, 365, 1095]
+    itemknn:
+      k: [25, 50, 100, 200]
+      shrinkage: [0, 10, 50]
+    als:
+      factors: [16, 32, 64]
+      regularization: [0.01, 0.1]
+      alpha: [5, 20]
+    hybrid:
+      random_trials: 24
+      diversity_lambda: [1.0, 0.9, 0.8]
+      behavioral_ramp: [5, 15, 30]
+      cold_start_boost: [2.0, 5.0, 10.0]
+      content_support_damping: [0.5, 1.0, 2.0]
+  quick:            # CI smoke: small, fast, no retuning
+    max_users: 120
+    bootstrap_b: 200
+    permutations: 1000
+    cold_sizes: [0, 3]
+    stage_tuning: {dirichlet: 2, profile: 1}

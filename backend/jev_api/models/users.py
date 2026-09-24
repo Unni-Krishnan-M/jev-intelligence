@@ -24,6 +24,9 @@ class User(TimestampMixin, Base):
     # bumped on every taste-relevant event; part of the recommendation cache key
     profile_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     recommendation_prefs: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    # security (migration 0010): every JWT carries the version it was issued under; bumping it (revoke-all,
+    # password change, role change) invalidates all of the account's sessions at once
+    token_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
 
     genre_preferences: Mapped[list[UserGenrePreference]] = relationship(
         back_populates="user", cascade="all, delete-orphan"

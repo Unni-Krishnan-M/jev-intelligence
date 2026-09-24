@@ -1,319 +1,293 @@
 # JEV — Intelligent Decision & Early-Warning Engine
 
-**Version 1.2.0** · [Platform design](docs/platform.md) · [Demo walkthrough](docs/demo.md) · [Changelog](CHANGELOG.md) · [Status report](docs/progress.md)
+**Version 1.3.0** · [Architecture](ARCHITECTURE.md) · [Intelligence pipeline](docs/INTELLIGENCE_PIPELINE.md) ·
+[Demo walkthrough](docs/demo.md) · [Changelog](CHANGELOG.md) · [Completion report](docs/PROJECT_COMPLETION_REPORT.md)
 
-JEV is a reusable intelligence engine. It turns changing data into **signals, trends, anomalies, forecasts, risk
-assessments, structured decisions, explanations, recommendations and actions**. Every output carries its evidence and
-an honestly labelled confidence, and every stage is evaluated offline on real data.
+JEV turns changing data into **signals, trends, anomalies, forecasts, risk scores, typed decisions, early warnings
+and actions**. Every output carries its evidence, a confidence whose meaning is labelled, and a lineage back to the
+data it came from. Every stage is evaluated offline on real data, and the evaluation reports its negative results.
 
-Domain knowledge lives in **domain adapters**. Two ship today:
-- **Movies**, the first adapter and the reference implementation. It is a full hybrid recommender (popularity,
-  TF-IDF content, item-kNN, implicit ALS, adaptive hybrid with MMR diversity) on MovieLens. JEV watches its audience,
-  catalogue and model, detects each member's preference drift, and decides *how* recommendations should be produced
-  before producing them.
-- **Generic structured dataset**, any time-stamped CSV plus a YAML config. The demo uses monthly US and state
-  unemployment rates (BLS via FRED, public domain). The same engine raises early warnings of rising unemployment
-  when you replay it as of 2008 or 2020.
+The engine (`ml/jev_ml/core`) does not know any domain. Domain knowledge lives in adapters:
+
+- **Movie Intelligence**, the reference implementation: a hybrid recommender on MovieLens (popularity, TF-IDF content,
+  item-kNN, implicit ALS, adaptive hybrid with MMR diversity). JEV watches its audience, catalogue and model, detects
+  each member's preference drift, decides *how* a member's recommendations should be produced, and governs model
+  retraining with a promotion gate.
+- **US unemployment** (`generic:us-unemployment`): monthly BLS rates via FRED for the US, 12 states and 4 regions,
+  from one CSV and one YAML file, with no domain code.
+- **CTA ridership** (`generic:cta-ridership`): daily Chicago Transit Authority boardings (system, bus, rail, top
+  stations), with a weekly cycle, a holiday calendar and publication lag, again from YAML only.
+
+JEV runs on a laptop CPU: SQLite and an in-process cache without Docker, PostgreSQL and Redis with it. No GPU and no
+external model API are involved; the decision layer is a set of versioned rules, not an LLM.
 
 ![Situation report](docs/screenshots/14-intel-overview.png)
 
-**See it in five minutes:** [docs/demo.md](docs/demo.md). Run locally with `npm run dev`.
+## Contents
+[Architecture](#architecture) · [Pipeline](#the-intelligence-pipeline) · [Domains](#domains) ·
+[Technical highlights](#technical-highlights) · [Evaluation](#evaluation-honest-numbers) · [Limitations](#limitations) ·
+[Reproduce](#reproducibility) · [Demo](#demo-workflow) · [Tests](#tests) · [Screenshots](#screenshots) ·
+[Summary](#summary) · [Roadmap](#roadmap)
 
-## Problem statement
-Organisations sit on streams of changing data but act on them late. Dashboards show numbers without saying what is
-changing, how surely, what is likely next, how much it matters, or what to do. Single models ("a recommender", "a
-forecaster") answer one narrow question and hide their uncertainty. JEV chains the whole path from observation to
-action:
+## Architecture
 
-- it detects what is changing, and whether it is unusual;
-- it predicts where each series is heading, with calibrated uncertainty;
-- it scores the risk;
-- it makes **bounded, typed decisions** from that evidence, including whether a situation deserves an early warning;
-- it turns those decisions into warnings, recommendations and actions;
-- it learns from operator feedback.
-
-The architecture does not depend on the domain, so the same engine serves a film platform and a labour-market
-dataset.
-
-## At a glance
-| | |
-|---|---|
-| Engine | Domain-independent core (`ml/jev_ml/core`): series · signals · trends and change points · anomalies · forecasts · risk · JEV decisions · early warnings · actions · scenarios · drift · evaluation |
-| Domains | **Movies**: MovieLens 100,836 ratings, 9,742 films, plus Wikidata; hybrid recommender. **Generic**: any CSV + YAML; demo is monthly unemployment rates for the US (from 1948) and 12 states (from 1976), plus 4 census-region means |
-| Decisions | Typed (`boolean` / `choice` / `score`), versioned policies, confidence labelled `probability`, `margin`, `interval`, `evidence` or `rule`, and explicit abstention |
-| Recommender (test, 592 users) | Hybrid NDCG@10 **0.1214**: +21 % over the best single model |
-| Stack | FastAPI · SQLAlchemy + Alembic · PostgreSQL · Redis · Next.js 16 + TypeScript · Tailwind v4 · Recharts · Docker Compose |
-| Laptop footprint | CPU only. Movie intelligence run ≈ 1 s, unemployment run ≈ 0.2 s, ≈ 25 ms per recommendation request |
-
-## System architecture
 ```
-                 ┌──────────────────────── JEV core (ml/jev_ml/core) ──────────────────────┐
- data source ──► │ validate → series → signals → trends / change points → anomalies        │
- (adapter)       │ → forecasts → risk → JEV decisions → early warnings → actions            │
-                 │ → evidence & explanations · scenarios · drift · feedback · evaluation    │
-                 └──────────▲───────────────────────────────────────────▲───────────────────┘
-                            │ observations + series specs                │ domain extras (hooks)
-        ┌───────────────────┴──────────────┐           ┌─────────────────┴──────────────────────────┐
-        │ domains/generic: any CSV + YAML   │           │ domains/movie: MovieLens + app DB,         │
-        │ (US unemployment demo)            │           │ hybrid recommender, raters, lapse, model   │
-        └───────────────────────────────────┘           │ governance, preference drift, strategy     │
-                                                        └────────────────────────────────────────────┘
-Next.js console + member app ──/api/*──► FastAPI (/intel/*, /me/intelligence, /recommendations, …)
-                                            ├──► PostgreSQL (runs, warnings, decisions, evidence, audit, …)
-                                            └──► Redis (cache, rate limits)
-```
-Details: [ARCHITECTURE.md](ARCHITECTURE.md) · [docs/platform.md](docs/platform.md).
-
-## Domains
-| Domain | Data | What JEV produces |
-|---|---|---|
-| **Movies** (`movie`) | MovieLens ratings, app ratings/feedback, the served-recommendation log, model registry | genre and platform trends; spikes; suspicious raters; audience lapse forecasts; model governance; per-member preference drift → recommendation strategy → recommendations |
-| **Generic** (`generic:<name>`) | any long CSV (time, entity, value, optional groups) + `configs/domains/<name>.yaml` | per-entity trends, change points, anomalies, forecasts, adverse-direction risk, early-warning decisions and warnings |
-
-Adding a domain means writing a YAML file for a generic dataset, or implementing the `DomainAdapter` protocol for
-anything richer ([platform.md §3](docs/platform.md#3-domain-adapter-protocol-jev_mlcoreadapterpy)).
-
-## Movies domain: hybrid recommender
-1. **Popularity**: log like-counts, time-decayed trending, and a Bayesian-average rating.
-2. **Content-based**: separate TF-IDF per field (genres, directors, cast, keywords, tags, title, description, decade),
-   field-weighted and cosine-scored, with a signed user taste vector.
-3. **Collaborative filtering**: item-item cosine with shrinkage over the sparse implicit matrix, top-k neighbours.
-4. **Matrix factorization**: implicit ALS (Hu–Koren–Volinsky), with exact fold-in for new users and exact score attribution.
-5. **Hybrid**: candidate generation → filtering → six normalised signals → interaction-adaptive weighted score →
-   quality floor → MMR diversity → top-K with pagination. Every item carries its per-signal breakdown and a reason
-   built from real contributions: *"Recommended because of your interest in Christopher Nolan"*, *"Because you liked
-   Inception"*, *"Viewers who enjoyed The Dark Knight also loved this"*.
-
-Full description: [docs/recommendation-algorithms.md](docs/recommendation-algorithms.md).
-
-## Dataset
-MovieLens (GroupLens, research licence) is downloaded by script and MD5-verified; it is never committed. Wikidata (CC0)
-enrichment is fetched by IMDb id: 9,651/9,742 films matched, 98.5% have a director. Fields, sizes, validation and
-versioning are documented in [docs/ml-pipeline.md](docs/ml-pipeline.md).
-
-## Installation
-Requirements: Python 3.11+ with [uv](https://docs.astral.sh/uv/), Node 20.9+ with pnpm. Docker is optional.
-```bash
-cp .env.example .env            # set secrets
-uv sync
-cd frontend && pnpm install && cd ..
+ browser ──► Next.js 16 (App Router)  /api/* rewrite · nonce CSP · signs client address (x-jev-client)
+                    │
+                    ▼
+ FastAPI (backend/jev_api)            JWT (cookie + CSRF header, or bearer) · revocable sessions · service tokens
+   routers  auth · users · me · movies · recommendations · intel · events · governance · experiments/online · admin
+   services recommend ─► strategy decision ─► experiment arm ─► serve + log exposure
+            events     ─► append-only log + projections (one transaction) · idempotency keys
+            intel      ─► gather inputs (event log cut at as_of) ─► run_domain ─► persist (live | replay)
+            governance ─► snapshot ─► train candidate ─► gate ─► promote / rollback (hot swap)
+      │                          │                                   │
+      ▼                          ▼                                   ▼
+ PostgreSQL 17 / SQLite     Redis 7 / in-memory               files: models/ experiments/ data/
+ runs · decisions · warnings  cache · rate limits              versioned artifacts, registry.json,
+ events · jobs · experiments                                   snapshots, evaluation reports
+ audit · tokens
+                                          ▲
+ JEV core (ml/jev_ml/core, no web/DB imports) ─┘ used by the API and by the offline scripts
+   run_domain(adapter, as_of) ◄── adapters: domains/movie · domains/generic (any CSV + YAML)
 ```
 
-## Training
-```bash
-uv run python scripts/download_data.py      # --skip-enrichment to work offline
-uv run python scripts/preprocess_data.py
-uv run python scripts/train_models.py       # tune on validation, evaluate on test, train + register (≈4.5 min CPU)
-uv run python scripts/train_models.py --quick   # no tuning
-uv run python scripts/generate_recommendations.py --rate 79132=5 109487=5 --genres Sci-Fi
-```
-
-## Movies domain: recommender evaluation
-Per-user temporal split (70/10/20), relevance = held-out rating ≥ 4, full-catalogue ranking with consumed items
-excluded, the same protocol for every model. Numbers from run `jev-hybrid-v1-20260923T095709Z`:
-
-| Model (test, K=10) | Precision | Recall | NDCG | MAP | HitRate | Coverage | Diversity | Novelty |
-|---|---|---|---|---|---|---|---|---|
-| **Hybrid** | **0.0946** | **0.0990** | **0.1214** | **0.0591** | **0.5169** | 0.0514 | 0.9211 | 2.29 |
-| Item-kNN | 0.0828 | 0.0751 | 0.1006 | 0.0480 | 0.4358 | 0.0627 | 0.9178 | 2.54 |
-| ALS | 0.0731 | 0.0840 | 0.0956 | 0.0451 | 0.4392 | 0.0786 | 0.9222 | 2.64 |
-| Popularity | 0.0598 | 0.0489 | 0.0775 | 0.0379 | 0.3209 | 0.0093 | 0.9224 | 1.55 |
-| Content | 0.0044 | 0.0069 | 0.0060 | 0.0026 | 0.0389 | 0.1242 | 0.5961 | 8.29 |
-| Random | 0.0022 | 0.0009 | 0.0024 | 0.0007 | 0.0220 | 0.4530 | 0.9457 | 7.75 |
-
-On the cold-start protocol (3 interactions) popularity still leads (NDCG@10 0.046 vs hybrid 0.035). See
-[docs/evaluation.md](docs/evaluation.md) for the full tables, plots and discussion.
+Details: [ARCHITECTURE.md](ARCHITECTURE.md), [docs/platform.md](docs/platform.md) (adapter protocol).
 
 ## The intelligence pipeline
-The same stages run for every domain. Movie-only stages (raters, lapse, model governance, preference drift) plug
-in through the adapter's hooks.
 
 ```
-INGEST → VALIDATE → UNDERSTAND → DETECT → PREDICT → ASSESS → DECIDE → ACT/EXPLAIN → FEEDBACK
-sources  quality    monthly     trends,   forecasts, risk    typed      warnings,   operator verdicts
-         freshness  series,     change    lapse      scores  decisions  action      → evaluation
-                    signals     points,   model                         plan
-                                anomalies
+INGEST ─► VALIDATE ─► SERIES ─► SIGNALS ─► TRENDS / CHANGE POINTS ─► ANOMALIES ─► FORECASTS ─► RISK
+                                                                                                │
+FEEDBACK ◄── ACT / EXPLAIN ◄── EARLY WARNINGS ◄── early_warning_level decision ◄── DECISIONS ◄──┘
+operator     actions,          only at WARNING     NO_ACTION | MONITOR |           typed, versioned,
+verdicts     evidence,         or URGENT_ACTION;   WARNING | URGENT_ACTION         confidence kind,
+→ evaluation lineage           lifecycle + audit                                   abstention
 ```
-- **Leak-free replay.** Every run analyses the data *as of* a timestamp and never looks past it. Replaying as of
-  2017-07-01 raises a high warning for the May-2017 Horror spike. At that date the retrain and serving decisions
-  abstain, because the model was trained on later data.
-- **Detection:**
-  - trends: Mann–Kendall plus a Theil–Sen slope with 95 % CI, and Benjamini–Hochberg control across series;
-  - change points: a mean shift tested against an AR(1) null;
-  - series anomalies: robust (MAD) z-scores against a trailing baseline;
-  - rater anomalies: an IsolationForest over behavioural features.
-- **Prediction:**
-  - Damped Holt, moving-average and naive forecasts, selected per series by rolling-origin MASE, with
-    finite-sample 80 % intervals.
-  - A lapse model, a calibrated logistic regression that estimates P(no rating in 180 days), trained and tested on
-    separate time cut-offs.
-- **Risk:** each risk scores likelihood × impact, shrunk by confidence and data quality, and lists its contributing
-  factors.
-- **Decisions ("JEV").** The decision layer is JEV itself, not an external LLM. Each decision is a fixed question
-  with a fixed answer type (`boolean`, `choice`, `score`) and a versioned policy. Normal code does all arithmetic;
-  the policy only combines evidence. Every decision stores:
-  - the exact state it saw and its rationale;
-  - a confidence labelled `probability` (paired bootstrap or calibrated model), `margin` (not a probability) or
-    `rule`;
-  - an explicit abstention when the data is insufficient.
-- **Early-warning decision.** For every situation (a series or an entity with evidence), JEV answers
-  `early_warning_level`: `NO_ACTION | MONITOR | WARNING | URGENT_ACTION`.
-  - It is scored from the situation's structured evidence: signal strength, trend direction and q-value, anomaly
-    score, forecast direction against the domain's adverse direction, and risk.
-  - The policy is monotone and versioned, with a margin confidence.
-- **Early warnings are downstream of that decision.**
-  - A warning is raised only at `WARNING` or `URGENT_ACTION`, and it links its `decision_id`.
-  - Each warning shows its trigger condition (observed vs threshold), evidence and recommended action.
-  - They are deduplicated by key. Their lifecycle runs `new → acknowledged → investigating → resolved | dismissed`,
-    with an audit trail.
-  - A dismissal suppresses the warning unless its severity escalates; a resolved warning that fires again reopens.
-- **What-if and feedback:**
-  - Scenarios bend a series' fitted trend (continue, slow, reverse, shock) and compare the projections against the
-    baseline band.
-  - Operators mark decisions, warnings, actions and forecasts as correct or useful. The system reports decision
-    accuracy and warning precision from those verdicts.
 
-**Offline evaluation** (`uv run python scripts/evaluate_intelligence.py`, run `intel-eval-20260923T134257Z`):
+- **Leak-free as of any date.** A run sees only data with event time ≤ `as_of` and ingestion time ≤ the knowledge
+  time. A run with `as_of` is a *replay*: it never touches live warnings.
+- **Decisions are rules, not guesses.** Each decision is a fixed question with a fixed answer type (`boolean`,
+  `choice`, `score`) and a versioned policy. Ordinary code computes the evidence; the policy combines it.
+- **Warnings come only from a decision.** A warning exists only downstream of an `early_warning_level` of
+  `WARNING` or `URGENT_ACTION`, and links its `decision_id`.
 
-| Component | Protocol | Result | Baseline |
-|---|---|---|---|
-| Forecasts (21 series) | model picked on origins 1–12, scored on 13–24 | median MASE 0.93; beats naive on 21/21; 80 % interval coverage 0.95 | naive MASE 1.15 |
-| Lapse model | temporal holdout, 1,017 train / 493 test rows | AUC 0.886 · Brier 0.115 · ECE 0.061 | recency rule AUC 0.779 · Brier 0.155 |
-| Shilling detection | synthetic, labelled attack profiles injected into real data | AUC 0.95 random · 0.99 average · 0.92 bandwagon | deviation rule F1 0 |
-| Series anomalies | 756 spikes/drops injected into real series | 50 % detected overall (73–76 % at ≥ 5σ); 2 % false-alarm rate | — |
-| Change points | synthetic AR(1) matched to real volume | 32.5 % detected; 7 % false alarms (nominal 1 %) | — |
+Stage-by-stage description: [docs/INTELLIGENCE_PIPELINE.md](docs/INTELLIGENCE_PIPELINE.md).
 
-**Preference drift and recommendation strategy (movies).**
-- For each member, JEV compares the historical and recent windows on six aspects: genre mix, rating level, activity
-  rate, film age, content similarity and acceptance. Permutation tests work on whole active days, with Holm
-  correction.
-- JEV then decides the `recommendation_strategy` (`standard | adapt_to_recent | explore`), and `/recommendations`
-  serves under that decision. Each list carries the decision id and its evidence.
-- A per-member what-if ranks the real model's recommendations under projected preferences (continue, accelerate,
-  reverse), with 80 % bands from resampling.
+## Domains
 
-**Platform evaluation** (`scripts/evaluate_domains.py`, run `platform-eval-20260924T051637Z`, 6-period horizon;
-`scripts/evaluate_drift.py`, run `drift-eval-20260924T045528Z`):
-
-| Measure | Movies | US unemployment |
+| Domain | Data | What JEV produces |
 |---|---|---|
-| Forecast median MAE / RMSE | 47.8 / 59.1 ratings | 0.145 / 0.177 points |
-| Forecast MASE vs naive | 0.93 vs 1.15 (better on 21/21) | 1.52 vs 1.41 (no better than naive) |
-| 80 % interval coverage | 0.95 | 0.61 |
-| Warning precision / false-positive rate (monthly leak-free replays) | lapse 18/18, but the base rate is 1.0, so uninformative | 0.36 / 0.39 at base rate 0.30; recall 0.52 |
-| Early-warning decision flip rate between monthly replays | 0.23 (0.026 across the WARNING line) | 0.13 (2006–10) · 0.22 (2019–21) |
-| Drift detector, labelled splices of real histories (20 events) | precision 0.92 · recall 0.29 · false-positive rate 0.026 on preference aspects | — |
-| Drift adaptation effect (NDCG@10, models refitted without test data) | +0.006 [+0.001, +0.013] on only 7 drifting users; nothing measurable on larger groups, so the policy keeps `standard` | — |
+| **movie** (reference) | MovieLens ml-latest-small (100,836 ratings, 610 users, 9,742 films) + Wikidata; app ratings, feedback, served lists (event log); model registry | genre and platform trends, spikes, suspicious raters, audience-lapse forecasts, model governance decisions, per-member preference drift → `recommendation_strategy` → recommendations |
+| **us-unemployment** | BLS unemployment rates via FRED (public domain), fetched with checksums | per-series trends, change points, anomalies, forecasts, adverse-direction risk, early-warning decisions and warnings |
+| **cta-ridership** | City of Chicago data portal, daily boardings 2001–2026 | the same, on daily and weekly series with seasonal forecasts and a holiday calendar ([case study](docs/SECOND_DOMAIN_CASE_STUDY.md)) |
 
-A full run over the real data takes about 1 s on a laptop CPU (0.85 s pipeline + persistence). Design, contract and method notes:
-[docs/intelligence.md](docs/intelligence.md).
-```bash
-uv run python scripts/run_intelligence.py --as-of 2017-07-01   # one run, printed as JSON
-uv run python scripts/evaluate_intelligence.py                 # offline evaluation → experiments/intel-eval-*/
-```
+A new dataset needs a YAML file in `configs/domains/`; anything richer implements the `DomainAdapter` protocol.
 
-## API
-REST under FastAPI with JWT (httpOnly cookie or bearer) and CSRF protection for cookie writes. Main endpoints:
-`/auth/*`, `/users/me*`, `/movies*`, `/recommendations` (+ `/similar/{id}`, `/trending`, `/because-you-watched`,
-`/similar-to-favorites`, `/feedback`, `/history`), `/models*`, `/experiments*`, `/health`, `/health/ml`.
-Operators (admins) also get `/intel/*`: status, runs (with replay `as_of`), signals, trends, anomalies, predictions, series, risks, decisions (incl. score decisions and `/intel/decisions/batches`), warnings (lifecycle), actions, scenarios, feedback, evaluation and evaluation runs, evidence search, history across runs and recommender monitoring, plus `/admin/metrics` and `/admin/audit`. Recommendation items carry a calibrated `confidence` (P(rating ≥ 4)), or null.
-Reference: [docs/api.md](docs/api.md). OpenAPI UI is at `http://localhost:8000/docs` in development.
+## Technical highlights
 
-## Frontend
-Next.js 16 App Router. Pages: `/` landing (live metrics), `/login`, `/register`, `/onboarding` (genres → favourites →
-quick ratings), `/home` (six shelves: Recommended for you, Because you watched, Similar to your favourites, Trending,
-Popular, New discoveries), `/discover`, `/movies/[id]`, `/recommendations` (full ranking with "Why this?"
-breakdowns and feedback), `/profile` (taste profile), `/history`, `/favorites`, `/admin`, `/admin/models`,
-`/admin/experiments`, and the Intelligence console under `/intel` (overview, signals, trends, anomalies, predictions, risks, early warnings, decisions, actions, what-if scenarios, feedback, evaluation, recommender monitoring, evidence explorer, audit log, system health).
+| Area | What is implemented | Evidence |
+|---|---|---|
+| **Event log, bitemporal, idempotent** | Every member interaction and pushed observation is an append-only event with `event_time` and `ingested_at`; current-state tables are projections written in the same transaction; `Idempotency-Key` gives exactly-once retries (10 identical rating posts give 1 event); `POST /events/replay` diffs projections against the log | [STREAMING_ARCHITECTURE.md](docs/STREAMING_ARCHITECTURE.md), `tests/integration/test_events*.py` |
+| **Gated retraining with rollback** | Content-hashed snapshots including app feedback; candidates never auto-activate; the gate refits both recipes on the same frozen split and tests paired non-inferiority with power-derived margins; promotion needs a gate against the model active now; rollback in one call; hot swap; lineage per version | [RETRAINING_AND_MODEL_GOVERNANCE.md](docs/RETRAINING_AND_MODEL_GOVERNANCE.md), `tests/ml/test_governance.py`, `tests/integration/test_governance_api.py` |
+| **Online experiments** | Salted-hash sticky assignment, exposure logging including cache hits, attribution windows, SRM check, Bonferroni-adjusted tests, guardrails, power warnings, A/A false-positive check | [EXPERIMENTATION.md](docs/EXPERIMENTATION.md), `tests/integration/test_experiments*.py` |
+| **Replay isolation and lineage** | `intel_runs.mode` live/replay; reads default to the latest live run; each run records pipeline version, config hash, input fingerprint, event watermark and model version; decision → evidence → series → source lineage | [EARLY_WARNING_SYSTEM.md §3](docs/EARLY_WARNING_SYSTEM.md), `tests/integration/test_intel_replay_lineage.py` |
+| **Typed decisions** | Confidence kinds `probability` (bootstrap or calibrated model), `margin` (not a probability), `interval`, `evidence`, `rule`; explicit abstention with a reason; atomic decision batches with a state hash | [DECISION_ENGINE.md](docs/DECISION_ENGINE.md) |
+| **Warning lifecycle** | Dedup per (domain, key), new → acknowledged → investigating → resolved/dismissed, suppression after dismissal, reopen, auto-resolve after K live runs, audit trail | [EARLY_WARNING_SYSTEM.md §2](docs/EARLY_WARNING_SYSTEM.md) |
+| **Security** | Argon2id; JWTs with `jti` and `token_version` (logout, logout-all and password change revoke); scoped, hashed, expiring service tokens; per-account login throttle; signed client address from the web proxy; admin re-checked per request; route-walker tests; pip-audit and pnpm audit in CI | [SECURITY_AUDIT_PHASE2.md](docs/SECURITY_AUDIT_PHASE2.md), `tests/integration/test_security*.py` |
 
-The design is a festival programme printed for a dark screening room. It uses warm near-black and paper tones, a
-single tungsten-amber accent, serif display type, and typeset covers generated from each film's metadata instead of
-posters. A light "paper" theme is included. It is responsive from 360 px phones to 1440 px laptops, keyboard
-accessible, and respects reduced-motion settings.
-```bash
-npm run dev                                      # API :8000 + web :3000 together; Ctrl+C stops both
-# or separately:
-uv run uvicorn jev_api.main:app --port 8000      # SQLite + in-memory cache by default
-cd frontend && pnpm dev                          # http://localhost:3000
-```
+## Evaluation (honest numbers)
 
-## Docker
-```bash
-docker compose --profile train run --rm trainer  # first run: data + training into ./data ./models ./experiments
-docker compose up -d --build                     # postgres, redis, api, web → http://localhost:3000
-uv run python scripts/acceptance_test.py --base http://localhost:3000/api --admin-password "$JEV_ADMIN_PASSWORD"
-```
-The trainer also writes the recommendation-confidence calibration and the intelligence evaluation. The API is reachable
-only through the web proxy (`/api/*`), and forwarded headers are not trusted by default. The acceptance test (58 checks:
-the recommender journey plus the intelligence layer end to end) passes against the Docker stack. See
-[docs/deployment.md](docs/deployment.md).
+Every number below comes from a stored run under `experiments/` or from the independent reproduction in
+[docs/EVALUATION_AND_VALIDITY_REVIEW.md](docs/EVALUATION_AND_VALIDITY_REVIEW.md) §3. Lift = precision / base rate
+(1.0 = no better than flagging at random at the same rate). `experiments/` is gitignored; the commands in
+[Reproducibility](#reproducibility) regenerate it.
 
-## Testing
-```bash
-uv run pytest                   # 174 tests: unit 47, ML 9, intelligence 39, API integration 79 (~25 s; 173 pass + 1 PostgreSQL-only skip; real-data checks skip without data)
-uv run ruff check . && uv run ruff format --check . && uv run mypy
-cd frontend && pnpm test         # 65 Vitest tests in 6 files (helpers, CSP, safe redirects, components; jsdom)
-cd frontend && pnpm exec next typegen && pnpm exec tsc --noEmit && pnpm exec eslint src && pnpm build
-uv run python scripts/acceptance_test.py --base http://localhost:3000/api   # 58 end-to-end checks against a running stack
-uv run python scripts/capture_screenshots.py     # real-browser user journey (Chrome) → docs/screenshots
-```
+**Recommender** (`experiments/rec-benchmark-20260924T172521Z`, NDCG@10, 95 % per-user bootstrap CIs):
 
-## Screenshots
-| | |
-|---|---|
-| ![Landing](docs/screenshots/01-landing.png) | ![Onboarding](docs/screenshots/02-onboarding-genres.png) |
-| ![Ranked list](docs/screenshots/05-recommendations.png) | ![Why this?](docs/screenshots/06-why-this.png) |
-| ![Movie](docs/screenshots/07-movie-detail.png) | ![Taste profile](docs/screenshots/08-taste-profile.png) |
-| ![Admin experiments](docs/screenshots/12-admin-experiments.png) | ![Mobile, paper theme](docs/screenshots/13-mobile-discover-light.png) |
+| Protocol | Users | Hybrid | Strongest comparator | Paired Δ (Holm) | Reading |
+|---|---|---|---|---|---|
+| Per-user temporal split (other users' later ratings reach training) | 592 | 0.121 [0.108, 0.134] | item-kNN 0.101 | +0.020, p_holm 0.001 | +20 % over item-kNN, on a split with cross-user leakage |
+| Global temporal split (leak-free) | 28 | 0.115 [0.059, 0.186] | item-kNN 0.092 | +0.024 [−0.025, +0.074], n.s. | not better than item-kNN |
+| Global temporal split | 28 | 0.115 | tuned recently-popular 0.159 | −0.044 [−0.092, +0.001], n.s. | **negative result**: a 90-day popularity baseline is ahead |
+| Cold start, 3 interactions | 592 | 0.035 | popularity 0.046 | — | popularity still leads |
 
-Intelligence console:
+Recommendation confidence is calibrated to the base rate (about 1 %; ECE ≤ 0.002, relative error up to 17 %) with
+almost no skill beyond it (Brier skill ≤ 0.008) and weak discrimination (AUC 0.55–0.67). Two candidate improvements
+(cold-start stages, a logistic calibrator) failed their pre-declared adoption rules and are off by default
+([ML_IMPROVEMENT_REPORT.md](docs/ML_IMPROVEMENT_REPORT.md)).
 
-| | |
-|---|---|
-| ![Situation report](docs/screenshots/14-intel-overview.png) | ![Trends](docs/screenshots/15-intel-trends.png) |
-| ![Forecasts and lapse model](docs/screenshots/16-intel-predictions.png) | ![Early warning](docs/screenshots/17-intel-warning.png) |
-| ![Decision with evidence](docs/screenshots/18-intel-decision.png) | ![What-if scenarios](docs/screenshots/19-intel-scenarios.png) |
-| ![Evaluation](docs/screenshots/20-intel-evaluation.png) | ![Mobile, paper theme](docs/screenshots/21-mobile-intel-light.png) |
-| ![Evidence explorer](docs/screenshots/22-intel-evidence.png) | ![Recommender monitoring](docs/screenshots/23-intel-recommender.png) |
-| ![Audit log](docs/screenshots/24-intel-audit.png) | |
+**Early warnings** (monthly leak-free replays; `experiments/platform-eval-20260924T174851Z` unless noted):
+
+| Domain / window | Units | Base rate | Precision | Lift [95 % CI] | FPR | Recall | Reading |
+|---|---|---|---|---|---|---|---|
+| us-unemployment, 2006–10 + 2019–21 | 1,632 | 0.295 | 0.415 | 1.41 (CI not stored for this run) | 0.300 | 0.51 | modest skill; lags turning points |
+| us-unemployment, 2019–21 only | 612 | 0.206 | 0.214 | 1.04 | 0.144 | 0.15 | barely better than chance |
+| cta-ridership, plain generic config, 2015–24 | 960 | 0.0625 | 0.061 | 0.98 | 0.770 | 0.75 | no skill (weekends read as drops) |
+| cta-ridership, domain-aware, 2015–24 (development window) | 960 | 0.0625 | 0.090 | 1.44 [0.52, 2.36]; year-stratified 1.18 | 0.224 | 0.33 | 3.4× fewer false positives; skill **not** statistically established |
+| cta-ridership, domain-aware, 2003–09 (untouched) | 664 | 0.024 | 0.027 | 1.10 [0.00, 2.33] | 0.170 | 0.19 | **negative result**: no skill (3 of 16 events) |
+| movie, last 24 months | 361 | 0.108 | 1.00 | lapse base rate 1.0: uninformative | 0 | 0.46 | genre-decline warnings never fire |
+
+CTA CIs: month-cluster bootstrap, from the review's reproduction (§3 rows 3–7). From v1.3.0, `evaluate_domains.py`
+stores per-unit rows and this CI in every report.
+
+**Other components:**
+
+| Component | Result | Baseline / caveat |
+|---|---|---|
+| Movie forecasts (21 series) | median MASE 0.93, beats naive on 21/21 | 80 % intervals cover 0.95: they over-cover (too wide) |
+| Unemployment forecasts (17 series) | MASE 1.52 | naive 1.41: no better than naive; coverage 0.61 |
+| CTA forecasts (8 series, 522 issue times) | relative MAE 0.33 vs naive, 0.77 vs seasonal naive, 8/8 series | coverage 0.775 for nominal 0.80; no Diebold–Mariano test |
+| Change points (synthetic AR(1), φ = 0.56) | false alarms 1.3 % at nominal 1 % (was 9.9 %) | detection 13.5 % (1σ shifts 5.6 %) |
+| Lapse model (P(no rating in 180 days)) | AUC 0.886, Brier 0.115 | recency rule Brier 0.155; base rate 74 % |
+| Drift detector (labelled splices of real histories) | precision 0.92 at a 1:1 synthetic prevalence (2 false positives in 78; FPR 0.026, CI 0.007–0.089), recall 0.29 | at a 5–10 % prevalence the implied precision is about 0.4–0.6 |
+| Drift adaptation (NDCG@10, refit without test data) | +0.006 on 7 drifting users (3 improved, 4 tied; sign test p = 0.25) | no effect established; the policy serves `standard` |
+| A/B replay, 610 MovieLens members, 3 arms | recency arm +0.026 NDCG@10 [−0.009, +0.061], p 0.092 vs adjusted α 0.025 | inconclusive; offline replay, between-arm, not live traffic; latency not assessed |
+| Promotion gate on a real quick retrain (gate-1.0.0) | Δ NDCG@10 −0.0009, 90 % CI [−0.0073, +0.0055] | not shown non-inferior under the old 0.005 margin, so rejected; the gate could not distinguish it from the incumbent (margins now power-derived) |
+| Event ingestion, SQLite | 730 events/s (10,000 events in 13.7 s) | single process, laptop |
 
 ## Limitations
-- **Platform, generic domain:**
-  - Unemployment forecasts are no better than naive (MASE 1.52 vs 1.41), and their 80 % intervals cover only 61 %.
-  - Warnings lag turning points: warning precision is 0.36 overall, 0.44 in 2006–10 but 0.11 in 2019–21.
-  - Replays use today's revised FRED figures, not the first-published ones.
-  - The generic adapter adds no domain-specific stages.
-- **Platform, movie domain:** genre-decline warnings almost never fire under the strict FDR control. Lapse warning
-  precision is uninformative, because the base rate is 1.0.
-- **Preference drift:**
-  - The detector is precise but conservative (recall 0.29 at a 20-event splice).
-  - Adapting to drift is not yet shown to help: only 7 users were eligible. The policy therefore serves `standard`
-    until an evaluation on at least 30 drifting users shows a benefit.
-  - New app members rate everything on one day, so their drift tests abstain until they have history over time.
-- **Cold start**: with about 3 interactions, plain popularity still beats the hybrid on NDCG@10.
-- MovieLens-small is small (610 users) and old (ratings to 2018), so absolute metrics are modest and results may not
-  transfer to other domains. The evaluation split allows cross-user temporal leakage (documented; a global temporal
-  split is available).
-- Wikidata metadata is incomplete: keywords cover 36% of films, and cast lists are unordered (Wikidata has no billing order).
-- App users are not in the training data. They are served by fold-in, and their feedback is not yet fed back into retraining.
-- No password reset or email verification; JWTs are not revocable before expiry.
-- Posters are typeset, not artwork.
-- **Intelligence layer:**
-  - MovieLens is a static 2018 snapshot, so every live signal needs real app traffic before it says anything. Until
-    then those stages report "skipped" instead of guessing.
-  - On this thin stream (10–15 active raters a month), genre trends rarely survive false-discovery control.
-  - The change-point test over-alarms (7 % vs 1 % nominal).
-  - Recommendation confidence is well calibrated (ECE ≤ 0.0014) but discriminates weakly (AUC 0.57–0.63).
-  - Open warnings are never auto-resolved.
-  - The rater detector spends much of its 2 % review budget on genuine heavy users.
-  - Some impact weights and action efforts are declared estimates, and they are labelled as such.
-  - The lapse base rate is high (74 %), so a lapse warning mostly restates that most raters do not return.
 
-## Future improvements
-Separate cold-stage weights or learning-to-rank on logged feedback · sequence-aware models · scheduled retraining that
-includes app interactions · online A/B tests driven by the experiment table · larger MovieLens variants · optional
-TMDB artwork. See [docs/roadmap.md](docs/roadmap.md) and [docs/progress.md](docs/progress.md).
+- **Small, old data.** MovieLens-small has 610 users and ends in 2018. The leak-free recommender protocol has 28
+  warm users, so its CIs are about ±0.06 and most comparisons there are inconclusive.
+- **Warning skill is weak or unproven.** Unemployment lift 1.41 lags turning points (2019–21 lift 1.04). CTA warnings
+  cut false positives but show no skill on an untouched window. Movie lapse warnings are uninformative (base rate
+  1.0) and genre-decline warnings never fire. Outcomes are scored on today's data vintage, not first releases.
+- **No live traffic.** Every online-experiment result is an offline replay. Live signals of the movie domain stay
+  "cannot be assessed" until real app traffic exists.
+- **Replay determinism** holds for a fixed code version, data files and active model: a movie replay reads the model
+  active at replay time (the run records which; the API cannot pin it yet).
+- **Promotion gate power** depends on the snapshot size; at 594 users an equivalent candidate passes each accuracy gate
+  about 80 % of the time, and less often all three together. The calibration gate's ECE margin cannot fail at ~1 %
+  base rates.
+- **Recommender:** popularity beats the hybrid at cold start; confidence discriminates weakly; content metadata from
+  Wikidata is incomplete (keywords for 36 % of films).
+- **Operations:** one run lock and refresher per process; `idempotency_keys` and `revoked_tokens` are not pruned yet;
+  per-client rate limits need `JEV_PROXY_SECRET` (and an edge proxy for true client addresses); no password reset or
+  email verification. The Docker acceptance test (69 checks) was last run for v1.2.0 and was not re-run for 1.3.0.
+
+## Reproducibility
+
+```bash
+# setup (Python 3.11+ with uv; Node 20.9+ with pnpm)
+cp .env.example .env
+uv sync --frozen
+cd frontend && pnpm install --frozen-lockfile && cd ..
+
+# data (MovieLens is MD5-verified and never committed; FRED and Chicago portal need no key)
+uv run python scripts/download_data.py                       # --skip-enrichment to work offline
+uv run python scripts/preprocess_data.py
+uv run python scripts/download_domain_data.py us-unemployment
+uv run python scripts/download_domain_data.py cta-ridership
+
+# models and evaluations (CPU; times on a laptop)
+uv run python scripts/train_models.py --calibrate            # tune, evaluate, train, register (~4.5 min)
+uv run python scripts/benchmark_recommenders.py              # two-protocol benchmark (~11 min; --quick ~100 s)
+uv run python scripts/evaluate_intelligence.py               # movie intelligence components
+uv run python scripts/evaluate_domains.py                    # warnings/forecasts, all domains (~6 min)
+uv run python scripts/evaluate_drift.py                      # drift detector and adaptation
+uv run python scripts/simulate_ab_replay.py                  # offline A/B replay (labelled as not live)
+
+# governance: snapshot → candidate → gate (never activates), then promote or roll back
+uv run python scripts/retrain.py run --quick
+uv run python scripts/retrain.py status
+uv run python scripts/retrain.py promote <version>
+uv run python scripts/retrain.py rollback --reason "negative feedback spike"
+
+# a dev SQLite database stamped at head before migrations 0006–0010 existed
+uv run python scripts/repair_dev_db.py                       # backup, rebuild at head, copy rows back
+```
+
+Seeds are fixed (42); every run directory records the dataset version, git commit and config hash.
+
+## Demo workflow
+
+```bash
+npm run dev                         # API on :8000 + web on :3000 (SQLite, in-memory cache); Ctrl+C stops both
+# or: docker compose --profile train run --rm trainer && docker compose up -d --build   → http://localhost:3000
+```
+
+1. Sign in as the bootstrap admin (`JEV_ADMIN_EMAIL` / `JEV_ADMIN_PASSWORD` in `.env`) and open **Intelligence**.
+2. **Overview** (movie domain): freshness, signals, the latest decisions and open warnings.
+3. **Replay** as of 2017-07-01: the Horror spike raises a high warning; the retrain and serving decisions abstain
+   because the model was trained on later data. Live warnings are untouched.
+4. Switch the domain to **us-unemployment** and replay 2008-06-01: warnings for IL and NY before the peak. Switch to
+   **cta-ridership** and replay 2020-03-20: every entity at URGENT_ACTION.
+5. Open a **decision**: answer, confidence kind, state, rationale, evidence and its lineage to the data sources.
+6. Open a **warning**, acknowledge it, then resolve or dismiss it; the audit log records each step.
+7. Run a **what-if scenario** on a series (continue, reverse, shock).
+8. **Ops → Models**: gate results, promote a passing candidate or roll back with a reason. **Ops → Experiments**:
+   create, start and read an online experiment. **Ops → Events**: ingestion health and replay drift.
+9. As a member: rate a few films, open **My intelligence** for the preference-drift report and the strategy decision
+   behind your recommendations.
+
+Full walkthrough with expected outputs: [docs/demo.md](docs/demo.md).
+
+## Tests
+
+Final validation for 1.3.0 (2026-09-25):
+
+| Check | Result |
+|---|---|
+| `uv run pytest -q` (repository, real data present) | 466 passed, 8 skipped (PostgreSQL-only; 474 collected) |
+| Clean copy of the tracked and unignored files, `uv sync --frozen && uv run pytest -q` | 452 passed, 22 skipped (real-data and PostgreSQL-only tests) |
+| `uv run ruff check .` · `uv run ruff format --check .` · `uv run mypy` | clean · clean · clean |
+| `uv run alembic check` (single head 0010) | no drift |
+| Frontend (`cd frontend && pnpm test`) | 129 Vitest tests in 10 files passed |
+
+```bash
+uv run pytest -q
+uv run ruff check . && uv run ruff format --check . && uv run mypy && uv run alembic check
+cd frontend && pnpm test && pnpm exec next typegen && pnpm exec tsc --noEmit && pnpm lint && pnpm build
+uv run python scripts/acceptance_test.py --base http://localhost:3000/api --admin-password "$JEV_ADMIN_PASSWORD"
+```
+
+PostgreSQL-only tests run when `JEV_TEST_POSTGRES_URL` is set. Every quality gate and its evidence:
+[docs/FINAL_VERIFICATION_MATRIX.md](docs/FINAL_VERIFICATION_MATRIX.md).
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Situation report](docs/screenshots/14-intel-overview.png) | ![Early warning](docs/screenshots/17-intel-warning.png) |
+| ![Decision with evidence](docs/screenshots/18-intel-decision.png) | ![Decision lineage](docs/screenshots/34-decision-lineage.png) |
+| ![Unemployment overview](docs/screenshots/26-intel-unemployment-overview.png) | ![Unemployment warning](docs/screenshots/27-intel-unemployment-warning.png) |
+| ![Early-warning decision](docs/screenshots/28-intel-ewl-decision.png) | ![What-if scenarios](docs/screenshots/19-intel-scenarios.png) |
+| ![Model lifecycle](docs/screenshots/31-ops-model-lifecycle.png) | ![Online experiment](docs/screenshots/32-ops-experiment.png) |
+| ![Event ingestion](docs/screenshots/33-ops-events.png) | ![Evaluation](docs/screenshots/20-intel-evaluation.png) |
+| ![My intelligence](docs/screenshots/29-me-intelligence.png) | ![Member scenarios](docs/screenshots/30-me-scenarios.png) |
+| ![Recommendations](docs/screenshots/05-recommendations.png) | ![Why this?](docs/screenshots/06-why-this.png) |
+| ![Landing](docs/screenshots/25-landing-platform.png) | ![Mobile, paper theme](docs/screenshots/21-mobile-intel-light.png) |
+
+More (01–24): [docs/screenshots/](docs/screenshots/).
+
+## Summary
+
+JEV is a domain-independent decision and early-warning engine in Python (numpy, scipy, scikit-learn), FastAPI,
+SQLAlchemy/Alembic, PostgreSQL/SQLite, Redis and Next.js/TypeScript, with three domains from one core: a MovieLens
+hybrid recommender, US unemployment and Chicago transit ridership. It implements an append-only bitemporal event
+log with idempotent ingestion, leak-free replays isolated from live state, typed and versioned decisions with
+labelled confidence and abstention, early warnings with a full lifecycle, gated retraining with power-derived
+non-inferiority tests and one-call rollback, and online A/B experimentation with SRM and multiple-testing control.
+Every metric is reported with bootstrap CIs, base rates and lift, including the negative results, and was checked by
+an independent validity review.
+
+## Roadmap
+
+Ordered by the gaps that remain after 1.3.0 ([docs/roadmap.md](docs/roadmap.md)):
+
+1. **Live traffic.** Run an online experiment on real members; until then every online result is a replay.
+2. **Paired offline experiment replay** (every member under every variant) in `scripts/simulate_ab_replay.py`.
+3. **Warning skill.** A persistence rule for daily anomalies, per-domain early-warning thresholds tuned on a
+   separate window, and a baseline rule (e.g. the Sahm rule for unemployment); report lift CIs for every domain.
+4. **Recommender power.** Re-run the benchmark on MovieLens-1M/25M (same code); a time-decayed popularity signal
+   inside the hybrid; learning-to-rank on logged feedback.
+5. **Governance.** A shared calibration set (relative calibration or Brier skill) for the calibration gate; a
+   post-promotion monitor that proposes rollback; API support for pinning a replay's model version.
+6. **Operations.** Re-run the Docker acceptance test; retention jobs for `idempotency_keys` and `revoked_tokens`;
+   a shared run lock across workers; password reset and email verification.
+7. **Movie warnings.** Evaluate lapse warnings at a fixed flag rate or retire the lapse warning (keep the risk).
 
 ## Licence and credits
-Code: MIT. Data: MovieLens © GroupLens (research use; not redistributed); Wikidata CC0.
+Code: MIT. Data: MovieLens © GroupLens (research use; not redistributed); Wikidata CC0; FRED/BLS public domain;
+City of Chicago data portal (terms of use of the portal).

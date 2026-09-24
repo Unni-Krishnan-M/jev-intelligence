@@ -8,6 +8,7 @@ from sqlalchemy import delete, func, select
 from jev_api.deps import DB, MAX_PAGE, CurrentUser
 from jev_api.models import Favorite, Genre, Movie, Rating, User, UserGenrePreference, WatchHistory
 from jev_api.schemas import MovieBrief, OnboardingRequest, PreferenceUpdate, UserOut
+from jev_api.services import events
 from jev_api.services.profile import taste_profile
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -48,9 +49,8 @@ def onboarding(body: OnboardingRequest, user: CurrentUser, db: DB) -> UserOut:
         if missing:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"unknown movie ids: {sorted(missing)}")
         existing = set(db.scalars(select(Favorite.movie_id).where(Favorite.user_id == user.id)).all())
-        db.add_all(
-            Favorite(user_id=user.id, movie_id=m, source="onboarding") for m in sorted(known - existing)
-        )
+        for m in sorted(known - existing):  # WS1: an event first, the favorite row is its projection
+            events.apply_member_event(db, user, "favorite", m, extra={"source": "onboarding"})
     user.onboarding_completed = True
     user.profile_version += 1
     db.commit()

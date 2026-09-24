@@ -15,15 +15,24 @@ from jev_ml.models.base import Contribution, Recommender, TrainContext, sparse_t
 from jev_ml.signals import UserProfile
 
 # prefix -> explanation "kind" for feature contributions
-FEATURE_KIND = {"d:": "director", "c:": "cast", "k:": "keyword", "t:": "tag", "g:": "genre",
-                "w:": "title", "o:": "description", "y:": "decade"}
+FEATURE_KIND = {
+    "d:": "director",
+    "c:": "cast",
+    "k:": "keyword",
+    "t:": "tag",
+    "g:": "genre",
+    "w:": "title",
+    "o:": "description",
+    "y:": "decade",
+}
 
 
 class ContentRecommender(Recommender):
     name = "content"
 
-    def __init__(self, field_weights: dict[str, float] | None = None, min_df: int = 2,
-                 n_neighbors: int = 50) -> None:
+    def __init__(
+        self, field_weights: dict[str, float] | None = None, min_df: int = 2, n_neighbors: int = 50
+    ) -> None:
         self.field_weights = dict(field_weights or DEFAULT_FIELD_WEIGHTS)
         self.min_df = min_df
         self.n_neighbors = n_neighbors
@@ -50,8 +59,11 @@ class ContentRecommender(Recommender):
             rows.append(r)
             cols.append(c)
             vals.append(v)
-        return sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
-                             shape=(n, n), dtype=np.float32)
+        return sp.csr_matrix(
+            (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+            shape=(n, n),
+            dtype=np.float32,
+        )
 
     # --- inference ------------------------------------------------------------------------------
     def user_vector(self, profile: UserProfile) -> np.ndarray | None:
@@ -116,8 +128,7 @@ class ContentRecommender(Recommender):
 
     # --- persistence ----------------------------------------------------------------------------
     def params(self) -> dict[str, Any]:
-        return {"field_weights": self.field_weights, "min_df": self.min_df,
-                "n_neighbors": self.n_neighbors}
+        return {"field_weights": self.field_weights, "min_df": self.min_df, "n_neighbors": self.n_neighbors}
 
     def save(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)

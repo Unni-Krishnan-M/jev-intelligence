@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 
+import { CLIENT_HEADER, clientIp, signClient } from "@/lib/client-sign";
 import { buildCsp, HSTS, newNonce } from "@/lib/csp";
 
 /**
@@ -11,6 +12,8 @@ import { buildCsp, HSTS, newNonce } from "@/lib/csp";
  *    http development is unaffected.
  * 3. Optimistic route guard: only checks that a session cookie exists. The API still verifies the
  *    JWT on every request, and client pages handle a 401 by sending the user to /login.
+ * 4. /api/* (the rewrite to FastAPI): a client-sent x-jev-client is dropped and, when JEV_PROXY_SECRET
+ *    is set, replaced by the signed client address (src/lib/client-sign.ts). No CSP on API calls.
  */
 const PROTECTED = ["/home", "/onboarding", "/recommendations", "/profile", "/history", "/favorites", "/admin", "/intel", "/me"];
 const AUTH_PAGES = ["/login", "/register"];
@@ -22,7 +25,16 @@ function secured(response: NextResponse, csp: string, https: boolean): NextRespo
   return response;
 }
 
-export function proxy(request: NextRequest) {
+export async function proxy(request: NextRequest) {
+  if (request.nextUrl.pathname.startsWith("/api/")) {
+    const headers = new Headers(request.headers);
+    headers.delete(CLIENT_HEADER); // never forward a client-supplied value
+    const secret = process.env.JEV_PROXY_SECRET;
+    const ip = secret ? clientIp(request.headers) : null;
+    if (secret && ip) headers.set(CLIENT_HEADER, await signClient(ip, secret));
+    return NextResponse.next({ request: { headers } });
+  }
+
   const https = process.env.JEV_HTTPS === "true";
   const nonce = newNonce();
   const csp = buildCsp(nonce, { dev: process.env.NODE_ENV === "development", https });
@@ -45,6 +57,6 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  // every page; not the API rewrite, build assets or the favicon
-  matcher: ["/((?!api/|_next/static|_next/image|favicon.ico).*)"],
+  // pages AND the API rewrite; not build assets or the favicon
+  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
 };

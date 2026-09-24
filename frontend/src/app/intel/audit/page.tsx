@@ -14,20 +14,22 @@ import useSWR from "swr";
 import { fmtDate } from "@/components/jev/admin/ui";
 import Link from "@/components/jev/intel/domain-context";
 import { PageHeader } from "@/components/jev/intel/page-header";
-import { FilterRow, IntelError, Pagination, RowsSkeleton } from "@/components/jev/intel/states";
+import { IntelError, Pagination, RowsSkeleton } from "@/components/jev/intel/states";
 import { EmptyState } from "@/components/jev/states";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { qs } from "@/lib/api";
+import { auditGroups, isFailureAction } from "@/lib/audit-actions";
 import { fmtValue, ownerHref } from "@/lib/intel";
 import type { AuditEntry, AuditPage } from "@/lib/intel-types";
 
 const LIMIT = 50;
-/** The actions the API writes (docs/intelligence.md 9.3). */
-const ACTIONS = ["all", "intel.run", "warning.transition", "feedback.create", "scenario.save", "model.activate", "auth.login.success", "auth.login.failure", "auth.register"];
+/** Every action the API writes (AUDIT_ACTIONS in backend/jev_api/models/enums.py), grouped by prefix. */
+const GROUPS = auditGroups();
 
 function ActionChip({ action }: { action: string }) {
-  const failed = action.endsWith(".failure");
+  const failed = isFailureAction(action);
   const Icon = failed ? XCircle : action.startsWith("auth.") ? LogIn : action.endsWith(".success") ? CheckCircle2 : Info;
   return (
     <span className="inline-flex items-center gap-1.5 whitespace-nowrap rounded border hairline px-1.5 py-0.5 font-mono text-xs">
@@ -41,6 +43,9 @@ function ActionChip({ action }: { action: string }) {
 function targetHref(e: AuditEntry): string | null {
   if (!e.target_type || !e.target_id) return null;
   if (e.target_type === "model") return "/admin/models";
+  if (e.target_type === "model_version" || e.target_type === "training_job") return "/intel/ops/models";
+  if (e.target_type === "ab_experiment") return `/intel/ops/experiments/${encodeURIComponent(e.target_id)}`;
+  if (e.target_type === "projections" || e.action.startsWith("events.")) return "/intel/ops/events";
   if (["signal", "trend", "anomaly", "forecast", "risk", "decision", "warning", "action"].includes(e.target_type)) return ownerHref(e.target_type, e.target_id);
   return null;
 }
@@ -88,7 +93,7 @@ export default function AuditPage() {
       <PageHeader
         eyebrow="trace"
         title="Audit log"
-        description="Who did what, when: pipeline runs, warning transitions, feedback, saved scenarios, model activations and sign-ins. Secrets and passwords are never recorded."
+        description="Who did what, when: pipeline runs, warnings, feedback, event ingestion and replays, retraining, promotions and rollbacks, experiments, tokens and sign-ins. Secrets and passwords are never recorded."
       />
 
       <div className="mb-5 flex flex-col gap-2.5">
@@ -96,7 +101,28 @@ export default function AuditPage() {
           <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
           <Input type="search" value={actorText} onChange={(e) => setActorText(e.target.value)} placeholder="Actor (email or system)" aria-label="Filter by actor" className="h-9 pl-8" />
         </form>
-        <FilterRow label="Action" value={action} onChange={(v) => { setAction(v); setOffset(0); }} options={ACTIONS.map((a) => ({ value: a, label: a === "all" ? "All" : a }))} />
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="eyebrow shrink-0" id="audit-action-label">Action</span>
+          <Select value={action} onValueChange={(v) => { setAction(v); setOffset(0); }}>
+            <SelectTrigger className="h-8 w-full max-w-xs font-mono text-xs" aria-labelledby="audit-action-label">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all" className="text-xs">All actions</SelectItem>
+              {GROUPS.map((g) => (
+                <SelectGroup key={g.group}>
+                  <SelectLabel className="eyebrow">{g.group}</SelectLabel>
+                  {g.actions.map((a) => <SelectItem key={a} value={a} className="font-mono text-xs">{a}</SelectItem>)}
+                </SelectGroup>
+              ))}
+            </SelectContent>
+          </Select>
+          {action !== "all" && (
+            <Button variant="ghost" size="sm" className="h-8 px-2 text-xs" onClick={() => { setAction("all"); setOffset(0); }} aria-label={`Clear action filter ${action}`}>
+              <X aria-hidden /> Clear
+            </Button>
+          )}
+        </div>
         {targetType && (
           <p className="flex items-center gap-2 text-xs">
             <span className="eyebrow">Target</span>

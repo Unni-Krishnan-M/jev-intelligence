@@ -35,7 +35,9 @@ def unemployment_frame(seed: int = 7) -> pd.DataFrame:
     for ent in dl["series"]:
         base = 4.5 + rng.normal(0, 0.8)
         cyc = 1.5 * np.sin(2 * np.pi * t / 110 + rng.uniform(0, 1))
-        shock = np.where((months >= "2020-04-01") & (months < "2021-01-01"), 7.0 * np.exp(-(t - t[243]) / 4), 0)
+        shock = np.where(
+            (months >= "2020-04-01") & (months < "2021-01-01"), 7.0 * np.exp(-(t - t[243]) / 4), 0
+        )
         walk = np.cumsum(rng.normal(0, 0.05, len(t)))
         v = np.round(np.clip(base + cyc + walk + shock, 1, 25), 1)
         et = "country" if ent == "US" else "state"

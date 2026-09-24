@@ -64,6 +64,7 @@ from jev_api.schemas import (
     WarningStatus,
     WarningUpdate,
 )
+from jev_api.schemas.intel import IntelLineage
 from jev_api.services import audit
 from jev_api.services.feedback import feedback_counts, latest_feedback
 from jev_api.services.intel import (
@@ -89,6 +90,18 @@ NO_RUN = "no intelligence run yet"
 Limit = Query(50, ge=1, le=200)
 Offset = Query(0, ge=0, le=MAX_OFFSET)
 RunId = Query(None, max_length=36)  # a run uuid
+# P2.4: which run a read without ?run_id= means. "live" (default): the latest live run; "replay": the
+# latest replay; "any": the latest of either. An explicit ?run_id= always wins (a replay included).
+RunMode = Literal["live", "replay", "any"]
+ModeQuery = Query(
+    "live", description='latest run of this mode when no run_id: "live" (default), "replay", "any"'
+)
+
+
+def mode_filter(mode: str) -> str | None:
+    return None if mode == "any" else mode
+
+
 SeriesId = Query(None, max_length=200)
 HISTOGRAM_BINS = 5
 
@@ -130,22 +143,24 @@ def read_domain(request: Request, db: DB, domain: str = DomainQuery) -> str:
 Domain = Annotated[str, Depends(read_domain)]
 
 
-def _resolve_run(db: Session, svc: IntelService, run_id: str | None, domain: str) -> IntelRun:
+def _resolve_run(
+    db: Session, svc: IntelService, run_id: str | None, domain: str, mode: str = "live"
+) -> IntelRun:
     if run_id:
         run = db.scalar(select(IntelRun).where(IntelRun.run_id == run_id, IntelRun.domain == domain))
         if run is None or run.status != "succeeded":
             raise HTTPException(status.HTTP_404_NOT_FOUND, "intelligence run not found")
         return run
-    latest = svc.latest_run(db, domain=domain)
+    latest = svc.latest_run(db, domain=domain, mode=mode_filter(mode))
     if latest is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, NO_RUN)
     return latest
 
 
 def _run_and_result(
-    db: Session, svc: IntelService, run_id: str | None, domain: str
+    db: Session, svc: IntelService, run_id: str | None, domain: str, mode: str = "live"
 ) -> tuple[IntelRun, dict[str, Any]]:
-    run = _resolve_run(db, svc, run_id, domain)
+    run = _resolve_run(db, svc, run_id, domain, mode)
     return run, svc.result_for(db, run)
 
 
@@ -169,6 +184,7 @@ def _page(
         "run_id": run.run_id,
         "as_of": iso(run.as_of),
         "domain": run.domain,
+        "mode": run.mode,
     }
 
 
@@ -206,16 +222,24 @@ def list_domains(_: AdminUser, db: DB, request: Request) -> dict[str, Any]:
 # --- runs -----------------------------------------------------------------------------------------
 @router.get("/runs", response_model=IntelRunList)
 def list_runs(
-    _: AdminUser, db: DB, domain: Domain, limit: int = Limit, offset: int = Offset
+    _: AdminUser,
+    db: DB,
+    domain: Domain,
+    limit: int = Limit,
+    offset: int = Offset,
+    mode: RunMode = Query("any", description='"live", "replay" or "any" (default: every run)'),
 ) -> dict[str, Any]:
+    where = [IntelRun.domain == domain]
+    if mode != "any":
+        where.append(IntelRun.mode == mode)
     runs = db.scalars(
         select(IntelRun)
-        .where(IntelRun.domain == domain)
+        .where(*where)
         .order_by(IntelRun.started_at.desc(), IntelRun.id.desc())
         .limit(limit)
         .offset(offset)
     ).all()
-    total = db.scalar(select(func.count(IntelRun.id)).where(IntelRun.domain == domain)) or 0
+    total = db.scalar(select(func.count(IntelRun.id)).where(*where)) or 0
     return {"items": [run_out(r) for r in runs], "total": total}
 
 
@@ -243,7 +267,9 @@ def trigger_run(
             headers={"Retry-After": str(60 - int(time.time()) % 60)},
         )
     try:
-        run = _service(request).run("manual", body.as_of, user, domain=key)
+        run = _service(request).run(
+            "manual", body.as_of, user, domain=key, knowledge_time=body.knowledge_time
+        )
     except UnknownDomainError as exc:
         raise unknown_domain(key) from exc
     except DomainUnavailableError as exc:
@@ -268,6 +294,29 @@ def get_run(
     return run_out(run)
 
 
+@router.get("/runs/{run_ref}/warnings", response_model=IntelPage)
+def run_warnings(
+    run_ref: Annotated[str, Path(max_length=64)],
+    _: AdminUser,
+    db: DB,
+    request: Request,
+    domain: Domain,
+    severity: Severity | None = None,
+    limit: int = Limit,
+    offset: int = Offset,
+) -> dict[str, Any]:
+    """The warning candidates one run raised, from its result (P2.4). For a replay this is the only
+    place its warnings exist: a replay never opens, updates or resolves a live warning."""
+    pk = parse_db_id(run_ref)
+    run = db.scalar(
+        select(IntelRun).where(IntelRun.id == pk if pk is not None else IntelRun.run_id == run_ref)
+    )
+    if run is None or run.domain != domain or run.status != "succeeded":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "intelligence run not found")
+    res = _service(request).result_for(db, run)
+    return _page(res.get("warnings", []), limit, offset, run, {"severity": severity})
+
+
 # --- run-backed lists -------------------------------------------------------------------------------
 @router.get("/signals", response_model=IntelPage)
 def signals(
@@ -276,13 +325,14 @@ def signals(
     request: Request,
     domain: Domain,
     run_id: str | None = RunId,
+    mode: RunMode = ModeQuery,
     kind: str | None = Query(None, max_length=32),
     entity_type: str | None = Query(None, max_length=32),
     direction: Literal["up", "down", "flat"] | None = None,
     limit: int = Limit,
     offset: int = Offset,
 ) -> dict[str, Any]:
-    run, res = _run_and_result(db, _service(request), run_id, domain)
+    run, res = _run_and_result(db, _service(request), run_id, domain, mode)
     filters = {"kind": kind, "entity_type": entity_type, "direction": direction}
     return _page(res.get("signals", []), limit, offset, run, filters)
 
@@ -294,13 +344,14 @@ def trends(
     request: Request,
     domain: Domain,
     run_id: str | None = RunId,
+    mode: RunMode = ModeQuery,
     direction: Literal["up", "down", "flat"] | None = None,
     metric: str | None = Query(None, max_length=32),
     entity: str | None = Query(None, max_length=200),
     limit: int = Limit,
     offset: int = Offset,
 ) -> dict[str, Any]:
-    run, res = _run_and_result(db, _service(request), run_id, domain)
+    run, res = _run_and_result(db, _service(request), run_id, domain, mode)
     filters = {"direction": direction, "metric": metric, "entity": entity}
     return _page(res.get("trends", []), limit, offset, run, filters)
 
@@ -312,6 +363,7 @@ def anomalies(
     request: Request,
     domain: Domain,
     run_id: str | None = RunId,
+    mode: RunMode = ModeQuery,
     kind: str | None = Query(None, max_length=32),
     severity: Severity | None = None,
     entity_type: str | None = Query(None, max_length=32),
@@ -319,7 +371,7 @@ def anomalies(
     limit: int = Limit,
     offset: int = Offset,
 ) -> dict[str, Any]:
-    run, res = _run_and_result(db, _service(request), run_id, domain)
+    run, res = _run_and_result(db, _service(request), run_id, domain, mode)
     filters = {"kind": kind, "severity": severity, "entity_type": entity_type, "suppressed": suppressed}
     return _page(res.get("anomalies", []), limit, offset, run, filters)
 
@@ -331,12 +383,13 @@ def risks(
     request: Request,
     domain: Domain,
     run_id: str | None = RunId,
+    mode: RunMode = ModeQuery,
     kind: str | None = Query(None, max_length=40),
     level: Severity | None = None,
     limit: int = Limit,
     offset: int = Offset,
 ) -> dict[str, Any]:
-    run, res = _run_and_result(db, _service(request), run_id, domain)
+    run, res = _run_and_result(db, _service(request), run_id, domain, mode)
     return _page(res.get("risks", []), limit, offset, run, {"kind": kind, "level": level})
 
 
@@ -347,11 +400,12 @@ def actions(
     request: Request,
     domain: Domain,
     run_id: str | None = RunId,
+    mode: RunMode = ModeQuery,
     priority: Literal["P1", "P2", "P3"] | None = None,
     limit: int = Limit,
     offset: int = Offset,
 ) -> dict[str, Any]:
-    run, res = _run_and_result(db, _service(request), run_id, domain)
+    run, res = _run_and_result(db, _service(request), run_id, domain, mode)
     return _page(res.get("actions", []), limit, offset, run, {"priority": priority})
 
 
@@ -362,9 +416,10 @@ def predictions(
     request: Request,
     domain: Domain,
     run_id: str | None = RunId,
+    mode: RunMode = ModeQuery,
     series_id: str | None = SeriesId,
 ) -> dict[str, Any]:
-    run, res = _run_and_result(db, _service(request), run_id, domain)
+    run, res = _run_and_result(db, _service(request), run_id, domain, mode)
     pred = res.get("predictions") or {}
     forecasts = pred.get("forecasts", [])
     if series_id:
@@ -386,9 +441,10 @@ def series(
     request: Request,
     domain: Domain,
     run_id: str | None = RunId,
+    mode: RunMode = ModeQuery,
 ) -> dict[str, Any]:
     """A series with its trend, anomalies and forecast (ids contain colons: volume:genre:Drama)."""
-    run, res = _run_and_result(db, _service(request), run_id, domain)
+    run, res = _run_and_result(db, _service(request), run_id, domain, mode)
     s = next((x for x in res.get("series", []) if x.get("id") == series_id), None)
     if s is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "series not found")
@@ -414,11 +470,13 @@ def _histogram(values: list[float]) -> list[dict[str, Any]]:
 
 
 @router.get("/status")
-def intel_status(_: AdminUser, db: DB, request: Request, domain: Domain) -> dict[str, Any]:
+def intel_status(
+    _: AdminUser, db: DB, request: Request, domain: Domain, mode: RunMode = ModeQuery
+) -> dict[str, Any]:
     svc = _service(request)
     info = svc.domain(domain)
-    latest_any = svc.latest_run(db, status=None, domain=domain)
-    latest = svc.latest_run(db, domain=domain)
+    latest_any = svc.latest_run(db, status=None, domain=domain, mode=mode_filter(mode))
+    latest = svc.latest_run(db, domain=domain, mode=mode_filter(mode))
     res = svc.result_for(db, latest) if latest else {}
     engine = request.app.state.engines.engine
     has_model = bool((info.get("capabilities") or {}).get("recommendation"))
@@ -449,16 +507,15 @@ def intel_status(_: AdminUser, db: DB, request: Request, domain: Domain) -> dict
         request.app.state.log.exception("database health check failed")
         db_ok = False
     pipeline = "never_run"
-    finished = db.scalar(
-        select(IntelRun.status)
-        .where(IntelRun.status != "running", IntelRun.domain == domain)
-        .order_by(IntelRun.started_at.desc(), IntelRun.id.desc())
-        .limit(1)
-    )
+    finished_q = select(IntelRun.status).where(IntelRun.status != "running", IntelRun.domain == domain)
+    if mode != "any":
+        finished_q = finished_q.where(IntelRun.mode == mode)
+    finished = db.scalar(finished_q.order_by(IntelRun.started_at.desc(), IntelRun.id.desc()).limit(1))
     if finished is not None:
         pipeline = "ok" if finished == "succeeded" else "failed"
     return {
         "domain": domain,
+        "mode": mode,
         "domain_info": {
             "name": info.get("name"),
             "available": bool(info.get("available")),
@@ -524,6 +581,19 @@ def get_warning(warning_id: IdPath, _: AdminUser, db: DB, domain: Domain) -> dic
     return warning_out(_warning(db, warning_id, domain), history=True)
 
 
+@router.get("/warnings/{warning_id}/lineage", response_model=IntelLineage)
+def warning_lineage(
+    warning_id: IdPath, _: AdminUser, db: DB, request: Request, domain: Domain, run_id: str | None = RunId
+) -> dict[str, Any]:
+    """warning -> its early_warning_level decision -> that decision's evidence bundle, in the run that
+    last saw the warning (or `?run_id=`, e.g. its first run)."""
+    w = _warning(db, warning_id, domain)
+    graph = _service(request).warning_lineage(db, w, run_id)
+    if graph is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "the warning is not part of that run")
+    return graph
+
+
 @router.patch("/warnings/{warning_id}", response_model=IntelWarningOut)
 def update_warning(
     warning_id: IdPath, body: WarningUpdate, user: AdminUser, db: DB, request: Request, domain: Domain
@@ -561,12 +631,16 @@ def list_decisions(
     batch_id: str | None = Query(None, max_length=64),
     limit: int = Limit,
     offset: int = Offset,
+    mode: RunMode = Query("live", description="decisions of these runs (no run_id): live, replay, any"),
 ) -> dict[str, Any]:
     q = select(IntelDecision).where(IntelDecision.domain == domain)
     if key:
         q = q.where(IntelDecision.key == key)
     if run_id:
         q = q.where(IntelDecision.run_id == run_id)
+    elif mode != "any":  # P2.4: replay decisions only when asked for (or by run_id)
+        runs_of_mode = select(IntelRun.run_id).where(IntelRun.domain == domain, IntelRun.mode == mode)
+        q = q.where(IntelDecision.run_id.in_(runs_of_mode))
     if entity:
         q = q.where(IntelDecision.entity == entity)
     if batch_id:
@@ -584,10 +658,15 @@ def list_decisions(
 
 @router.get("/decisions/batches", response_model=DecisionBatchList)
 def decision_batches(
-    _: AdminUser, db: DB, request: Request, domain: Domain, run_id: str | None = Query(None, max_length=36)
+    _: AdminUser,
+    db: DB,
+    request: Request,
+    domain: Domain,
+    run_id: str | None = Query(None, max_length=36),
+    mode: RunMode = ModeQuery,
 ) -> dict[str, Any]:
     """The run's multi-question decision calls (section 9.1). Declared before /decisions/{ref}."""
-    run, res = _run_and_result(db, _service(request), run_id, domain)
+    run, res = _run_and_result(db, _service(request), run_id, domain, mode)
     batches = res.get("decision_batches")
     if not isinstance(batches, list):
         # a result without decision_batches: rebuild the groups from the stored batch ids
@@ -619,7 +698,30 @@ def decision_batches(
                 b["keys"].append(key)
             b["policy_versions"][key] = pv
         batches = list(grouped.values())
-    return {"items": batches, "run_id": run.run_id, "as_of": iso(run.as_of), "domain": run.domain}
+    return {
+        "items": batches,
+        "run_id": run.run_id,
+        "as_of": iso(run.as_of),
+        "domain": run.domain,
+        "mode": run.mode,
+    }
+
+
+def _decision(db: Session, decision_ref: str, domain: str, run_id: str | None = None) -> IntelDecision:
+    """By db_id, or by contract id ("dec-…": the copy in ``run_id``, else the most recent run's)."""
+    pk = parse_db_id(decision_ref)
+    if pk is not None:
+        d = db.get(IntelDecision, pk)
+    else:
+        q = select(IntelDecision).where(
+            IntelDecision.decision_id == decision_ref, IntelDecision.domain == domain
+        )
+        if run_id:
+            q = q.where(IntelDecision.run_id == run_id)
+        d = db.scalar(q.order_by(IntelDecision.id.desc()).limit(1))
+    if d is None or d.domain != domain:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "decision not found")
+    return d
 
 
 @router.get("/decisions/{decision_ref}", response_model=IntelDecisionOut)
@@ -627,19 +729,28 @@ def get_decision(
     decision_ref: Annotated[str, Path(max_length=64)], _: AdminUser, db: DB, domain: Domain
 ) -> dict[str, Any]:
     """By db_id, or by contract id ("dec-…": the most recent run's copy of that decision)."""
-    pk = parse_db_id(decision_ref)
-    if pk is not None:
-        d = db.get(IntelDecision, pk)
-    else:
-        d = db.scalar(
-            select(IntelDecision)
-            .where(IntelDecision.decision_id == decision_ref, IntelDecision.domain == domain)
-            .order_by(IntelDecision.id.desc())
-            .limit(1)
-        )
-    if d is None or d.domain != domain:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "decision not found")
+    d = _decision(db, decision_ref, domain)
     return decision_out(d, _decision_feedback(db, [d.decision_id]).get(d.decision_id))
+
+
+@router.get("/decisions/{decision_ref}/lineage", response_model=IntelLineage)
+def decision_lineage(
+    decision_ref: Annotated[str, Path(max_length=64)],
+    _: AdminUser,
+    db: DB,
+    request: Request,
+    domain: Domain,
+    run_id: str | None = RunId,
+) -> dict[str, Any]:
+    """The evidence bundle of a decision (P2.4): decision -> evidence refs -> run objects (signals,
+    trends, anomalies, forecasts, risks, decisions) -> series -> data sources -> the run (mode,
+    versions, config hash, input fingerprint, events watermark). `complete` is false when a ref does
+    not resolve inside its run. A contract id resolves to the copy in `?run_id=` or the newest run."""
+    d = _decision(db, decision_ref, domain, run_id)
+    graph = _service(request).decision_lineage(db, d)
+    if graph is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "the decision's run result is not available")
+    return graph
 
 
 # --- feedback ---------------------------------------------------------------------------------------
@@ -978,6 +1089,7 @@ def evidence(
     request: Request,
     domain: Domain,
     run_id: str | None = RunId,
+    mode: RunMode = ModeQuery,
     owner_type: EvidenceOwner | None = None,
     owner_id: str | None = Query(None, max_length=200),
     kind: str | None = Query(None, max_length=16),
@@ -987,7 +1099,7 @@ def evidence(
 ) -> dict[str, Any]:
     """Every Evidence item of the latest (or `?run_id=`) run with its owner; `q` searches the label,
     detail and owner title (case-insensitive)."""
-    run = _resolve_run(db, _service(request), run_id, domain)
+    run = _resolve_run(db, _service(request), run_id, domain, mode)
     query = select(IntelEvidenceRow).where(IntelEvidenceRow.run_id == run.id)
     if owner_type:
         query = query.where(IntelEvidenceRow.owner_type == owner_type)
@@ -1075,6 +1187,7 @@ def history(
     domain: Domain,
     key: str = Query(..., min_length=1, max_length=200),
     limit: int = Query(100, ge=1, le=500),
+    mode: RunMode = ModeQuery,
 ) -> dict[str, Any]:
     """One object across successful runs, oldest -> newest (the most recent `limit` points).
     `key` = signal/anomaly dedup_key, trend series_id, risk key (risk:<kind>:<entity>), or any
@@ -1095,10 +1208,13 @@ def history(
             select(key_col).join(IntelRun, in_domain[0]).where(id_col == key, in_domain[1]).limit(1)
         )
         resolved = by_id if by_id is not None else key
+    where = [key_col == resolved, IntelRun.status == "succeeded", IntelRun.domain == domain]
+    if mode != "any":  # P2.4: history is the live timeline unless a replay view is asked for
+        where.append(IntelRun.mode == mode)
     rows = db.execute(
         select(model, IntelRun)
         .join(IntelRun, model.run_id == IntelRun.id)
-        .where(key_col == resolved, IntelRun.status == "succeeded", IntelRun.domain == domain)
+        .where(*where)
         .order_by(IntelRun.started_at.desc(), IntelRun.id.desc(), model.id.desc())
         .limit(limit)
     ).all()

@@ -382,7 +382,7 @@ def run_pipeline(
     processed_dir: Path = PROCESSED_DIR,
     models_dir: Path = MODELS_DIR,
     experiments_dir: Path = EXPERIMENTS_DIR,
-    activate: bool = True,
+    activate: bool = False,  # candidates are gated before promotion (docs/RETRAINING_AND_MODEL_GOVERNANCE.md)
     train_production: bool = True,
     fixed_models: dict[str, Any] | None = None,
 ) -> dict[str, Any]:

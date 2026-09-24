@@ -22,6 +22,7 @@ class IntelPage(BaseModel):
     run_id: str | None
     as_of: str | None
     domain: str = "movie"
+    mode: str = "live"  # P2.4: the mode of the run the page was read from
 
 
 DomainKey = Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9:_-]{0,63}$")]
@@ -33,6 +34,8 @@ class RunTrigger(BaseModel):
     # "YYYY-MM-DD" (UTC midnight) or a full ISO timestamp; omitted = the domain's default (movie: the
     # last MovieLens event; generic: now)
     as_of: str | None = Field(default=None, max_length=40)
+    # replays only (P2.4 + WS1): events ingested after this are unknown to the run; default = as_of
+    knowledge_time: str | None = Field(default=None, max_length=40)
 
 
 class IntelRunOut(BaseModel):
@@ -51,6 +54,8 @@ class IntelRunOut(BaseModel):
     summary: dict[str, Any] | None
     stage_ms: dict[str, Any]
     error: str | None
+    event_watermark: dict[str, Any] | None = None  # WS1: the events the run read (lineage)
+    mode: str = "live"  # P2.4: "replay" when the run was asked for an explicit as_of
 
 
 class IntelRunList(BaseModel):
@@ -269,6 +274,24 @@ class DecisionBatchList(BaseModel):
     run_id: str
     as_of: str | None
     domain: str = "movie"
+    mode: str = "live"
+
+
+class IntelLineage(BaseModel):
+    """GET /intel/decisions/{id}/lineage and /intel/warnings/{id}/lineage (docs/DECISION_ENGINE.md)."""
+
+    version: str
+    root: dict[str, Any]
+    run: dict[str, Any]  # mode, versions, config_hash, input_fingerprint, event_watermark
+    evidence: list[dict[str, Any]]  # the root's evidence items with `resolves_to`
+    nodes: list[dict[str, Any]]  # {id "<type>:<ref>", type, ref, title, ...}
+    edges: list[dict[str, Any]]  # {from, to, relation}
+    series: list[str]
+    sources: list[str]
+    node_types: list[str]
+    unresolved: list[dict[str, Any]]
+    complete: bool
+    event_watermark: dict[str, Any] | None = None
 
 
 class EvaluationRunOut(BaseModel):

@@ -26,10 +26,13 @@ from jev_api.models import (
     MovieGenre,
     User,
 )
-from jev_api.security import hash_password
+from jev_api.models.governance import ModelGovernance
+from jev_api.security import hash_password, verify_password
+from jev_api.services import audit
 from jev_ml.data.dataset import load_movies, split_list
+from jev_ml.governance.retrain import load_lineage
 from jev_ml.paths import PROCESSED_DIR
-from jev_ml.registry import active_version, list_manifests
+from jev_ml.registry import active_version, list_manifests, read_registry
 
 log = logging.getLogger(__name__)
 _METRIC_KEY = re.compile(r"^(?P<metric>[a-z_][a-z0-9_]*)@(?P<k>\d+)$")
@@ -110,7 +113,57 @@ def sync_model_versions(db: Session) -> int:
             db.add(mv)
             n += 1
         mv.is_active = m["version"] == active
+    db.flush()
+    sync_governance(db)
     db.commit()
+    return n
+
+
+def sync_governance(db: Session) -> int:
+    """Mirror models/registry.json lifecycle states (and lineage.json) into model_governance.
+
+    The registry file is authoritative for the state (it decides what serves); the table adds what
+    only the database keeps (gate results, who promoted). Returns the number of rows added."""
+    settings = get_settings()
+    reg = read_registry(settings.models_dir)
+    states: dict[str, str] = reg["states"]
+    n = 0
+    rows = {g.version: g for g in db.scalars(select(ModelGovernance)).all()}
+    for version in reg["versions"]:
+        if not (settings.models_dir / version / "manifest.json").exists():
+            continue
+        row = rows.get(version)
+        if row is None:
+            lineage = load_lineage(version, settings.models_dir) or {}
+            row = ModelGovernance(
+                version=version,
+                state=states.get(version, "candidate"),
+                snapshot_id=lineage.get("snapshot_id"),
+                job_id=lineage.get("job_id"),
+                decision_id=lineage.get("decision_id"),
+                config_hash=lineage.get("config_hash"),
+                git_commit=(lineage.get("git_commit") or None) and str(lineage["git_commit"])[:40],
+                seed=lineage.get("seed"),
+                lineage=lineage,
+                gate_reasons=[],
+            )
+            gate_file = settings.models_dir / version / "gate.json"  # written by the governance gate
+            if gate_file.exists():
+                try:
+                    gate = json.loads(gate_file.read_text())
+                    row.gate, row.gate_passed = gate, bool(gate.get("passed"))
+                    row.gate_reasons = list(gate.get("reasons") or [])
+                    row.gated_against = gate.get("incumbent")
+                    row.gated_at = _parse_ts(gate.get("evaluated_at"))
+                except (OSError, ValueError):
+                    log.warning("unreadable gate.json for %s", version)
+            db.add(row)
+            n += 1
+        state = states.get(version, row.state)
+        if row.state != state:
+            if state == "retired" and row.retired_at is None:
+                row.retired_at = datetime.now(UTC)
+            row.state = state
     return n
 
 
@@ -247,8 +300,20 @@ def ensure_admin(db: Session) -> None:
         db.commit()
         log.info("created admin account from JEV_ADMIN_EMAIL")
     elif not user.is_admin:
+        # Registration is open, so anyone may have registered this address first. Promote only when the
+        # account's password is the configured admin password (proof that the operator owns it);
+        # otherwise leave it a member and tell the operator (docs/SECURITY_AUDIT_PHASE2.md, F1).
+        if not verify_password(s.admin_password.get_secret_value(), user.password_hash):
+            log.error(
+                "JEV_ADMIN_EMAIL belongs to an existing member account whose password is not "
+                "JEV_ADMIN_PASSWORD: not promoted. Promote it deliberately or choose another address."
+            )
+            return
         user.is_admin = True
+        user.token_version += 1  # sessions issued before the promotion carry the old role
+        audit.record(db, "user.role_change", None, "user", user.id, {"is_admin": True, "by": "ensure_admin"})
         db.commit()
+        log.warning("promoted existing account %s to admin (JEV_ADMIN_EMAIL, password verified)", user.id)
 
 
 def sync_all(db: Session) -> dict[str, int]:

@@ -522,7 +522,7 @@ class SeasonContext:
         if n_future not in self._cache:
             last = self.periods[-1]
             fut = pd.period_range(last + 1, periods=n_future, freq=last.freq) if n_future else None
-            idx = self.periods if fut is None else self.periods.append(fut)
+            idx = self.periods if fut is None else pd.PeriodIndex(self.periods.append(fut))
             self._cache[n_future] = season_classes(idx, self.period, self.calendar)
         return self._cache[n_future]
 
@@ -662,10 +662,10 @@ def model_paths(
     """Transformed-scale forecasts from every origin (row j: fitted on y[:origins[j]] only).
     Returns (paths, trend parts, params of the last origin)."""
     cap = cfg.forecast_history_months
-    O = len(origins)
+    n_o = len(origins)
     steps = np.arange(horizon)
-    P = np.full((O, horizon), np.nan)
-    T = np.zeros((O, horizon))
+    P = np.full((n_o, horizon), np.nan)
+    T = np.zeros((n_o, horizon))
     params: dict[str, Any] = {}
     m = ctx.period or 1
     if name in ("naive", "moving_average", "holt_damped"):
@@ -701,7 +701,9 @@ def model_paths(
                 pos = pos_of.get(int(c), np.zeros(0, dtype=np.int64))
                 k = np.searchsorted(pos, origins[sel]) - 1  # latest same-class period before o
                 fall = origins[sel] - 1
-                P[sel, h] = y[np.where(k >= 0, pos[np.clip(k, 0, max(len(pos) - 1, 0))] if len(pos) else fall, fall)]
+                P[sel, h] = y[
+                    np.where(k >= 0, pos[np.clip(k, 0, max(len(pos) - 1, 0))] if len(pos) else fall, fall)
+                ]
         return P, T, {}
     if name in ("holt_winters", "holt_winters_calendar"):
         if name == "holt_winters":
@@ -731,17 +733,17 @@ def _scales(raw: np.ndarray, origins: np.ndarray, lag: int, cap: int) -> np.ndar
 
 
 def _bt_from_paths(
-    P: np.ndarray, y: np.ndarray, raw: np.ndarray, origins: np.ndarray, transform: str, scales: np.ndarray
+    paths: np.ndarray, y: np.ndarray, raw: np.ndarray, origins: np.ndarray, transform: str, scales: np.ndarray
 ) -> _Backtest:
     n = len(raw)
-    horizon = P.shape[1]
+    horizon = paths.shape[1]
     tgt = origins[:, None] + np.arange(horizon)[None, :]
     inside = tgt < n
     tc = np.clip(tgt, 0, n - 1)
     truth_raw = np.where(inside, raw[tc], np.nan)
     truth_y = np.where(inside, y[tc], np.nan)
-    f_raw = _itf(transform, P)
-    resid = truth_y - P
+    f_raw = _itf(transform, paths)
+    resid = truth_y - paths
     abs_err = np.abs(truth_raw - f_raw)
     with np.errstate(invalid="ignore", divide="ignore"):
         scaled = np.where(scales[:, None] > 0, abs_err / np.where(scales > 0, scales, 1.0)[:, None], np.nan)
@@ -914,7 +916,11 @@ def forecast_series_seasonal(
         "issued_at": as_of_key,
         "features_used": [
             f"{'log1p(' + s.metric + ')' if sd.transform == 'log1p' else s.metric} history, {hist_n} {unit}s"
-            + (f"; season classes ({s.calendar or 'cycle position'}, period {s.seasonal_period})" if s.seasonal_period else "")
+            + (
+                f"; season classes ({s.calendar or 'cycle position'}, period {s.seasonal_period})"
+                if s.seasonal_period
+                else ""
+            )
         ],
         "points": scenario_points(state, path, horizon),
         "backtest": backtest,
@@ -967,9 +973,13 @@ def rolling_evaluation(
         sd.lag = int(scale_lag)
     n = len(sd.raw)
     if issue_idx is None:
-        per = sd.months
-        lo = 0 if start is None else int(np.searchsorted(per.start_time, pd.Timestamp(start)))
-        hi = n - 1 if end is None else int(np.searchsorted(per.start_time, pd.Timestamp(end), side="right")) - 1
+        starts = sd.months.start_time.to_numpy().astype("datetime64[ns]")
+        lo = 0 if start is None else int(np.searchsorted(starts, np.datetime64(pd.Timestamp(start), "ns")))
+        hi = (
+            n - 1
+            if end is None
+            else int(np.searchsorted(starts, np.datetime64(pd.Timestamp(end), "ns"), side="right")) - 1
+        )
         issue_idx = np.arange(max(lo, 1), hi + 1, step)
     N = cfg.forecast_backtest_origins
     issue_idx = issue_idx[issue_idx >= cfg.forecast_min_history + N]
@@ -981,13 +991,14 @@ def rolling_evaluation(
     if "naive" not in bts:
         return None
     names = [m for m in sd.models if m in bts]
-    extra_bench = {}
+    extra_bench: dict[str, _Backtest] = {}
     bp = benchmark_period or sd.ctx.period
     if bp and ("seasonal_naive" not in bts or bp != sd.ctx.period):
         bctx = SeasonContext(sd.ctx.freq, bp, None, sd.ctx.periods)
         extra_sd = SeasonalData(**{**sd.__dict__, "models": ("seasonal_naive",), "ctx": bctx})
         extra_bench = backtest_all(extra_sd, cfg, horizon, origins)[0]
-    bench_bt = {**{k: bts[k] for k in ("naive", "seasonal_naive") if k in bts}, **extra_bench}
+    bench_bt: dict[str, _Backtest] = {k: bts[k] for k in ("naive", "seasonal_naive") if k in bts}
+    bench_bt.update(extra_bench)
     sel_count = dict.fromkeys(names, 0)
     rows_scaled: dict[str, list[np.ndarray]] = {"model": [], **{k: [] for k in bench_bt}}
     ae: list[np.ndarray] = []
@@ -1025,6 +1036,7 @@ def rolling_evaluation(
         ref = bench_bt[k].abs_err[rows]
         ok = np.isfinite(ref) & np.isfinite(A)
         return fnum(float(A[ok].mean() / ref[ok].mean()), 4) if ok.any() and ref[ok].mean() > 0 else None
+
     return {
         "series_id": s.id,
         "issue_times": len(issue_idx),

@@ -21,8 +21,9 @@ from jev_ml.signals import UserProfile
 class ItemKNNRecommender(Recommender):
     name = "itemknn"
 
-    def __init__(self, k: int = 100, shrinkage: float = 10.0, binary: bool = False,
-                 block_size: int = 1024) -> None:
+    def __init__(
+        self, k: int = 100, shrinkage: float = 10.0, binary: bool = False, block_size: int = 1024
+    ) -> None:
         self.k = k
         self.shrinkage = shrinkage
         self.binary = binary
@@ -46,16 +47,24 @@ class ItemKNNRecommender(Recommender):
             rows.append(r)
             cols.append(c)
             vals.append(v)
-        self.sim = sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
-                                 shape=(n, n), dtype=np.float32)
+        self.sim = sp.csr_matrix(
+            (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+            shape=(n, n),
+            dtype=np.float32,
+        )
         return self
 
     def score(self, profile: UserProfile) -> np.ndarray:
         n = self.sim.shape[0]
         if profile.n_interactions == 0:
             return np.zeros(n)
-        u = sp.csr_matrix((profile.weights.astype(np.float32),
-                           (np.zeros(len(profile.items), dtype=np.int64), profile.items)), shape=(1, n))
+        u = sp.csr_matrix(
+            (
+                profile.weights.astype(np.float32),
+                (np.zeros(len(profile.items), dtype=np.int64), profile.items),
+            ),
+            shape=(1, n),
+        )
         return np.asarray((u @ self.sim).toarray()).ravel().astype(np.float64)
 
     def explain(self, profile: UserProfile, item: int) -> list[Contribution]:
@@ -64,8 +73,11 @@ class ItemKNNRecommender(Recommender):
         col = np.asarray(self.sim[profile.items, item].toarray()).ravel()
         contrib = col * profile.weights
         order = np.argsort(-contrib)[:3]
-        return [Contribution(kind="item", item=int(profile.items[j]), value=float(contrib[j]))
-                for j in order if contrib[j] > 0]
+        return [
+            Contribution(kind="item", item=int(profile.items[j]), value=float(contrib[j]))
+            for j in order
+            if contrib[j] > 0
+        ]
 
     def params(self) -> dict[str, Any]:
         return {"k": self.k, "shrinkage": self.shrinkage, "binary": self.binary}

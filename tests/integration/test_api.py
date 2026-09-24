@@ -160,11 +160,14 @@ def test_admin_endpoints(client):
     summary = client.get("/models/active/summary").json()
     assert summary["model_version"] and summary["n_items"] > 0 and isinstance(summary["comparison"], dict)
 
-    # switch the active model and back
+    # Phase 2: activation is gate-enforced. An ungated candidate is refused (409 with the blockers)
+    # and the serving model is unchanged; re-activating the active one reloads it. Promotion and
+    # rollback are tested in tests/integration/test_governance_api.py.
     inactive = next(m for m in models if not m["is_active"])
     active = next(m for m in models if m["is_active"])
-    assert client.post(f"/models/{inactive['id']}/activate", headers=adm).json()["is_active"]
-    assert client.get("/health/ml").json()["model_version"] == inactive["version"]
+    r = client.post(f"/models/{inactive['id']}/activate", headers=adm)
+    assert r.status_code == 409 and r.json()["blockers"] and isinstance(r.json()["detail"], str)
+    assert client.get("/health/ml").json()["model_version"] == active["version"]
     assert client.post(f"/models/{active['id']}/activate", headers=adm).status_code == 200
 
 

@@ -548,8 +548,9 @@ migration `0002_intelligence`. Tests: `tests/integration/test_intel_api.py`.
   `reopened_from` points at the previous row for the key when that row was resolved, or was
   dismissed and then expired or escalated.
 - Every status change writes an `intel_warning_events` row. The system is the actor for creation
-  (the note says detected / reopened / escalated); a PATCH records the user's email. Open warnings
-  are never auto-resolved when a run stops producing them. Operators close them.
+  (the note says detected / reopened / escalated); a PATCH records the user's email. Since
+  Phase 2 (WS4a), a live run auto-resolves an open warning whose key has been absent for K consecutive
+  live runs, up to `JEV_INTEL_AUTO_RESOLVE_MAX_SEVERITY`; replays never do (docs/EARLY_WARNING_SYSTEM.md).
 
 ### Decisions, feedback, metrics
 - `intel_decisions` stores every decision of every run (unique per `(run_id, decision_id)`).

@@ -166,6 +166,57 @@ def main() -> None:
         page.goto(f"{base}/intel/audit")
         shot(page, "24-intel-audit", full=False)
 
+        # Phase 2 operations: model lifecycle, an online experiment, the event log, decision lineage.
+        # Each is skipped (with a note) when the API answering predates the endpoint.
+        csrf = {"X-JEV-CSRF": "1"}
+        if page.request.get(f"{base}/api/governance/models").ok:
+            page.goto(f"{base}/intel/ops/models")
+            page.wait_for_selector("text=Versions")
+            shot(page, "31-ops-model-lifecycle")
+        else:
+            print("skip 31: no /governance/models")
+        exps = page.request.get(f"{base}/api/experiments/online/list")
+        if exps.ok:
+            items = exps.json()["items"]
+            key = items[0]["key"] if items else f"shot-{int(time.time())}"
+            if not items:
+                page.request.post(
+                    f"{base}/api/experiments/online",
+                    headers=csrf,
+                    data={
+                        "key": key,
+                        "name": "MMR λ 0.6 against the champion",
+                        "primary_metric": "interaction_rate",
+                        "variants": [
+                            {"name": "control", "is_control": True},
+                            {"name": "diverse", "config": {"hybrid_overrides": {"diversity_lambda": 0.6}}},
+                        ],
+                    },
+                )
+                page.request.post(f"{base}/api/experiments/online/{key}/start", headers=csrf)
+            page.goto(f"{base}/intel/ops/experiments/{key}")
+            page.wait_for_selector("h1")
+            shot(page, "32-ops-experiment")
+        else:
+            print("skip 32: no /experiments/online")
+        if page.request.get(f"{base}/api/events/health").ok:
+            page.goto(f"{base}/intel/ops/events")
+            page.wait_for_selector("h1")
+            shot(page, "33-ops-events")
+        else:
+            print("skip 33: no /events/health")
+        decisions = page.request.get(f"{base}/api/intel/decisions?limit=1").json().get("items", [])
+        if decisions and page.request.get(f"{base}/api/intel/decisions/{decisions[0]['db_id']}/lineage").ok:
+            page.goto(f"{base}/intel/decisions/{decisions[0]['db_id']}")
+            page.wait_for_selector("text=Input fingerprint")
+            page.evaluate(
+                "[...document.querySelectorAll('h3')].find(h => h.textContent.includes('Lineage'))"
+                "?.scrollIntoView({block: 'start'}); window.scrollBy(0, -96)"
+            )
+            shot(page, "34-decision-lineage", full=False)
+        else:
+            print("skip 34: no decision lineage")
+
         # small screens: phone and light theme
         m = browser.new_context(
             viewport={"width": 390, "height": 844}, device_scale_factor=2, color_scheme="light"

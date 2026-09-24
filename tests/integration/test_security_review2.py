@@ -13,11 +13,12 @@ import logging
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from conftest import admin_headers, register
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, func, insert, inspect, select
+from sqlalchemy import JSON, column, create_engine, func, insert, inspect, select, table
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from test_intel_api import synthetic_frames
@@ -281,7 +282,7 @@ def _migration_roundtrip(url: str) -> None:
     from alembic import command
     from alembic.config import Config
 
-    from jev_api.models import Movie, Recommendation, RecommendationFeedback, User
+    from jev_api.models import Movie, Recommendation, RecommendationFeedback
     from jev_ml.paths import ROOT
 
     cfg = Config(str(ROOT / "alembic.ini"))
@@ -293,9 +294,34 @@ def _migration_roundtrip(url: str) -> None:
     t0 = datetime(2026, 9, 1, tzinfo=UTC)
     try:
         with Session(eng) as db:
-            users = [User(email=f"m{i}@example.com", password_hash="x", display_name="m") for i in range(2)]
-            movie = Movie(id=1, title="One")
-            db.add_all([*users, movie])
+            # users as of 0003 (the ORM model has token_version, added in 0010)
+            cols = ("id", "email", "password_hash", "display_name", "is_admin", "onboarding_completed")
+            users_t = table(
+                "users",
+                *(column(c) for c in (*cols, "profile_version", "created_at", "updated_at")),
+                column("recommendation_prefs", JSON),
+            )
+            users = [
+                SimpleNamespace(
+                    id=db.execute(
+                        insert(users_t)
+                        .values(
+                            email=f"m{i}@example.com",
+                            password_hash="x",
+                            display_name="m",
+                            is_admin=False,
+                            onboarding_completed=False,
+                            profile_version=0,
+                            recommendation_prefs={},
+                            created_at=t0,
+                            updated_at=t0,
+                        )
+                        .returning(users_t.c.id)
+                    ).scalar_one()
+                )
+                for i in range(2)
+            ]
+            db.add(Movie(id=1, title="One"))
             db.flush()
             # core inserts with explicit columns: the ORM model has columns added after 0003 (0005)
             rec_ids = [

@@ -62,6 +62,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+from jev_ml.core.common import evidence, fnum, iso_from_epoch, short_hash, stable_id
 from jev_ml.core.drift import (
     DAY,
     INSUFFICIENT,
@@ -79,7 +80,6 @@ from jev_ml.core.drift import (
     summarize,
 )
 from jev_ml.engine import Interaction, RecommendationEngine
-from jev_ml.intel.common import evidence, fnum, iso_from_epoch, short_hash, stable_id
 from jev_ml.signals import UserProfile
 
 DOMAIN = "movie"
@@ -502,7 +502,7 @@ def _decision(
     policy: str,
     fallback: str | None,
 ) -> dict[str, Any]:
-    """Same wire shape as jev_ml.intel.decisions._decision (+ ``domain``)."""
+    """Same wire shape as jev_ml.core.decisions.decision (+ ``domain``)."""
     return {
         "id": stable_id("dec", SPEC_ID, entity, as_of_key),
         "key": SPEC_ID,

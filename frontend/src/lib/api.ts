@@ -38,9 +38,12 @@ export async function api<T>(path: string, init: RequestInit & { json?: unknown 
     }
   }
   if (!res.ok) {
-    const b = (body ?? {}) as { detail?: unknown; request_id?: string; errors?: unknown };
-    const detail = typeof b.detail === "string" ? b.detail : res.statusText || "request failed";
-    throw new ApiError(res.status, detail, b.request_id, b.errors);
+    const b = (body ?? {}) as { detail?: unknown; request_id?: string; errors?: unknown; blockers?: unknown };
+    // governance answers 409 with {detail, blockers}; older builds nested {message, blockers} in detail
+    const obj = b.detail && typeof b.detail === "object" && !Array.isArray(b.detail) ? (b.detail as { message?: unknown; blockers?: unknown }) : null;
+    const detail = typeof b.detail === "string" ? b.detail : typeof obj?.message === "string" ? obj.message : res.statusText || "request failed";
+    const blockers = Array.isArray(b.blockers) ? b.blockers : obj && Array.isArray(obj.blockers) ? obj.blockers : null;
+    throw new ApiError(res.status, detail, b.request_id, blockers ?? b.errors);
   }
   return body as T;
 }

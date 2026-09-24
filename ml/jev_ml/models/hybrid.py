@@ -44,10 +44,16 @@ SIGNALS = ("content", "collaborative", "latent", "popularity", "preference", "re
 
 @dataclass
 class HybridConfig:
-    weights: dict[str, float] = field(default_factory=lambda: {
-        "content": 0.20, "collaborative": 0.30, "latent": 0.35,
-        "popularity": 0.08, "preference": 0.05, "recency": 0.02,
-    })
+    weights: dict[str, float] = field(
+        default_factory=lambda: {
+            "content": 0.20,
+            "collaborative": 0.30,
+            "latent": 0.35,
+            "popularity": 0.08,
+            "preference": 0.05,
+            "recency": 0.02,
+        }
+    )
     behavioral_ramp: int = 10
     candidates_per_source: int = 200
     normalization: str = "minmax"  # "minmax" | "rank"
@@ -96,9 +102,15 @@ class RecommendationFilters:
 
 
 class HybridRanker:
-    def __init__(self, movies: pd.DataFrame, popularity: PopularityRecommender,
-                 content: ContentRecommender, itemknn: ItemKNNRecommender, als: ALSRecommender,
-                 config: HybridConfig | None = None) -> None:
+    def __init__(
+        self,
+        movies: pd.DataFrame,
+        popularity: PopularityRecommender,
+        content: ContentRecommender,
+        itemknn: ItemKNNRecommender,
+        als: ALSRecommender,
+        config: HybridConfig | None = None,
+    ) -> None:
         self.movies = movies.reset_index(drop=True)
         self.popularity = popularity
         self.content = content
@@ -110,7 +122,8 @@ class HybridRanker:
         gcount = np.asarray(self.genre_matrix.sum(axis=1)).ravel()
         self._genre_norm = 1.0 / np.sqrt(np.maximum(gcount, 1.0))
         self._primary_genre = np.asarray(
-            [(split_list(g) or [""])[0] for g in self.movies["genres"]], dtype=object)
+            [(split_list(g) or [""])[0] for g in self.movies["genres"]], dtype=object
+        )
         years = pd.to_numeric(self.movies["year"], errors="coerce").to_numpy(dtype=np.float64)
         self._years = years
         ref = np.nanmax(years) if np.isfinite(years).any() else 2020.0
@@ -145,7 +158,7 @@ class HybridRanker:
     def raw_signals(self, profile: UserProfile) -> dict[str, np.ndarray]:
         content = self.content.score(profile)
         if self.config.content_support_damping:
-            content = np.maximum(content, 0.0) * self._support_prior ** self.config.content_support_damping
+            content = np.maximum(content, 0.0) * self._support_prior**self.config.content_support_damping
         return {
             "content": content,
             "collaborative": self.itemknn.score(profile),
@@ -219,8 +232,11 @@ class HybridRanker:
         if filters:
             if filters.genres:
                 wanted = [self.genres.index(g) for g in filters.genres if g in self.genres]
-                has = np.asarray(self.genre_matrix[:, wanted].sum(axis=1)).ravel() > 0 if wanted else \
-                    np.zeros(self.n_items, dtype=bool)
+                has = (
+                    np.asarray(self.genre_matrix[:, wanted].sum(axis=1)).ravel() > 0
+                    if wanted
+                    else np.zeros(self.n_items, dtype=bool)
+                )
                 mask |= ~has
             if filters.year_min is not None:
                 mask |= ~(self._years >= filters.year_min)
@@ -247,8 +263,14 @@ class HybridRanker:
         return (values - lo) / (hi - lo)
 
     # --- main entry point ------------------------------------------------------------------------------
-    def rank(self, profile: UserProfile, k: int = 20, offset: int = 0,
-             filters: RecommendationFilters | None = None, explain: bool = True) -> list[RankedItem]:
+    def rank(
+        self,
+        profile: UserProfile,
+        k: int = 20,
+        offset: int = 0,
+        filters: RecommendationFilters | None = None,
+        explain: bool = True,
+    ) -> list[RankedItem]:
         cfg = self.config
         need = offset + k
         mask = self.filter_mask(profile, filters)
@@ -288,8 +310,11 @@ class HybridRanker:
         # diversity: MMR on the top pool
         pool_n = min(len(order), max(cfg.diversity_pool, need))
         pool = order[:pool_n]
-        selected = self._mmr(cands[pool], score[pool], need) if cfg.diversity_lambda < 1.0 else \
-            list(range(len(pool)))
+        selected = (
+            self._mmr(cands[pool], score[pool], need)
+            if cfg.diversity_lambda < 1.0
+            else list(range(len(pool)))
+        )
         chosen = [pool[i] for i in selected]
         if cfg.max_per_genre:
             chosen = self._genre_cap(chosen, cands, need)
@@ -297,9 +322,15 @@ class HybridRanker:
         results: list[RankedItem] = []
         for pos in chosen[offset:need]:
             item = int(cands[pos])
-            sig = {name: {"raw": float(raw[name][item]), "normalized": float(norm[name][pos]),
-                          "weight": float(weights[name]),
-                          "contribution": float(weights[name] * norm[name][pos])} for name in SIGNALS}
+            sig = {
+                name: {
+                    "raw": float(raw[name][item]),
+                    "normalized": float(norm[name][pos]),
+                    "weight": float(weights[name]),
+                    "contribution": float(weights[name] * norm[name][pos]),
+                }
+                for name in SIGNALS
+            }
             dominant = max(SIGNALS, key=lambda s: (sig[s]["contribution"], -SIGNALS.index(s)))
             ri = RankedItem(item=item, score=float(score[pos]), signals=sig, dominant=dominant)
             if explain:
@@ -337,8 +368,9 @@ class HybridRanker:
                 tail.append(pos)
         return head + tail
 
-    def contributions(self, profile: UserProfile, item: int,
-                      sig: dict[str, dict[str, float]]) -> dict[str, list[Contribution]]:
+    def contributions(
+        self, profile: UserProfile, item: int, sig: dict[str, dict[str, float]]
+    ) -> dict[str, list[Contribution]]:
         out: dict[str, list[Contribution]] = {}
         if sig["content"]["contribution"] > 0:
             out["content"] = self.content.explain(profile, item)
@@ -353,17 +385,25 @@ class HybridRanker:
             prefs.sort(key=lambda t: (-t[1], t[0]))
             out["preference"] = [Contribution(kind="genre", label=name, value=v) for name, v in prefs[:2]]
         if sig["popularity"]["contribution"] > 0:
-            out["popularity"] = [Contribution(
-                kind="popularity", value=float(self.popularity.like_counts[item]),
-                label=f"{int(self.popularity.like_counts[item])}")]
+            out["popularity"] = [
+                Contribution(
+                    kind="popularity",
+                    value=float(self.popularity.like_counts[item]),
+                    label=f"{int(self.popularity.like_counts[item])}",
+                )
+            ]
         if sig["recency"]["contribution"] > 0 and np.isfinite(self._years[item]):
-            out["recency"] = [Contribution(kind="recency", value=float(self._years[item]),
-                                           label=str(int(self._years[item])))]
+            out["recency"] = [
+                Contribution(
+                    kind="recency", value=float(self._years[item]), label=str(int(self._years[item]))
+                )
+            ]
         return out
 
     # --- similar items (item-to-item) --------------------------------------------------------------
-    def similar_items(self, item: int, k: int = 12, content_weight: float = 0.6
-                      ) -> list[tuple[int, float, dict[str, float]]]:
+    def similar_items(
+        self, item: int, k: int = 12, content_weight: float = 0.6
+    ) -> list[tuple[int, float, dict[str, float]]]:
         """Blend content neighbours (metadata; works for unrated items) with co-occurrence."""
         c_idx, c_val = self.content.similar(item, 100)
         cf_row = self.itemknn.sim.getrow(item)
@@ -372,13 +412,18 @@ class HybridRanker:
             scores.setdefault(i, {"content": 0.0, "collaborative": 0.0})["content"] = v
         cf_max = float(cf_row.data.max()) if cf_row.nnz else 0.0
         for i, v in zip(cf_row.indices.tolist(), cf_row.data.tolist(), strict=True):
-            scores.setdefault(i, {"content": 0.0, "collaborative": 0.0})["collaborative"] = \
+            scores.setdefault(i, {"content": 0.0, "collaborative": 0.0})["collaborative"] = (
                 v / cf_max if cf_max > 0 else 0.0
+            )
         cw = content_weight if cf_row.nnz else 1.0
         ranked = sorted(
-            ((i, cw * s["content"] + (1 - cw) * s["collaborative"], s) for i, s in scores.items()
-             if i != item),
-            key=lambda t: (-t[1], t[0]))
+            (
+                (i, cw * s["content"] + (1 - cw) * s["collaborative"], s)
+                for i, s in scores.items()
+                if i != item
+            ),
+            key=lambda t: (-t[1], t[0]),
+        )
         return ranked[:k]
 
     def similar_to_vector(self, vec: sp.csr_matrix, k: int = 12) -> list[tuple[int, float]]:
@@ -386,8 +431,13 @@ class HybridRanker:
         idx = topk_indices(sims, k)
         return [(int(i), float(sims[i])) for i in idx]
 
-    def trending(self, k: int = 20, offset: int = 0, exclude: np.ndarray | None = None,
-                 boost: dict[int, float] | None = None) -> list[tuple[int, float]]:
+    def trending(
+        self,
+        k: int = 20,
+        offset: int = 0,
+        exclude: np.ndarray | None = None,
+        boost: dict[int, float] | None = None,
+    ) -> list[tuple[int, float]]:
         """Time-decayed popularity, optionally boosted with live (in-app) activity counts."""
         t = self.popularity.trending.astype(np.float64).copy()
         t = t / t.max() if t.max() > 0 else t

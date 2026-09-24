@@ -51,15 +51,25 @@ The intelligence and early-warning layer, then v1.1:
 
 See [progress.md](progress.md) for the evidence.
 
-## Next steps (ordered by value, from what 1.1 measured)
+## 1.2 and 1.3 (done)
+- 1.2: the domain-independent core, the generic CSV + YAML adapter (US unemployment), preference drift and the
+  per-member recommendation strategy decision.
+- 1.3 (Phase 2): the append-only event log with idempotency and bitemporal replay; gated retraining with promotion,
+  rollback and lineage; online experiments; replay isolation and decision lineage; stale-warning auto-resolution
+  (done, was item 1 below in 1.1); the change-point false-alarm fix (9.9 % → 1.3 %, was item 4); scheduled,
+  decision-driven retraining that includes app interactions (was item 8); client-address signing behind the web
+  proxy (was item 7); the CTA ridership domain; the two-protocol recommender benchmark; the security hardening.
+  Evidence: [PROJECT_COMPLETION_REPORT.md](PROJECT_COMPLETION_REPORT.md).
+
+## Next steps (ordered by value, from what 1.3 measured)
 | # | Item | Why (measured) | Sketch |
 |---|---|---|---|
-| 1 | **Auto-resolution of stale warnings** | Open warnings are never closed when a run stops producing them, so the queue only grows (DEFERRED since 1.0 of the layer) | Resolve after N consecutive successful runs without the key, with a `system` event and an audit row; keep manual resolution as the default for high severity |
-| 2 | **Better recommendation discrimination** | Confidence is well calibrated (ECE ≤ 0.0014) but ranks weakly: AUC 0.57–0.63, Brier skill +0.45 % warm, about 0 for short profiles | Learn per-stage hybrid weights on the validation split; add features (profile size, item popularity, signal agreement) to the calibrator; report AUC as a release gate |
-| 3 | **Learning-to-rank on logged feedback** | Popularity still beats the hybrid at cold start (NDCG@10 0.046 vs 0.035), and weights are hand-set per stage | LightGBM LambdaMART over the six signals and context, trained on held-out ratings and logged `recommendation_feedback`; offline A/B against the current hybrid |
-| 4 | **Change-point false-alarm rate** | 7 % false alarms against 1 % nominal on synthetic AR(1) series; detection 32.5 % | Estimate AR(1) by a bias-corrected estimator or block bootstrap for the null; require a minimum segment length; re-run `evaluate_intelligence.py` and publish the new rate |
-| 5 | **Live-traffic validation** | Every live signal says "cannot be assessed" on the static 2018 snapshot; lapse and warning precision are only measured offline or synthetically | Collect a few weeks of app ratings and feedback; compare forecasts with actuals (`prediction` feedback); report warning precision from operator verdicts once ≥ 5 exist |
-| 6 | Rater-detector budget | The 2 % review budget is partly spent on genuine heavy users | Add tenure and diversity features; calibrate against the injection study per attack type |
-| 7 | Client-address attribution behind the web proxy | Next.js rewrites forward `X-Forwarded-For` verbatim, so the API trusts no forwarded header and all clients share one rate-limit bucket (docs/deployment.md) | Put an edge proxy that overwrites the header in the compose stack, or set the header from the socket peer in `frontend/src/proxy.ts` |
-| 8 | Scheduled retraining with app interactions | App users are served by fold-in and never enter training | Nightly trainer job gated by the `retrain_model` decision |
-| 9 | Sequence-aware models, larger MovieLens variants, optional TMDB artwork | From the 1.0 list | — |
+| 1 | **Live traffic** | Every online-experiment result is an offline replay; movie live signals are "cannot be assessed" on the 2018 snapshot | Run one experiment on real members; compare forecasts and warnings with realised outcomes |
+| 2 | **Paired offline experiment replay** | The between-arm replay needs ~13,400 members per arm; arm baselines move ~0.01 NDCG@10 by assignment alone | Score every member under every variant in `scripts/simulate_ab_replay.py` and test within member |
+| 3 | **Warning skill** | Unemployment lift 1.41 (2019–21: 1.04); CTA lift CI 0.52–2.36 and 1.10 on an untouched window; movie lapse uninformative, genre decline never fires | Persistence rule for daily anomalies; per-domain thresholds on separate tuning windows; a baseline rule (Sahm rule); lift CIs in every report |
+| 4 | **Recommender power and recency** | Leak-free protocol has 28 users; a 90-day popularity baseline is 0.044 NDCG@10 ahead (n.s.); popularity leads at cold start | ML-1M/25M re-run (same code); decayed popularity inside the hybrid; learning-to-rank on logged feedback |
+| 5 | **Governance statistics** | The calibration gate's ECE margin cannot fail at ~1 % base rates; the joint pass rate of three accuracy gates is below 80 % | Shared calibration set with Brier skill or relative calibration; consider a joint (intersection-union) power target |
+| 6 | **Replay pinning in the API** | A movie replay reads the active model (recorded, not pinned) | Accept `model_version` on `POST /intel/runs` and thread it to `load_default_inputs` |
+| 7 | **Operations** | Docker acceptance not re-run for 1.3; `idempotency_keys` / `revoked_tokens` not pruned; per-process run lock | Re-run acceptance on compose; a `retention.prune` job; a shared lock |
+| 8 | Rater-detector budget | The 2 % review budget is partly spent on genuine heavy users | Tenure and diversity features |
+| 9 | Sequence-aware models, optional TMDB artwork | From the 1.0 list | — |

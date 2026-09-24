@@ -81,15 +81,23 @@ def make_signal(
     }
 
 
-def period_age_days(as_of_ts: float, period_start: str) -> float:
-    """Days from the end of the period starting at ``period_start`` to as_of (>= 0)."""
-    p = (
-        pd.Period(period_start[:7], freq="M")
-        if period_start.endswith("-01")
-        else pd.Period(period_start, freq="W")
-    )
+def period_age_days(as_of_ts: float, period_start: str, freq: str | None = None) -> float:
+    """Days from the end of the period starting at ``period_start`` to as_of (>= 0). ``freq`` is the
+    series' period ("M", "W", "D"); without it a "-01" date is a month and anything else a week (the
+    monthly/weekly behaviour before daily series existed)."""
+    if freq == "D":
+        p = pd.Period(period_start[:10], freq="D")
+    elif freq == "W" or (freq is None and not period_start.endswith("-01")):
+        p = pd.Period(period_start, freq="W")
+    else:
+        p = pd.Period(period_start[:7], freq="M")
     end = p.end_time.tz_localize("UTC").timestamp()
     return max(0.0, (as_of_ts - end) / 86400.0)
+
+
+def period_label(period_start: str, freq: str) -> str:
+    """ "YYYY-MM" for a month, the full start date for a week or a day."""
+    return period_start[:7] if freq == "M" else period_start[:10]
 
 
 def _sub(a: Any, b: Any) -> float | None:
@@ -124,7 +132,7 @@ def build_signals(
             q = t["q_value"] if t["q_value"] is not None else 1.0
             label = "rising" if t["direction"] == "up" else "falling"
             unit = (s.trend_unit if s is not None and s.trend_unit else None) or (
-                f"{t['metric']}/month" if (s is None or s.freq == "M") else f"{t['metric']}/week"
+                f"{t['metric']}/{ {'M': 'month', 'W': 'week', 'D': 'day'}[s.freq if s is not None else 'M'] }"
             )
             sigs.append(
                 make_signal(
@@ -140,7 +148,7 @@ def build_signals(
                     src(t["series_id"]),
                     t["window"]["end"],
                     win,
-                    period_age_days(as_of_ts, t["window"]["end"]),
+                    period_age_days(as_of_ts, t["window"]["end"], s.freq if s is not None else None),
                     [evidence("test", "Mann–Kendall p", t["p_value"], f"BH q {t['q_value']}", t["id"])],
                     as_of_key,
                     baseline=t["prior_mean"],
@@ -159,7 +167,8 @@ def build_signals(
                     f"cp:{t['series_id']}",
                     t["entity_type"],
                     t["entity"],
-                    f"{t['entity']} {t['metric']} shifted {'up' if up else 'down'} in {cp['date'][:7]}",
+                    f"{t['entity']} {t['metric']} shifted {'up' if up else 'down'} in "
+                    f"{period_label(cp['date'], s.freq if s is not None else 'M')}",
                     cp["after_mean"],
                     None,
                     1 - (cp["p_value"] or 1.0),
@@ -167,7 +176,7 @@ def build_signals(
                     src(t["series_id"]),
                     cp["date"],
                     win,
-                    period_age_days(as_of_ts, cp["date"]),
+                    period_age_days(as_of_ts, cp["date"], s.freq if s is not None else None),
                     [
                         evidence(
                             "test",
@@ -189,7 +198,8 @@ def build_signals(
         if a["suppressed"]:
             continue
         if a["method"] == "robust_z":
-            fresh = period_age_days(as_of_ts, a["detected_at"])
+            a_s = series_by_id.get(a.get("series_id") or "")
+            fresh = period_age_days(as_of_ts, a["detected_at"], a_s.freq if a_s is not None else None)
             source = a.get("source") or src(a.get("series_id"))
         else:
             fresh, source = 0.0, a.get("source")

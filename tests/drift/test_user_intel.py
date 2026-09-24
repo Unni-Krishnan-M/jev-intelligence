@@ -383,3 +383,23 @@ def test_real_users_if_available() -> None:
         assert len(out["recommendations"]) == 10
         if uid == 1:  # every rating within 9 days: drift is not measurable
             assert out["drift"]["status"] == "insufficient_data" and out["strategy"]["abstained"]
+
+
+def test_evaluated_effects_match_the_stored_drift_report():
+    """EVALUATED_EFFECTS is a hand copy of the drift evaluation: pin it to the report it cites."""
+    import json
+
+    from jev_ml.domains.movie.user_intel import _EVAL_SOURCE, EVALUATED_EFFECTS
+    from jev_ml.paths import ROOT
+
+    path = ROOT / _EVAL_SOURCE
+    if not path.exists():
+        pytest.skip(f"{_EVAL_SOURCE} not present (gitignored experiment output)")
+    rep = json.loads(path.read_text())
+    stored = rep["adaptation"]["settings"]["refit"]["preference_drift"]["vs_standard"]
+    for name, eff in EVALUATED_EFFECTS.items():
+        s = stored[name]["ndcg10"]
+        assert eff["delta_ndcg10"] == pytest.approx(s["delta"], abs=1e-9), name
+        assert eff["ci95"] == pytest.approx(s["ci95"], abs=1e-9), name
+        for k in ("n_users", "n_improved", "n_worse"):
+            assert eff[k] == s[k], (name, k)

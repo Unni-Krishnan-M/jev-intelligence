@@ -8,7 +8,7 @@ below plus its names to ``__all__``. Shared envelopes (error body, pagination) s
 
 from __future__ import annotations
 
-from jev_api.schemas import events, experiments, governance, security  # noqa: F401 - WS placeholders
+from jev_api.schemas import events, experiments, governance, security  # noqa: F401 - Phase-2 modules
 from jev_api.schemas.audit import (
     AuditEntryOut,
     AuditPage,

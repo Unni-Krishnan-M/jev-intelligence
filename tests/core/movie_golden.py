@@ -151,9 +151,25 @@ def diff(golden: Any, new: Any, path: str = "$", out: list[str] | None = None) -
     return out
 
 
+EWL = "early_warning_level"
+
+
+def v11_view(d: dict[str, Any]) -> dict[str, Any]:
+    """The intel-1.1 contract view the goldens pin: essentials without the platform's additive
+    ``early_warning_level`` decisions (and their batch), counts adjusted; batch state hashes kept."""
+    d = essentials(d)
+    ewl = [x for x in d["decisions"] if x["key"] == EWL]
+    d["decisions"] = [x for x in d["decisions"] if x["key"] != EWL]
+    d["decision_batches"] = [b for b in d["decision_batches"] if b["name"] != "early_warning"]
+    c = d["summary"]["counts"]
+    c["decisions"] -= len(ewl)
+    c["decisions_abstained"] -= sum(x["abstained"] for x in ewl)
+    return d
+
+
 def _write(name: str, d: dict[str, Any]) -> None:
     GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
-    raw = json.dumps(essentials(d), sort_keys=True, separators=(",", ":")) + "\n"
+    raw = json.dumps(v11_view(d), sort_keys=True, separators=(",", ":")) + "\n"
     if name.endswith(".gz"):
         # mtime=0: byte-identical files for identical content
         (GOLDEN_DIR / name).write_bytes(gzip.compress(raw.encode(), mtime=0))

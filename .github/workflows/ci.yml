@@ -33,6 +33,11 @@ jobs:
       - run: uv run alembic upgrade head && uv run alembic check
         env:
           JEV_DATABASE_URL: sqlite:///${{ runner.temp }}/alembic-check.db
+      # supply chain: known vulnerabilities in the locked Python dependencies (docs/SECURITY_AUDIT_PHASE2.md)
+      - name: pip-audit (locked dependencies)
+        run: |
+          uv export --frozen --no-hashes --no-emit-project -o "$RUNNER_TEMP/requirements.txt"
+          uvx pip-audit --disable-pip --no-deps --strict -r "$RUNNER_TEMP/requirements.txt"
 
   # PostgreSQL-only tests (every test with "postgres" in its name skips without JEV_TEST_POSTGRES_URL):
   # migration round trips and CHECK parity on the production database engine
@@ -88,6 +93,7 @@ jobs:
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
+      - run: pnpm audit --prod --audit-level high   # supply chain: production dependencies
       - run: pnpm exec next typegen   # route types (LayoutProps, PageProps) that tsc needs
       - run: pnpm exec tsc --noEmit
       - run: pnpm lint

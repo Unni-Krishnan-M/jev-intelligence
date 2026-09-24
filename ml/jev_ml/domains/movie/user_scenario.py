@@ -40,6 +40,7 @@ from typing import Any
 
 import numpy as np
 
+from jev_ml.core.common import evidence, fnum, iso_from_epoch
 from jev_ml.core.drift import DAY, OK, split_windows
 from jev_ml.domains.movie.user_intel import (
     StrategyConfig,
@@ -48,7 +49,6 @@ from jev_ml.domains.movie.user_intel import (
     user_events,
 )
 from jev_ml.engine import Interaction, RecommendationEngine
-from jev_ml.intel.common import evidence, fnum, iso_from_epoch
 from jev_ml.signals import UserProfile
 
 KINDS = ("continue", "accelerate", "reverse")

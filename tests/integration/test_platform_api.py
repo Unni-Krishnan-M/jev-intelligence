@@ -137,13 +137,31 @@ def run(client, admin, **body):
     return r.json()
 
 
+SYNTH_NOW = datetime(2020, 7, 25, tzinfo=UTC)
+
+
+def live_run(client, admin, domain: str) -> dict:
+    """A *live* run of a synthetic generic domain on 2020-07-25 (the service clock is set to that day).
+    Since P2.4 an explicit as_of makes a replay, which never touches live warnings; these tests exercise
+    the live warning lifecycle, so they move the clock instead of passing as_of."""
+    svc = client.app.state.intel
+    original = svc.clock
+    svc.clock = lambda: SYNTH_NOW
+    try:
+        out = run(client, admin, domain=domain)
+    finally:
+        svc.clock = original
+    assert out["mode"] == "live"
+    return out
+
+
 @pytest.fixture(scope="module")
 def runs(client, platform, admin):
-    """One run per domain: movie (synthetic), synth-rates and synth-rates-b as of 2020-07-25."""
+    """One live run per domain: movie (synthetic), synth-rates and synth-rates-b on 2020-07-25."""
     return {
         "movie": run(client, admin),
-        SYNTH: run(client, admin, domain=SYNTH, as_of="2020-07-25"),
-        SYNTH_B: run(client, admin, domain=SYNTH_B, as_of="2020-07-25"),
+        SYNTH: live_run(client, admin, SYNTH),
+        SYNTH_B: live_run(client, admin, SYNTH_B),
     }
 
 
@@ -305,8 +323,8 @@ def test_warnings_are_isolated_per_domain(client, admin, runs):
     )
     assert r.status_code == 200 and r.json()["status"] == "dismissed"
     # re-running A suppresses the dismissed key there only; B's warning is updated, not suppressed
-    run(client, admin, domain=SYNTH, as_of="2020-07-25")
-    run(client, admin, domain=SYNTH_B, as_of="2020-07-25")
+    live_run(client, admin, SYNTH)
+    live_run(client, admin, SYNTH_B)
     assert [w["status"] for w in warnings(client, admin, SYNTH, key=A_KEY)] == ["dismissed"]
     (wb2,) = warnings(client, admin, SYNTH_B, key=A_KEY)
     assert wb2["id"] == wb["id"] and wb2["occurrences"] == 2

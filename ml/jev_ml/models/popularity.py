@@ -76,8 +76,10 @@ class PopularityRecommender(Recommender):
         return self.user_counts / max(self.n_users, 1)
 
     def params(self) -> dict[str, Any]:
-        out: dict[str, Any] = {"trending_half_life_days": self.trending_half_life_days,
-                               "bayes_prior_votes": self.bayes_prior_votes}
+        out: dict[str, Any] = {
+            "trending_half_life_days": self.trending_half_life_days,
+            "bayes_prior_votes": self.bayes_prior_votes,
+        }
         # only non-default scoring params are recorded, so existing manifests stay byte-identical
         if self.reach_weight != 0.25:
             out["reach_weight"] = self.reach_weight
@@ -87,17 +89,28 @@ class PopularityRecommender(Recommender):
 
     def save(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(path / "popularity.npz", user_counts=self.user_counts,
-                            like_counts=self.like_counts, trending=self.trending,
-                            bayes_rating=self.bayes_rating, popularity=self.popularity)
-        self._write_json(path / "popularity.json", {**self.params(), "n_users": self.n_users,
-                                                    "reference_ts": self.reference_ts})
+        np.savez_compressed(
+            path / "popularity.npz",
+            user_counts=self.user_counts,
+            like_counts=self.like_counts,
+            trending=self.trending,
+            bayes_rating=self.bayes_rating,
+            popularity=self.popularity,
+        )
+        self._write_json(
+            path / "popularity.json",
+            {**self.params(), "n_users": self.n_users, "reference_ts": self.reference_ts},
+        )
 
     @classmethod
     def load(cls, path: Path) -> PopularityRecommender:
         meta = cls._read_json(path / "popularity.json")
-        obj = cls(meta["trending_half_life_days"], meta["bayes_prior_votes"],
-                  meta.get("reach_weight", 0.25), meta.get("score_half_life_days"))
+        obj = cls(
+            meta["trending_half_life_days"],
+            meta["bayes_prior_votes"],
+            meta.get("reach_weight", 0.25),
+            meta.get("score_half_life_days"),
+        )
         arrs = np.load(path / "popularity.npz")
         for k in ("user_counts", "like_counts", "trending", "bayes_rating", "popularity"):
             setattr(obj, k, arrs[k])

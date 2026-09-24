@@ -5,7 +5,7 @@ Schema (keys not listed are rejected, so a typo never silently changes a run)::
     key: us-unemployment                 # adapter key becomes "generic:<key>"
     name: US unemployment
     description: ...
-    frequency: month                     # month (required support) | week
+    frequency: month                     # month (required support) | week | day
     grid_end: last_observation           # last_observation (published statistics) | as_of (event streams)
     source:
       name: fred-bls                     # DataSource.source
@@ -29,6 +29,10 @@ Schema (keys not listed are rejected, so a typo never silently changes a run)::
     series:                              # SeriesSpec fields; group_by may be "entity"
       - {id: "rate:{group}", metric: level, group_by: entity, unit: "%", adverse_direction: up}
     thresholds: {}                       # CoreConfig field overrides (e.g. anomaly_z_threshold: 4.0)
+    calendar_check:                      # optional: compare a spec's calendar with a data column
+      column: day_type                   #   (quality check "<source>_calendar": share of days agreeing)
+      calendar: weekday_us_holidays
+      labels: {weekday: W, saturday: A, sunday_holiday: U}
     impact_weights: {}                   # declared impact weight per entity (0..1), labelled "declared"
     download: {...}                      # used by scripts/download_domain_data.py only
 """
@@ -57,6 +61,7 @@ TOP_KEYS = {
     "thresholds",
     "impact_weights",
     "download",
+    "calendar_check",
 }
 SOURCE_KEYS = {
     "name",
@@ -87,6 +92,7 @@ class GenericDomainConfig:
     thresholds: dict[str, Any] = field(default_factory=dict)
     impact_weights: dict[str, float] = field(default_factory=dict)
     download: dict[str, Any] = field(default_factory=dict)
+    calendar_check: dict[str, Any] = field(default_factory=dict)
     root: Path = field(default_factory=Path)
     path: Path | None = None
 
@@ -142,10 +148,16 @@ def parse_config(raw: dict[str, Any], root: Path, path: Path | None = None) -> G
         sp.setdefault("source", src.get("name"))
         if sp.get("group_by") == cols["entity"]:
             sp["group_by"] = "entity"
+        if sp.get("forecast_models") is not None:
+            sp["forecast_models"] = tuple(sp["forecast_models"])
         specs.append(SeriesSpec(**sp))
     freq = str(raw.get("frequency", "month"))
-    if freq not in ("month", "week"):
-        raise ValueError("frequency must be 'month' or 'week'")
+    if freq not in ("month", "week", "day"):
+        raise ValueError("frequency must be 'month', 'week' or 'day'")
+    cc = dict(raw.get("calendar_check") or {})
+    _check_keys(cc, {"column", "calendar", "labels"}, "calendar_check")
+    if cc and not {"column", "calendar", "labels"} <= set(cc):
+        raise ValueError("calendar_check needs column, calendar and labels")
     vr = raw.get("value_range")
     cfg = GenericDomainConfig(
         key=str(raw["key"]),
@@ -160,6 +172,7 @@ def parse_config(raw: dict[str, Any], root: Path, path: Path | None = None) -> G
         thresholds=dict(raw.get("thresholds") or {}),
         impact_weights=dict(raw.get("impact_weights") or {}),
         download=dict(raw.get("download") or {}),
+        calendar_check=cc,
         root=root,
         path=path,
     )

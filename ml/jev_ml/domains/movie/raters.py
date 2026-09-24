@@ -209,7 +209,8 @@ def live_feedback(
     prep: Prepared, cfg: IntelConfig, as_of_key: str, suppressed: dict[str, str]
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     fb = prep.app_feedback
-    now = prep.now_ts
+    # the replay clock in a replay (P2.4), the wall clock in a live run
+    now = prep.event_clock_ts if prep.event_clock_ts is not None else prep.now_ts
     recent_lo = now - cfg.live_recent_days * 86400
     prior_lo = recent_lo - cfg.live_prior_days * 86400
     status: dict[str, Any] = {"status": "skipped", "reason": None}
@@ -244,15 +245,16 @@ def live_feedback(
             severity = name
     key = "anomaly:live_feedback:app"
     reason = suppression(key, severity, suppressed)
+    clock = iso_from_epoch(now)  # = iso(prep.now) in a live run; the as_of in a replay (P2.4)
     anom: dict[str, Any] = {
-        "id": stable_id("anom", "live_feedback", "app", (iso(prep.now) or "")[:10], as_of_key),
+        "id": stable_id("anom", "live_feedback", "app", (clock or "")[:10], as_of_key),
         "dedup_key": key,
         "kind": "live_feedback",
         "entity_type": "platform",
         "entity": "app",
         "series_id": None,
         "metric": "negative_feedback_rate",
-        "detected_at": iso(prep.now),
+        "detected_at": clock,
         "value": fnum(p1),
         "baseline": fnum(p0),
         "deviation": fnum(p1 - p0),

@@ -34,8 +34,8 @@ import numpy as np
 
 from jev_ml.core.common import fnum, period_str
 from jev_ml.core.config import CoreConfig
-from jev_ml.core.forecast import ForecastState, _itf, forecast_series, interval_at, run_model
-from jev_ml.core.series import Series
+from jev_ml.core.forecast import ForecastState, _itf, forecast_series, interval_at, rerun
+from jev_ml.core.series import FREQ_NAMES, Series
 from jev_ml.core.trends import theil_sen
 
 KINDS = ("continue", "slow", "reverse", "shock", "custom")
@@ -143,7 +143,7 @@ def scenario_on_series(
     sid, horizon, scen = _validate(spec, known)
     state = _state_for(series, states, sid, as_of, data_version, cfg)
     y = np.log1p(np.maximum(state.history, 0)) if state.transform == "log1p" else state.history
-    path, trend, _ = run_model(state.model, y, horizon, cfg)
+    path, trend = rerun(state, horizon, cfg)
     trend_info: dict[str, Any] = {"source": "model", "slope_per_month": None, "slope_ci": None}
     if np.any(np.abs(trend) > 1e-12):
         trend_info["slope_per_month"] = fnum(float(trend[0]), 6)
@@ -168,19 +168,22 @@ def scenario_on_series(
 
     base_total = total(base_pts)
     has_trend = bool(np.any(np.abs(trend) > 1e-12))
+    # period wording: months for the v1.2 path (unchanged text), the series' own unit otherwise
+    unit = "month" if state.context is None else FREQ_NAMES[state.context.freq]
+    last_label = period_str(state.history_months[-1])
+    last_label = last_label[:7] if unit == "month" else last_label
     out_s = []
     for s in scen:
         kind = s["kind"]
         m = float(s.get("trend_multiplier", DEFAULT_MULT[kind]))
         g = path + (m - 1.0) * trend
         assumptions = [
-            f"model: {state.model} fitted on {len(state.history)} complete months up to "
-            f"{period_str(state.history_months[-1])[:7]}"
+            f"model: {state.model} fitted on {len(state.history)} complete {unit}s up to {last_label}"
         ]
         if trend_info["source"] == "theil_sen":
             assumptions.append(
                 f"{state.model} has no trend: baseline = its level + Theil–Sen trend of the last "
-                f"{cfg.trend_window_months} months ({trend_info['slope_per_month']}/month on "
+                f"{cfg.trend_window_months} {unit}s ({trend_info['slope_per_month']}/{unit} on "
                 f"{'log1p' if state.transform == 'log1p' else 'raw'} scale, 95 % CI {trend_info['slope_ci']})"
             )
         if kind != "continue" and m != 1.0:
@@ -198,12 +201,12 @@ def scenario_on_series(
             else:
                 g = g.copy()
                 g[sm - 1 :] = g[sm - 1 :] * (1 + float(pct) / 100.0)
-            assumptions.append(f"level shift {float(pct):+g} % from month {sm} onwards")
+            assumptions.append(f"level shift {float(pct):+g} % from {unit} {sm} onwards")
         if kind == "continue" and m == 1.0 and not pct:
             assumptions.append("identical to the baseline forecast")
         if len(state.q_lo) < horizon:
             assumptions.append(
-                f"intervals beyond month {len(state.q_lo)} widened by sqrt(h/{len(state.q_lo)})"
+                f"intervals beyond {unit} {len(state.q_lo)} widened by sqrt(h/{len(state.q_lo)})"
             )
         pts = _points(state, g, horizon)
         tot = total(pts)

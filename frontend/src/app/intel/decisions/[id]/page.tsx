@@ -12,6 +12,8 @@ import { EvidenceList } from "@/components/jev/intel/evidence-list";
 import { FeedbackButtons } from "@/components/jev/intel/feedback-buttons";
 import { LevelScale, StateSnapshot } from "@/components/jev/intel/level-scale";
 import { IntelError } from "@/components/jev/intel/states";
+import { RunModeBadge } from "@/components/jev/ops/badges";
+import { LineageViewer } from "@/components/jev/ops/lineage-viewer";
 import { EmptyState } from "@/components/jev/states";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError, qs } from "@/lib/api";
@@ -212,6 +214,7 @@ export default function DecisionDetailPage() {
               </div>
             </div>
           </section>
+          <LineageViewer path={dq(`/intel/decisions/${encodeURIComponent(String(d.db_id))}/lineage`)} />
         </div>
 
         <div className="space-y-4">
@@ -223,7 +226,7 @@ export default function DecisionDetailPage() {
                 { label: "Model version", value: modelVersion ?? (runs.data ? "— (none in this run)" : "…") },
                 { label: "As of", value: fmtDate(d.as_of) },
                 { label: "Recorded", value: fmtDate(d.created_at) },
-                { label: "Run", value: <span title={d.run_id}>{d.run_id.slice(0, 8)}</span> },
+                { label: "Run", value: <span className="inline-flex items-center gap-2"><span title={d.run_id}>{d.run_id.slice(0, 8)}</span>{run?.mode && <RunModeBadge mode={run.mode} />}</span> },
                 { label: "Subject", value: `${d.entity_type} ${d.entity}` },
                 ...(d.domain ? [{ label: "Domain", value: d.domain }] : []),
                 { label: "Decision id", value: <span title={d.id}>{d.id}</span> },

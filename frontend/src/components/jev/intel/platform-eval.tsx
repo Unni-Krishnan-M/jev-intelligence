@@ -12,7 +12,7 @@ import type { PlatformEvaluation, WarningOutcomeCounts } from "@/lib/intel-types
 function OutcomeTable({ rows, caption, first }: { rows: [string, WarningOutcomeCounts][]; caption: string; first: string }) {
   return (
     <div className="relative overflow-x-auto rounded-lg border bg-card">
-      <table className="w-full min-w-[720px] text-sm">
+      <table className="w-full min-w-[860px] text-sm">
         <caption className="sr-only">{caption}</caption>
         <thead>
           <tr className="border-b hairline text-left text-xs text-muted-foreground">
@@ -23,6 +23,8 @@ function OutcomeTable({ rows, caption, first }: { rows: [string, WarningOutcomeC
             <th className="px-2 py-2.5 text-right font-normal">False alarms</th>
             <th className="px-2 py-2.5 text-right font-normal">Missed</th>
             <th className="px-2 py-2.5 text-right font-normal">Precision ↑</th>
+            <th className="px-2 py-2.5 text-right font-normal" title="precision ÷ base rate; 1.0 = no better than random flagging">Lift</th>
+            <th className="px-2 py-2.5 text-right font-normal" title="share of observable units warned">Flag rate</th>
             <th className="px-2 py-2.5 text-right font-normal">FPR ↓</th>
             <th className="px-2 py-2.5 text-right font-normal">Recall ↑</th>
             <th className="px-4 py-2.5 text-right font-normal">Base rate</th>
@@ -38,6 +40,8 @@ function OutcomeTable({ rows, caption, first }: { rows: [string, WarningOutcomeC
               <td className="num px-2 py-2 text-right">{c.fp.toLocaleString()}</td>
               <td className="num px-2 py-2 text-right">{c.fn.toLocaleString()}</td>
               <td className="num px-2 py-2 text-right">{fmtNum(c.precision, 3)}</td>
+              <td className="num px-2 py-2 text-right">{c.lift == null ? "—" : `${fmtNum(c.lift, 2)}×`}</td>
+              <td className="num px-2 py-2 text-right text-ink-2">{fmtNum(c.flag_rate ?? null, 3)}</td>
               <td className="num px-2 py-2 text-right">{fmtNum(c.false_positive_rate, 3)}</td>
               <td className="num px-2 py-2 text-right">{fmtNum(c.recall, 3)}</td>
               <td className="num px-4 py-2 text-right text-ink-2">{fmtNum(c.base_rate, 3)}</td>
@@ -93,7 +97,7 @@ export function PlatformEvaluationView({ p, index }: { p: PlatformEvaluation; in
           {p.created_at ? ` · created ${fmtDate(p.created_at)}` : ""} · {fmtMs(r.replays.ms_mean)} per replay
         </p>
         <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-          <StatTile label="Precision" value={fmtNum(w.precision, 2)} hint={`${w.tp} of ${w.warned} warnings confirmed`} />
+          <StatTile label="Precision" value={fmtNum(w.precision, 2)} hint={`${w.tp} of ${w.warned} warnings confirmed${w.lift != null ? ` · lift ${fmtNum(w.lift, 2)}× over base rate` : ""}${w.flag_rate != null ? ` · flag rate ${fmtNum(w.flag_rate, 2)}` : ""}`} />
           <StatTile label="False-positive rate" value={fmtNum(w.false_positive_rate, 2)} hint={`${w.fp} false alarms among ${w.fp + w.tn} quiet situations`} />
           <StatTile label="Recall" value={fmtNum(w.recall, 2)} hint={`${w.tp} of ${w.tp + w.fn} adverse outcomes warned`} />
           <StatTile label="Base rate" value={fmtNum(w.base_rate, 2)} hint="share of situations that turned adverse" />

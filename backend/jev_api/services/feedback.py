@@ -1,6 +1,8 @@
 """Recommendation feedback: one verdict per member per recommendation, and counts that stay honest.
 
-Writes are upserts (migration 0004 enforces the keys with partial unique indexes):
+Writes are upserts (migration 0004 enforces the keys with partial unique indexes). Since Phase 2 every
+write is a ``rec_feedback`` event in the append-only log and the row is its projection
+(jev_api.services.events):
 
 * a verdict (like / dislike / not_interested) replaces the member's earlier verdict on the same
   recommendation, or on the same movie when no recommendation is attached;
@@ -21,7 +23,8 @@ from sqlalchemy import Select, case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from jev_api.models import RecommendationFeedback, User, utcnow
+from jev_api.models import DEFAULT_DOMAIN, RecommendationFeedback, User, utcnow
+from jev_api.models.events import Event
 
 CLICK = "clicked"
 VERDICTS = ("like", "dislike", "not_interested")
@@ -29,37 +32,70 @@ NEGATIVE = frozenset({"dislike", "not_interested"})  # these exclude the movie f
 
 
 def upsert_feedback(
-    db: Session, user: User, movie_id: int, kind: str, recommendation_id: int | None
+    db: Session,
+    user: User,
+    movie_id: int,
+    kind: str,
+    recommendation_id: int | None,
+    idempotency_key: str | None = None,
 ) -> RecommendationFeedback:
-    """Record `kind` as the member's current feedback for the key and commit. Returns the row."""
-    fb = RecommendationFeedback
+    """Record `kind` as the member's current feedback for the key and commit. Returns the row.
+
+    The write is an event first (``rec_feedback`` in the append-only log, docs/STREAMING_ARCHITECTURE.md)
+    and the row is its projection, refolded in the same transaction. With `idempotency_key`, a retry
+    appends nothing (the key is unique per member)."""
+    from jev_api.services import events
+
     for attempt in range(2):
-        same_slot = (fb.feedback == CLICK) if kind == CLICK else (fb.feedback != CLICK)
-        q = select(fb).where(fb.user_id == user.id, same_slot)
-        if recommendation_id is not None:
-            q = q.where(fb.recommendation_id == recommendation_id)
-        else:
-            q = q.where(fb.recommendation_id.is_(None), fb.movie_id == movie_id)
-        row = db.scalars(q.order_by(fb.created_at.desc(), fb.id.desc())).first()
-        previous = row.feedback if row is not None else None
-        if row is None:
-            row = fb(user_id=user.id, movie_id=movie_id, feedback=kind, recommendation_id=recommendation_id)
-            db.add(row)
-        elif previous != kind:
-            row.feedback = kind
-            row.created_at = utcnow()  # the verdict changed now
-        if (previous in NEGATIVE) != (kind in NEGATIVE):
-            user.profile_version += 1  # the exclusion list changed: cached recommendations are stale
         try:
+            if idempotency_key is not None:
+                seen = db.scalar(
+                    select(Event.id).where(
+                        Event.source == events.APP,
+                        Event.idempotency_key == events.member_key(user.id, idempotency_key),
+                    )
+                )
+                if seen is not None:
+                    events.count_ingest(db, DEFAULT_DOMAIN, utcnow().date(), duplicates=1)
+                    db.commit()
+                    return _slot_row(db, user, movie_id, kind, recommendation_id)
+            applied = events.apply_member_event(
+                db,
+                user,
+                "rec_feedback",
+                movie_id,
+                feedback=kind,
+                recommendation_id=recommendation_id,
+                key=idempotency_key,
+            )
+            if applied.profile_changed:
+                user.profile_version += 1  # the exclusion list changed: cached recommendations are stale
             db.commit()
-        except IntegrityError:  # a concurrent request inserted the same key first: update that row
+        except IntegrityError:  # a concurrent request inserted the same key first: refold on top of it
             db.rollback()
             if attempt:
                 raise
             continue
+        row = _slot_row(db, user, movie_id, kind, recommendation_id)
         db.refresh(row)
         return row
     raise AssertionError("unreachable")
+
+
+def _slot_row(
+    db: Session, user: User, movie_id: int, kind: str, recommendation_id: int | None
+) -> RecommendationFeedback:
+    fb = RecommendationFeedback
+    same_slot = (fb.feedback == CLICK) if kind == CLICK else (fb.feedback != CLICK)
+    q = select(fb).where(fb.user_id == user.id, same_slot)
+    if recommendation_id is not None:
+        q = q.where(fb.recommendation_id == recommendation_id)
+    else:
+        q = q.where(fb.recommendation_id.is_(None), fb.movie_id == movie_id)
+    row = db.scalars(q.order_by(fb.created_at.desc(), fb.id.desc())).first()
+    if row is None:
+        raise LookupError("feedback projection row missing after the append")
+    return row
 
 
 def latest_feedback() -> Any:

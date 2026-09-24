@@ -82,13 +82,13 @@ def onboarding_genres(history: pd.DataFrame, movies: pd.DataFrame) -> dict[int, 
     genres_of = dict(zip(movies["movie_id"].tolist(), movies["genres"].tolist(), strict=True))
     out: dict[int, dict[str, float]] = {}
     liked = history[history["rating"] >= LIKE_THRESHOLD]
-    for uid, g in liked.groupby("user_id"):
+    for _, g in liked.groupby("user_id"):
         c: Counter[str] = Counter()
         for mid in g["movie_id"].tolist():
             c.update(split_list(genres_of.get(int(mid))))
         top = sorted(c.items(), key=lambda kv: (-kv[1], kv[0]))[:ONBOARDING_GENRES]
         if top:
-            out[int(uid)] = {name: 1.0 for name, _ in top}
+            out[int(g["user_id"].iloc[0])] = {name: 1.0 for name, _ in top}
     return out
 
 
@@ -109,8 +109,8 @@ def new_user_cases(
     after = w[pos >= HISTORY_PREFIX]
     rel_rows = after[after["rating"] >= threshold]
     relevant = {
-        int(u): set(item_index.indices_of(g["movie_id"].to_numpy()).tolist())
-        for u, g in rel_rows.groupby("user_id")
+        int(g["user_id"].iloc[0]): set(item_index.indices_of(g["movie_id"].to_numpy()).tolist())
+        for _, g in rel_rows.groupby("user_id")
     }
     users = np.asarray(sorted(relevant), dtype=np.int64)
     prof_rows = prefix[prefix.groupby("user_id").cumcount() < n] if n > 0 else prefix.iloc[0:0]
@@ -223,7 +223,9 @@ def tune_cold_stages(
         vals = []
         for _, stage in cands:
             ranker.config = with_stage(base, stage)
-            vals.append(ev.evaluate(f"cold-trial[n={key[0]},onb={key[1]}]", hybrid_fn(ranker)).metrics[metric])
+            vals.append(
+                ev.evaluate(f"cold-trial[n={key[0]},onb={key[1]}]", hybrid_fn(ranker)).metrics[metric]
+            )
         scores[key] = vals
     chosen: list[dict[str, Any]] = []
     report: dict[str, Any] = {"buckets": {}, "n_candidates": len(cands), "metric": metric}

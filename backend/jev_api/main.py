@@ -19,7 +19,7 @@ from jev_api import __version__
 from jev_api.cache import build_cache
 from jev_api.config import Settings, get_settings
 from jev_api.db import SessionLocal
-from jev_api.deps import client_address
+from jev_api.deps import client_address, peer_address, signed_client_address
 from jev_api.logging_setup import configure_logging, request_id_var
 from jev_api.metrics import metrics
 from jev_api.routers import ALL_ROUTERS
@@ -29,7 +29,7 @@ from jev_api.services.sync import ensure_admin, sync_all
 
 log = logging.getLogger("jev_api")
 
-AUTH_PATHS = ("/auth/login", "/auth/register")
+AUTH_PATHS = ("/auth/login", "/auth/register", "/auth/password")
 # a client or upstream proxy id is only logged (as upstream_request_id), never used as the request id
 UPSTREAM_REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 SECURITY_HEADERS = {
@@ -159,7 +159,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, exc: HTTPException) -> JSONResponse:
         return JSONResponse(
-            {"detail": exc.detail, "request_id": request_id_var.get()},
+            {"detail": exc.detail, **getattr(exc, "extra", {}), "request_id": request_id_var.get()},
             status_code=exc.status_code,
             headers=getattr(exc, "headers", None),
         )
@@ -183,13 +183,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 def _rate_limited(request: Request, settings: Settings) -> JSONResponse | None:
     if request.method == "OPTIONS" or request.url.path.startswith("/health"):
         return None
-    client = client_address(request)  # never the client-controlled X-Forwarded-For
+    signed = signed_client_address(request)  # the web proxy's HMAC-signed client address, if valid
+    client = signed or client_address(request)  # never the client-controlled X-Forwarded-For
     is_auth = request.url.path in AUTH_PATHS
     limit = settings.auth_rate_limit_per_minute if is_auth else settings.rate_limit_per_minute
     bucket = int(time.time() // 60)
     key = f"rl:{'auth' if is_auth else 'api'}:{client}:{bucket}"
     count = request.app.state.cache.incr_window(key, 60)
-    if count > limit:
+    over = count > limit
+    if signed is not None:
+        # per-client buckets behind the proxy, plus one backstop for everything the proxy carries
+        total = request.app.state.cache.incr_window(f"rl:proxy:{peer_address(request)}:{bucket}", 60)
+        over = over or total > settings.security_proxy_rate_limit_per_minute
+    if over:
         return JSONResponse(
             {"detail": "rate limit exceeded", "request_id": request_id_var.get()},
             status_code=429,

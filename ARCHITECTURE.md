@@ -14,12 +14,14 @@ JEV is a domain-independent decision and early-warning engine (`ml/jev_ml/core`)
 ┌───────────────────────────────▼──────────────────────────────────────────────────────┐
 │ FastAPI  (backend/jev_api)                                                           │
 │  middleware: request-id · JSON logs (secret redaction) · rate limit · sec headers    │
-│  routers: auth · users · movies · recommendations · models/experiments · health ·    │
-│           intel (operator console) · admin/metrics                                   │
-│  services: profile (DB → UserProfile) · recommend (serve/persist/cache) · sync ·     │
-│            intel (gather inputs → run pipeline → persist runs/warnings/decisions)    │
+│  routers: auth · users · me · movies · recommendations · models/experiments ·        │
+│           health · intel (operator console) · admin · events · governance ·          │
+│           experiments/online · security (service tokens)                             │
+│  services: profile · recommend (strategy decision → experiment arm → serve/persist)  │
+│            events (append-only log + projections) · intel (gather → run → persist)   │
+│            governance (snapshot → train → gate → promote/rollback) · experiments     │
 │  EngineHolder ──► RecommendationEngine (jev_ml.engine)  ◄── models/<version>/        │
-│  jev_ml.intel.run_pipeline ◄── data/processed + app DB events + model manifest        │
+│  jev_ml.core.run_domain(adapter) ◄── data files + event log cut at as_of + manifest   │
 └───────┬──────────────────────────────┬──────────────────────────────┬───────────────┘
         │ SQLAlchemy 2 + Alembic       │ redis-py                     │ files (npz/json)
 ┌───────▼────────┐             ┌───────▼───────┐             ┌────────▼────────────────┐
@@ -67,14 +69,55 @@ JEV is a domain-independent decision and early-warning engine (`ml/jev_ml/core`)
 2. `services/intel.py` gathers `PipelineInputs`: processed MovieLens data, app ratings / feedback / served
    recommendations from the DB, the active model manifest and its experiment, and the keys of warnings dismissed
    inside the suppression window.
-3. `jev_ml.intel.run_pipeline` runs every stage using only data ≤ `as_of`. It is pure and deterministic, with no DB or web imports.
-4. The service persists the run (`intel_runs`, full result JSON), upserts warnings by dedup key (with an event row per
-   status change), stores the decisions, updates the metrics registry and logs one structured line per run.
-5. List endpoints read the latest successful run (or `?run_id=`). Lifecycle tables (warnings, decisions, feedback,
-   scenarios) are queried directly.
+3. `jev_ml.core.run_domain(adapter, as_of, now)` runs every stage using only data ≤ `as_of` (the event log is cut on
+   event time and knowledge time, docs/STREAMING_ARCHITECTURE.md §4). It is pure and deterministic for a fixed code
+   version, data files and active model, with no DB or web imports. The run records `pipeline_version`,
+   `config_hash`, `input_fingerprint`, `model_version` and the event watermark.
+4. The service persists the run (`intel_runs`, full result JSON, normalised objects and evidence). A run without
+   `as_of` is `mode = live`: it upserts warnings by dedup key (an event row per status change) and auto-resolves stale
+   ones. A run with `as_of` is `mode = replay`: its warnings stay in its result and live state is untouched.
+5. List endpoints read the latest successful **live** run (or `?run_id=`, `?mode=replay|any`). Lifecycle tables
+   (warnings, decisions, feedback, scenarios) are queried directly.
 
 A run on the real data takes about 0.9 s including persistence. The API starts one in a background thread at
-startup when the latest run is older than `JEV_INTEL_MIN_INTERVAL_HOURS`.
+startup when the latest live run is older than `JEV_INTEL_MIN_INTERVAL_HOURS`, and a debounced refresher starts one
+after fresh events.
+
+## Write path: `POST /events` and the member write endpoints
+
+Every member interaction (rating, favourite, watch, feedback) and every pushed observation of a generic domain is a
+row in the append-only `events` table, with `event_time` (when it happened) and `ingested_at` (when JEV knew). The
+current-state tables (`ratings`, `favorites`, …) are projections folded from the log in the same transaction, so there
+is no dual write. An `Idempotency-Key` header (or per-item keys in a batch) makes retries exactly-once:
+`idempotency_keys` stores the first response. `POST /events/replay` recomputes the projections from the log and
+reports drift. Detail: [docs/STREAMING_ARCHITECTURE.md](docs/STREAMING_ARCHITECTURE.md).
+
+## Model lifecycle: governance
+
+`POST /governance/retrain` (or `scripts/retrain.py`, or the opt-in scheduler driven by the `retrain_model` decision)
+takes one job lock and runs: **snapshot** (MovieLens + app feedback as pseudo-ratings, content-hashed) → **train** a
+candidate (never activated) → **gate** (both training recipes refit on the candidate snapshot's frozen split; paired
+bootstrap non-inferiority on NDCG@10, Recall@10 and cold start, with power-derived margins; coverage, calibration,
+latency and an artifact self-check). Promotion requires a gate that passed against the model active *now* (or `force`
+with a reason); rollback restores the previous active version. `EngineHolder` swaps engines under a lock and other
+workers follow `registry.json` by polling. Every step is audited and every version carries lineage (snapshot, config
+hash, seed, git commit, job). Detail: [docs/RETRAINING_AND_MODEL_GOVERNANCE.md](docs/RETRAINING_AND_MODEL_GOVERNANCE.md).
+
+## Serving path with experiments
+
+`GET /recommendations`: the member's `recommendation_strategy` decision is computed (and persisted in
+`member_decisions`); if a running experiment covers the surface, the member is assigned by a salted hash (sticky in
+`ab_assignments`) and the arm's config is applied; the list is served and every exposure, cache hits included, is
+logged. Outcomes are attributed within a window; the results endpoint reports per-arm metrics, SRM, Bonferroni-adjusted
+tests, guardrails and power. Detail: [docs/EXPERIMENTATION.md](docs/EXPERIMENTATION.md).
+
+## Security boundaries
+
+Browser → web (`/api/*` rewrite, per-request nonce CSP, signs the client address into `x-jev-client` with
+`JEV_PROXY_SECRET`) → API (not published in compose). Sessions are JWTs with `jti` and a per-user `token_version`, so
+logout, logout-all and password change revoke them. Machines use hashed, scoped, expiring service tokens that can
+only post observations. Admin checks re-read `is_admin` on every request; a route walker test fails on any
+`/intel*` or `/admin*` route without an admin guard. Detail: [docs/SECURITY_AUDIT_PHASE2.md](docs/SECURITY_AUDIT_PHASE2.md).
 
 ## Code map
 
@@ -92,6 +135,9 @@ startup when the latest run is older than `JEV_INTEL_MIN_INTERVAL_HOURS`.
 | `ml/jev_ml/domains/movie/` | movie adapter: ingest/validation, genre series, raters, lapse, model governance, user intelligence (preference drift, strategy decision, preference scenarios) |
 | `ml/jev_ml/domains/generic/` | generic adapter: any long CSV + `configs/domains/*.yaml` |
 | `ml/jev_ml/intel/` | compatibility layer: `run_pipeline(PipelineInputs)` and re-exports for the movie domain, plus offline evaluation |
+| `ml/jev_ml/governance/` | snapshots, candidate training, the promotion gate (`gates.py`), promotion blockers |
+| `ml/jev_ml/evaluation/{benchmark,leakage,stats,cold_start}.py` | two-protocol benchmark, leakage controls, bootstrap and permutation statistics |
+| `backend/jev_api/services/{events,governance,experiments,experiment_stats}.py` | event log and projections; retrain jobs, lock, promotion; online experiments and their statistics |
 | `backend/jev_api/` | FastAPI app, ORM models, Alembic migrations, routers, services |
 | `frontend/src/` | Next.js pages (`app/`), components (`components/jev`, `components/ui`), API client (`lib/`) |
 | `scripts/` | pipeline entry points, acceptance test, screenshot capture |
@@ -105,6 +151,10 @@ startup when the latest run is older than `JEV_INTEL_MIN_INTERVAL_HOURS`.
 open warning per key (partial unique index); `intel_feedback` references decisions, warnings, actions or forecasts by id;
 `intel_scenarios` stores saved what-if analyses.
 `experiments` *─1 `model_versions`, and `evaluation_metrics` *─1 `experiments` (unique per model/protocol/metric/K).
+Phase 2 (migrations 0006–0010): `intel_runs.mode` (live | replay) and `event_watermark`; `events`,
+`idempotency_keys`, `event_daily_counts`; `dataset_snapshots`, `training_jobs`, `model_governance`, `governance_locks`;
+`ab_experiments`, `ab_variants`, `ab_assignments`, `ab_exposures`, `ab_outcomes`, `member_decisions`;
+`service_tokens`, `revoked_tokens` and `users.token_version`.
 The schema uses only portable types, with JSON in place of JSONB, so it runs on PostgreSQL and SQLite. Constraints include
 the rating range (0.5–5), the allowed feedback kinds, and uniqueness of (user, movie) for ratings and favourites.
 Indexes cover every per-user timeline query.

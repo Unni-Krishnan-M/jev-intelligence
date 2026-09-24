@@ -80,7 +80,7 @@ Design contract: [intelligence.md](intelligence.md).
 | API, persistence, metrics | DONE | migrations 0002–0004 on SQLite and PostgreSQL 17 (Docker, first start); `/admin/metrics` |
 | Normalised tables, evidence, history (v1.1) | DONE | migration 0003; `/intel/evidence`, `/intel/history/*` checked end to end |
 | Audit log (v1.1) | DONE | login, runs, transition, feedback and scenario rows matched by request id; no password in any row |
-| Recommendation confidence (v1.1) | DONE / PARTIAL | calibrated (ECE ≤ 0.0014), but discrimination is weak (AUC 0.57–0.63) |
+| Recommendation confidence (v1.1) | DONE / PARTIAL | calibrated to the base rate (about 1 %; ECE ≤ 0.002, relative error up to 17 %) with almost no skill beyond it (Brier skill ≤ 0.008) and weak discrimination (AUC 0.55–0.67) |
 | Recommender monitoring (v1.1) | DONE | `/intel/recommendations`; served rows all carry a confidence |
 | Operator console | DONE | 16 sections + 3 detail pages; the demo flow was walked in a real browser on 2026-09-24 |
 | Frontend unit tests | DONE | Vitest: 65 tests in 6 files (was MISSING) |
@@ -123,7 +123,7 @@ evidence gathered while writing this report. Anything not re-run is marked as su
 |---|---|---|
 | Score decisions (`kind: score`, `confidence_kind: interval`) | DONE | e.g. Western 1.36 % [0.74, 2.04]; Horror 7.06 % [3.87, 13.3]; 15/18 genres answered, 3 abstain (coverage < 0.6) |
 | Decision batches (one hashed state, atomic) | DONE | model_governance (2), genre_programming (36, 3 abstained), audience (4); `batch_id` filter checked |
-| Recommendation confidence (isotonic, validation split) | DONE | 20/20 served items carry it (0.0072–0.0189); test ECE 0.00075 (full profile) |
+| Recommendation confidence (isotonic, validation split) | DONE | 20/20 served items carry it (0.0072–0.0189); test ECE 0.00075 (full profile), which at a base rate near 1 % shows calibration to the base rate, not skill |
 | Normalised tables + evidence + history (0003) | DONE | 179 evidence rows per latest-data run (202 for the replay); history over 2+ runs |
 | Audit log | DONE | every expected action found by request id; admin password absent |
 | Recommender monitoring page and endpoint | DONE | served/with-confidence, feedback by reason code, 10-bin histogram |
@@ -136,7 +136,7 @@ evidence gathered while writing this report. Anything not re-run is marked as su
 | Screenshots 22–24 | DONE | evidence, recommender, audit regenerated and inspected |
 
 ### Partial
-- **Recommendation confidence discrimination.** AUC 0.57–0.63, Brier skill +0.45 % warm. It is calibrated, but it
+- **Recommendation confidence discrimination.** AUC 0.57–0.63, Brier skill +0.45 % warm. It is calibrated to the base rate (about 1 %), but it
   barely ranks.
 - **Change points.** 32.5 % detection, 7 % false alarms against 1 % nominal.
 - **Live signals.** Freshness for the app source "cannot be assessed" until real traffic exists. The live-feedback
@@ -284,7 +284,7 @@ evidence gathered while writing this report. Anything not re-run is marked as su
   month).
 - Change points over-alarm (7 % vs 1 % nominal). The rater detector spends budget on heavy genuine users. The lapse
   base rate is 74 %.
-- Recommendation confidence is calibrated but weakly discriminative (AUC 0.57–0.63). Popularity beats the hybrid at
+- Recommendation confidence is calibrated to the base rate (about 1 %; ECE ≤ 0.002, relative error up to 17 %) with almost no skill beyond it (Brier skill ≤ 0.008) and weak discrimination (AUC 0.55–0.67). Popularity beats the hybrid at
   cold start.
 - Open warnings are never auto-resolved.
 - **Behind the Next.js proxy, the API cannot see client addresses.**
@@ -332,7 +332,7 @@ movie recommender as the first domain adapter and a generic structured-dataset a
 
 ## Status
 - [x] Core extraction + movie adapter + generic adapter (FRED unemployment) + early-warning decision + evaluation: golden tests pass (synthetic + real); movie ≈1 s, unemployment ≈0.2 s
-- [x] Preference drift + recommendation strategy + user scenarios + drift evaluation: 37 tests; detector precision 0.92, recall 0.29 (splice 20); adaptation not proven (7 users) → policy serves standard
+- [x] Preference drift + recommendation strategy + user scenarios + drift evaluation: 37 tests; detector precision 0.92 at a 1:1 synthetic prevalence (2 false positives in 78; FPR 0.026, CI 0.007–0.089; about 0.4–0.6 at a 5–10 % prevalence), recall 0.29 (splice 20); adaptation +0.006 on 7 drifting users (3 improved, 4 tied; sign test p = 0.25), no effect established → policy serves standard
 - [x] Frontend platform restructure (identity, nav, domain switcher, /me/intelligence): Vitest 88, tsc/lint/build clean (signed-in pages await the backend)
 - [x] Backend: domain dimension (migration 0005, SQLite + PostgreSQL 17), /intel/domains, /me/intelligence*, recommendations intelligence block: 276 passed; acceptance 69/69; strategy step p50 0.37 ms cached, ~5.5 ms uncached
 - [x] Integration, end-to-end demo, docs, final report (see "Final report: platform migration v1.2.0")
@@ -380,12 +380,26 @@ Baseline: pytest 277 passed / 2 skipped · Vitest 95 · ruff, format, mypy, tsc 
 
 | Workstream | Owner area | Status |
 |---|---|---|
-| Enabler (module split, router registry, migration 0006 + stubs 0007–0010, CI guards) | backend shared files | running |
-| WS3 Recommender quality (global temporal split, leakage tests, cold start, calibration, benchmark) | ml models/evaluation | running |
-| WS4b Second domain (CTA ridership, daily/weekly series, seasonal forecasts) | core forecast/series, domains/generic | running |
-| WS4a Decision-intelligence quality + replay/live separation (P0) | core engines, domains/movie, services/intel | queued (needs 0006) |
-| WS1 Events (append-only, idempotency, replay) | new events modules, write paths | queued (needs enabler) |
-| WS2 Feedback → retraining → gated promotion/rollback | training/registry/governance | queued (needs enabler) |
-| WS5 Online experimentation + persisted strategy decisions | serving, experiments | queued (needs enabler) |
-| Frontend productization | frontend | after backend |
-| Security, evaluation review, QA/release, docs, final review | — | after implementation |
+| Enabler (module split, router registry, migration 0006 + stubs 0007–0010, CI guards) | backend shared files | done: 284 passed / 5 skipped (PostgreSQL-only); 289 on PostgreSQL 17; single head |
+| WS3 Recommender quality (global temporal split, leakage tests, cold start, calibration, benchmark) | ml models/evaluation | done: leak-free benchmark; no candidate passed its adoption rule (global split: 28 warm users); active model unchanged |
+| WS4b Second domain (CTA ridership, daily/weekly series, seasonal forecasts) | core forecast/series, domains/generic | done: CTA forecasts beat naive (rel. MAE 0.33) and seasonal naive (0.77) on 8/8; COVID onset flagged from the first two days of falling ridership (data through 13 March 2020), in a replay of a known event; warning lift 1.44, CI includes 1; no skill on an untouched window |
+| WS4a Decision-intelligence quality + replay/live separation (P0) | core engines, domains/movie, services/intel | done: replay isolation; lineage 100 % resolved; unemployment lift 1.22→1.41; change-point false alarms 9.9 %→1.3 %; CTA flip rate worse (reported) |
+| WS1 Events (append-only, idempotency, replay) | new events modules, write paths | done: 38 tests + PostgreSQL; bitemporal replay; watermark per run; refresher; 730 events/s on SQLite |
+| WS2 Feedback → retraining → gated promotion/rollback | training/registry/governance | done: 20 tests; real quick retrain not shown non-inferior (Δ −0.0009, 90 % CI −0.0073..+0.0055), so the gate rejected it; active model unchanged. The 0.005 margin was underpowered (≈ 36 % pass rate for an equal model); v1.3.0 derives the margins from a power rule |
+| WS5 Online experimentation + persisted strategy decisions | serving, experiments | done: 20 tests; offline A/B replay (610 members) inconclusive: recency +0.026 NDCG@10, p=0.092 vs α 0.025 |
+| Frontend productization | frontend | done: Ops pages (models, experiments, events), decision lineage, proxy signing; Vitest 129 |
+| Security, evaluation review, QA/release, docs, final review | — | done: see "Release 1.3.0" below |
+| Security audit + hardening | auth, tokens, migration 0010, CI | done: 1 High fixed (admin-email squatting at startup); JWT revocation/logout, service tokens, per-account login throttle, pip-audit + pnpm audit (no findings); 20 tests |
+| Validity review | read-only | done: [EVALUATION_AND_VALIDITY_REVIEW.md](EVALUATION_AND_VALIDITY_REVIEW.md); 13 wording corrections + code issues queued for the final pass |
+
+## Release 1.3.0 (2026-09-25)
+
+- Code fixes from the validity review: power-derived gate margins and B = 2000 in quick mode (gate-1.1.0), leak-free
+  tags in the gate, Holm-based significance stars (reports regenerated), per-unit warning rows with a month-cluster
+  lift CI, replay model-version recording and pinning, compose proxy-secret wiring, API contract fixes, the F6
+  health fix, `scripts/repair_dev_db.py` (the local `jev.db` was repaired; backup kept).
+- Docs: R1–R13 applied; README, ARCHITECTURE, CHANGELOG rewritten or extended; new INTELLIGENCE_PIPELINE,
+  docs/ARCHITECTURE, FINAL_VERIFICATION_MATRIX, FINAL_PRINCIPAL_REVIEW, PROJECT_COMPLETION_REPORT.
+- Final validation: pytest 466 passed / 8 skipped (PostgreSQL-only); clean copy 452 passed / 22 skipped; ruff, format,
+  mypy clean; alembic check clean, single head 0010; Vitest 129.
+- Status: **PARTIALLY_COMPLETE** (reasons in [PROJECT_COMPLETION_REPORT.md](PROJECT_COMPLETION_REPORT.md) §12).

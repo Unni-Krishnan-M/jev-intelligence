@@ -1,15 +1,17 @@
 "use client";
 
+import { useState } from "react";
 import useSWR from "swr";
 
 import { fmtDate, Panel, SpecRows, Status } from "@/components/jev/admin/ui";
 import { ModelHealth } from "@/components/jev/intel/badges";
 import { CapabilityNotice, useIntelDomain } from "@/components/jev/intel/domain-context";
 import { PageHeader } from "@/components/jev/intel/page-header";
-import { IntelError, RowsSkeleton } from "@/components/jev/intel/states";
+import { FilterRow, IntelError, RowsSkeleton } from "@/components/jev/intel/states";
+import { RunModeBadge } from "@/components/jev/ops/badges";
 import { EmptyState } from "@/components/jev/states";
 import { Skeleton } from "@/components/ui/skeleton";
-import { api, ApiError } from "@/lib/api";
+import { api, ApiError, qs } from "@/lib/api";
 import { fmtValue, fmtMs, humanize, isNoRun } from "@/lib/intel";
 import type { AdminMetrics, IntelStatus, RunList } from "@/lib/intel-types";
 
@@ -67,7 +69,8 @@ export default function HealthPage() {
   const governance = can("model_governance");
   const status = useSWR<IntelStatus>(dq("/intel/status"), { refreshInterval: 60000 });
   const metrics = useSWR<AdminMetrics>("/admin/metrics", { refreshInterval: 30000 });
-  const runs = useSWR<RunList>(dq("/intel/runs"));
+  const [mode, setMode] = useState("any");
+  const runs = useSWR<RunList>(dq(`/intel/runs${qs({ mode: mode === "any" ? null : mode })}`), { keepPreviousData: true });
   const ih = status.data?.health;
 
   return (
@@ -152,7 +155,10 @@ export default function HealthPage() {
       </section>
 
       <section aria-labelledby="runs-heading" className="mt-8">
-        <h2 id="runs-heading" className="eyebrow mb-3">Pipeline runs</h2>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+          <h2 id="runs-heading" className="eyebrow">Pipeline runs</h2>
+          <FilterRow label="Mode" value={mode} onChange={setMode} options={[{ value: "any", label: "All" }, { value: "live", label: "Live" }, { value: "replay", label: "Replay" }]} />
+        </div>
         {runs.error ? (
           <IntelError error={runs.error} retry={() => runs.mutate()} runBacked={false} />
         ) : !runs.data ? (
@@ -180,6 +186,7 @@ export default function HealthPage() {
                     <td className="px-4 py-2.5">
                       <span className="num" title={r.run_id}>{r.run_id.slice(0, 8)}</span>
                       <span className="block text-xs text-muted-foreground">{r.trigger}</span>
+                      {r.mode && <RunModeBadge mode={r.mode} className="mt-1" />}
                     </td>
                     <td className="px-2 py-2.5">
                       {r.status === "running" ? <span className="text-muted-foreground">running…</span> : <Status ok={r.status === "succeeded"} label={r.status} />}
@@ -189,6 +196,7 @@ export default function HealthPage() {
                     <td className="num px-2 py-2.5 text-right">{fmtMs(r.duration_ms)}</td>
                     <td className="px-2 py-2.5 font-mono text-xs text-muted-foreground">
                       {r.pipeline_version}
+                      {r.event_watermark && <span className="block">events ≤ #{r.event_watermark.max_event_id ?? "—"}</span>}
                       <span className="block max-w-[180px] truncate" title={r.model_version ?? undefined}>{r.model_version ?? "no model"}</span>
                     </td>
                     <td className="max-w-[280px] px-4 py-2.5 text-xs">

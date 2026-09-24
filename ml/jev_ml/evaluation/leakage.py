@@ -61,9 +61,10 @@ def check_split(split: Split) -> dict[str, Any]:
     bad_test = (last_before_test.reindex(te.index) > te).fillna(False)
     if bad_val.any() or bad_test.any():
         raise LeakageError(
-            f"per-user order violated for {int(bad_val.sum())} validation and {int(bad_test.sum())} test users"
+            f"per-user order violated for {int(bad_val.sum())} validation and "
+            f"{int(bad_test.sum())} test users"
         )
-    out.update(users_checked=int(len(te)))
+    out.update(users_checked=len(te))
     return out
 
 
@@ -83,7 +84,7 @@ def tag_cutoffs(split: Split, stage: str) -> float | dict[int, float]:
         starts = pd.concat([split.val, split.test]).groupby("user_id")["timestamp"].min()
     else:
         starts = split.test.groupby("user_id")["timestamp"].min()
-    return {int(u): float(t) for u, t in starts.items()}
+    return {int(u): float(t) for u, t in zip(starts.index.to_numpy(), starts.to_numpy(), strict=True)}
 
 
 def movies_with_tags_before(

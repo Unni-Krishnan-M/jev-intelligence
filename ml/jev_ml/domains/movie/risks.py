@@ -19,6 +19,7 @@ from jev_ml.core.risk import make_risk
 from jev_ml.domains.movie.config import IntelConfig
 from jev_ml.domains.movie.ingest import Prepared
 from jev_ml.domains.movie.modelstats import influence, new_events_since_training
+from jev_ml.domains.movie.raters import RATER_FEATURES
 
 
 def genre_risks(
@@ -152,8 +153,6 @@ def manipulation_risk(
     users = [int(a["entity"]) for a in active]
     infl = influence(prep.ratings, prep.as_of_ts, cfg, users)
     strength = float(np.mean([clip01((a["value"] - 0.5) / 0.3) for a in active]))
-    from jev_ml.intel.anomalies import RATER_FEATURES
-
     pct = feats[list(RATER_FEATURES)].rank(pct=True)
     extreme = ((pct <= 0.05) | (pct >= 0.95)).mean(axis=1)
     agree = float(extreme.reindex(users).mean())
@@ -257,6 +256,7 @@ def model_risks(
                 "Retrain once enough new interactions accumulate (see the retrain decision).",
                 cfg,
                 as_of_key,
+                confidence_kind="rule",
             )
         )
     if boot and not boot.get("insufficient") and boot.get("hybrid"):

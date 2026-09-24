@@ -20,6 +20,8 @@ import { CountBars, NamedBars, TableView } from "@/components/jev/intel/charts";
 import Link, { useIntelDomain } from "@/components/jev/intel/domain-context";
 import { PageHeader } from "@/components/jev/intel/page-header";
 import { IntelError, PanelsSkeleton } from "@/components/jev/intel/states";
+import { OpsStrip } from "@/components/jev/ops/ops-strip";
+import { RunModeBadge } from "@/components/jev/ops/badges";
 import { EmptyState } from "@/components/jev/states";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -32,6 +34,7 @@ import type { IntelStatus, Run } from "@/lib/intel-types";
 
 function RunControl({ lastAsOf }: { lastAsOf?: string | null }) {
   const [asOf, setAsOf] = useState("");
+  const [knowledge, setKnowledge] = useState("");
   const [busy, setBusy] = useState(false);
   const revalidate = useIntelRevalidate();
   const { domain, name } = useIntelDomain();
@@ -40,7 +43,8 @@ function RunControl({ lastAsOf }: { lastAsOf?: string | null }) {
     setBusy(true);
     try {
       // the domain goes in the body (platform.md §8); the API defaults to movie without it
-      const r = await api<Run>("/intel/runs", { json: asOf ? { domain, as_of: asOf } : { domain } });
+      // knowledge_time (P2.4 + WS1) is valid only with as_of: events ingested after it are unknown to the run
+      const r = await api<Run>("/intel/runs", { json: asOf ? { domain, as_of: asOf, ...(knowledge ? { knowledge_time: knowledge } : {}) } : { domain } });
       if (r.status === "failed") toast.error(`Run failed${r.error ? `: ${r.error}` : ""}`);
       else toast.success(`Run ${r.status} · as of ${fmtDate(r.as_of)} · ${fmtMs(r.duration_ms)}`);
       await revalidate();
@@ -57,17 +61,23 @@ function RunControl({ lastAsOf }: { lastAsOf?: string | null }) {
       <div className="mt-3 flex flex-wrap items-end gap-2">
         <div className="min-w-0 flex-1 space-y-1">
           <Label htmlFor="replay" className="text-xs font-normal text-muted-foreground">Replay as of (optional)</Label>
-          <Input id="replay" type="date" value={asOf} onChange={(e) => setAsOf(e.target.value)} className="num h-8" max={new Date().toISOString().slice(0, 10)} />
+          <Input id="replay" type="date" value={asOf} onChange={(e) => { setAsOf(e.target.value); if (!e.target.value) setKnowledge(""); }} className="num h-8" max={new Date().toISOString().slice(0, 10)} />
+        </div>
+        <div className="min-w-0 flex-1 space-y-1">
+          <Label htmlFor="knowledge" className="text-xs font-normal text-muted-foreground">Knowledge time (optional)</Label>
+          <Input id="knowledge" type="date" value={knowledge} onChange={(e) => setKnowledge(e.target.value)} className="num h-8" disabled={!asOf} min={asOf || undefined} max={new Date().toISOString().slice(0, 10)} aria-describedby="knowledge-help" />
         </div>
         <Button onClick={run} disabled={busy}>
           <Play aria-hidden /> {busy ? "Running…" : asOf ? "Replay" : "Run now"}
         </Button>
       </div>
-      <p className="mt-2 text-xs text-muted-foreground" aria-live="polite">
+      <p id="knowledge-help" className="mt-2 text-xs text-muted-foreground" aria-live="polite">
         {busy
           ? "Running synchronously; this usually takes a few seconds."
           : asOf
-            ? "Uses only data at or before that date, so the run is leak-free."
+            ? knowledge
+              ? "Uses data at or before as-of, as it was known on the knowledge date: later corrections stay invisible."
+              : "Uses only data at or before that date, so the run is leak-free. Knowledge time defaults to as-of."
             : `Defaults to the latest event in the ${name} data${lastAsOf ? ` (last run: ${fmtDate(lastAsOf)})` : ""}.`}
       </p>
     </div>
@@ -167,11 +177,13 @@ function Overview({ s, run }: { s: IntelStatus; run: Run }) {
         <Link href="/intel/health" className="ml-auto text-xs text-primary hover:underline">System health →</Link>
       </section>
 
+      <OpsStrip />
+
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <Panel title="Latest run">
           <SpecRows
             rows={[
-              { label: "Status", value: <Status ok={run.status === "succeeded"} label={`${run.status} · ${run.trigger}`} /> },
+              { label: "Status", value: <span className="inline-flex items-center gap-2"><Status ok={run.status === "succeeded"} label={`${run.status} · ${run.trigger}`} />{run.mode && <RunModeBadge mode={run.mode} />}</span> },
               { label: "As of (data clock)", value: fmtDate(run.as_of) },
               { label: "Run at (wall clock)", value: fmtDate(run.started_at) },
               { label: "Data clock behind", value: fmtDays(lag) },
@@ -179,6 +191,7 @@ function Overview({ s, run }: { s: IntelStatus; run: Run }) {
               { label: "Pipeline", value: run.pipeline_version },
               { label: "Model", value: run.model_version ?? "— (no model)" },
               { label: "Data", value: <span title={run.data_version}>{run.data_version}</span> },
+              ...(run.event_watermark ? [{ label: "Events read", value: `≤ #${run.event_watermark.max_event_id ?? "—"} · ${run.event_watermark.n_events.toLocaleString()} events` }] : []),
             ]}
           />
         </Panel>

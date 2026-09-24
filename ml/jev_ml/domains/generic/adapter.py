@@ -29,6 +29,7 @@ from jev_ml.core.adapter import CoreContext, DomainData, DomainExtras, DomainInf
 from jev_ml.core.common import iso_from_epoch, to_utc
 from jev_ml.core.config import CoreConfig
 from jev_ml.core.quality import source_row, to_epoch
+from jev_ml.core.series import season_classes
 from jev_ml.domains.generic.config import GenericDomainConfig, load_config
 
 DAY = 86400.0
@@ -138,6 +139,11 @@ class GenericAdapter:
             }
         )
         obs["entity_id"] = obs["entity_type"] + ":" + obs["entity"]
+        cc_col = self.cfg.calendar_check.get("column")
+        if cc_col:
+            if cc_col not in raw.columns:
+                raise ValueError(f"{self.key}: calendar_check column {cc_col!r} not in the data file")
+            obs["_calendar_label"] = raw[cc_col].astype(str).to_numpy()
         for g in c.get("groups") or []:
             if g not in raw.columns:
                 raise ValueError(f"{self.key}: group column {g!r} not in the data file")
@@ -220,7 +226,7 @@ class GenericAdapter:
             ],
             core_checks=True,
             excluded_after_as_of=n_unpub,
-            frequency="M" if self.cfg.frequency == "month" else "W",
+            frequency={"month": "M", "week": "W", "day": "D"}[self.cfg.frequency],
             grid_end=self.cfg.grid_end,
             context=self.cfg,
         )
@@ -279,7 +285,31 @@ class GenericAdapter:
                     "source": src,
                 }
             )
+        if self.cfg.calendar_check and len(obs) and "_calendar_label" in obs.columns:
+            out.append(self._calendar_check(obs, src))
         return out
+
+    def _calendar_check(self, obs: pd.DataFrame, src: str) -> dict[str, Any]:
+        """Share of observed days whose rule-based calendar class (``season_classes``) matches the
+        data's own day-type label: evidence that the calendar used for *future* days is right."""
+        cc = self.cfg.calendar_check
+        days = pd.to_datetime(obs["timestamp"], unit="s").dt.normalize()
+        uniq = pd.DataFrame({"d": days, "l": obs["_calendar_label"]}).drop_duplicates("d")
+        per = pd.PeriodIndex(uniq["d"], freq="D")
+        cls = season_classes(per, 7, cc["calendar"])
+        names = np.where(cls <= 4, "weekday", np.where(cls == 5, "saturday", "sunday_holiday"))
+        want = np.array([cc["labels"].get(str(x)) for x in names], dtype=object)
+        agree = float(np.mean(want == uniq["l"].to_numpy())) if len(uniq) else 1.0
+        return {
+            "name": f"{src}_calendar",
+            "passed": agree >= 0.99,
+            "value": round(agree, 5),
+            "threshold": 0.99,
+            "severity": "info" if agree >= 0.99 else "warning",
+            "detail": f"calendar {cc['calendar']} matches column {cc['column']!r} on {agree:.2%} of "
+            f"{len(uniq)} days ({round((1 - agree) * len(uniq))} disagree)",
+            "source": src,
+        }
 
     def extra(self, ctx: CoreContext) -> DomainExtras:
         return DomainExtras()

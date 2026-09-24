@@ -129,6 +129,8 @@ Core `jev_ml/core/drift.py` provides generic drift tests between an entity's *hi
 - **Config:** `configs/domains/<name>.yaml`: source file, timestamp column, entity column, value column, optional
   group columns, frequency, metrics (`level` / `count` / `mean` / `share` / `nunique`), adverse direction, and an
   optional declared impact weight per entity (labelled as declared).
+- **Second reference domain:** `cta-ridership`, daily Chicago Transit Authority boardings (City of Chicago Data
+  Portal): see [SECOND_DOMAIN_CASE_STUDY.md](SECOND_DOMAIN_CASE_STUDY.md).
 - **Demo dataset:** `us-unemployment`, monthly unemployment rates for the US and a set of states, from the Bureau
   of Labor Statistics via FRED (public domain).
   - `scripts/download_domain_data.py us-unemployment` fetches it, records the SHA-256 of each file, and writes a
@@ -311,6 +313,10 @@ days until the event count matches) was tried and rejected: its false-positive r
   and *how it is rated* changes.
 - Label 0: A untouched. Real histories can contain genuine drift, so the FPR is an upper bound.
 - Precision is at 1:1 prevalence. The same 78 untouched histories have enough sessions to test.
+- **Reading the precision.** "Precision 0.92" (m = 20) is precision at a 1:1 synthetic prevalence (23 true positives
+  of 78 spliced, 2 false positives in 78 untouched; FPR 0.026, 95 % CI 0.007–0.089). At a 5–10 % prevalence this
+  implies a precision of about 0.4–0.6. The label-1 class is a synthetic splice, and the session-permutation mode was
+  chosen on the same 78 negatives.
 
 | mode | m | preference aspects P / R (95% CI) / F1 | FPR (pref.) | any aspect P / R | FPR (any) |
 |---|---|---|---|---|---|
@@ -344,7 +350,15 @@ days until the event count matches) was tried and rejected: its false-positive r
 
 Recall@10 differences are 0.000 for the 7 drifting users (refit).
 
-**Decision from the data.** The only CI that excludes zero rests on 7 users, of whom 3 improved. That is too few to
+The +0.0063 for `adapt_to_recent` on 7 drifting users rests on 3 improved, 4 tied and 0 worse (exact sign test
+p = 0.25); a percentile bootstrap on n = 7 is anti-conservative, so **no effect is established**. Two further
+variants were evaluated on the same 7 users and are stored in the same `report.json` (not adopted):
+`adapt_strong_floor_0.1` (+0.0298, 5 improved, 0 worse; sign test p = 0.06; +0.0016, n.s., on all 592 users) and
+`explore_lambda_0.7` (+0.0015, CI −0.0014..+0.0048). Four variants tried on 7 users is itself a multiple-comparison
+problem. Counts: the 7 users here are drift in the *train + validation* history (the adaptation protocol); the 9
+under "Real users" below are drift over *all* data.
+
+**Decision from the data.** The only CIs that exclude zero rest on 7 users (3 improved for the served variant). That is too few to
 change what drifting users are served. The larger event-mode group of 59 shows no effect, and neither does the full
 population. The policy therefore requires at least 30 evaluated drifting users. Neither alternative qualifies, so
 drifting users keep `standard`. The decision still reports the drift, and the rationale and evidence show the
@@ -415,12 +429,61 @@ signals → summary. Stage timings keep the v1.1 keys. Every object gains `domai
 `core_version` (`core-1.0.0`), `frequency`, `validation`. `summary.counts.early_warning` counts levels.
 
 ### Series builder
-Metrics `count | share | mean | nunique | level`, monthly (weekly supported), list-valued group columns (a film
+Metrics `count | share | mean | nunique | level | sum`, monthly, weekly (Mon..Sun) or daily, list-valued group columns (a film
 counts once per genre), `grid_end = as_of` (partial month excluded from every baseline) or
 `last_observation` (published statistics). Consecutive specs with the same `group_by` are emitted entity by entity,
 which reproduces the v1.1 series order. Spec flags route series to trend / anomaly scan / forecast / share
 forecast; `volume_guard` + `min_volume`, `resolution` (published precision guard) and `anomaly_basis`
 (`level` | `change`: score period-over-period changes, for smooth level series) are per spec.
+
+### Daily/weekly frequency and seasonality (WS4b; opt-in, monthly output byte-identical)
+- **Frequency** `frequency: day | week | month` (config); `run.frequency`, `series[].frequency` and
+  `forecast.horizon_unit` report `day`/`week`/`month`. Partial-period logic is unchanged (a period is complete once the
+  next one has started at as_of; at midnight the previous day is the last complete one). Gaps stay NaN; duplicates are
+  dropped by the core validator (CTA station data has 10). `sum` = sum of values with a `min_count` guard (a week with
+  a missing day is NaN, not a low week). Derived values: `rolling: k` (trailing mean, all k periods required) and
+  `ratio_lag: L` (ratio to L periods earlier), e.g. the 28-day total against the weekday-aligned 28 days a year earlier.
+- **Season classes** (`core.series.season_classes`): day of week for days, week of year for weeks, month for months.
+  `calendar: weekday_us_holidays` maps New Year's, Memorial, Independence, Labor, Thanksgiving and Christmas Day
+  (observed on the nearest weekday) to the Sunday class. On CTA's own `day_type` column it agrees on 99.91 % of 9,312
+  days (adapter check `<source>_calendar`, config `calendar_check`). `anomaly_calendar: weekday_us_special_days` adds
+  class 7 (those six plus MLK Day, Presidents' Day, the Friday after Thanksgiving and 24–31 Dec) for anomaly baselines
+  only.
+- **Seasonal forecasting** (`core.forecast`, taken when a spec sets `forecast_models` or `seasonal_period`):
+  - Candidates: `naive, moving_average, holt_damped, drift, theta, seasonal_naive, seasonal_naive_yearly`
+    (364 d / 52 w / 12 m), `calendar_naive` (the latest period of the same class), `holt_winters` (additive damped
+    ETS(A,Ad,A) on log1p for counts, grid `HW_*`, one causal pass over all origins) and `holt_winters_calendar`
+    (season index = calendar class).
+  - Gaps are filled for fitting (same class) and never scored.
+  - MASE uses the in-sample lag-m naive scale. `backtest.naive_mase` is the **seasonal-naive** benchmark
+    (`benchmark: seasonal_naive`), so the risk/signal/early-warning "beats naive" skill is measured against seasonal
+    naive. `random_walk_mase` and `seasonal_naive_mase` are reported too, plus `rmse`.
+  - Selection is unchanged: lowest backtest MASE on the origins before the issue time. Intervals are the same conformal
+    order statistics.
+  - `rolling_evaluation(series, cfg, ...)` replays that whole served procedure at many issue times.
+  - Scenarios rerun the selected model through `forecast.rerun` and word the horizon in the series' own unit.
+- **Seasonal anomaly baseline** `anomaly_basis: seasonal`: a point is scored against the previous
+  `anomaly_baseline_months` points *of its class* (Mondays with Mondays). This is the only hook in
+  `core/anomalies.py`: one additive branch.
+- **Other hooks outside WS4b ownership** (additive, identical for monthly/weekly):
+  - `risk.recent_from` parses the period with the series' own frequency (it was hard-coded to weeks for any non-month).
+  - `pipeline` reports `run.frequency = "day"`.
+- **Known cosmetic gaps (WS4a modules):**
+  - `signals.period_age_days` treats a daily date ending in `-01` as a month and other daily dates as weeks, so
+    `freshness_days` of daily signals can be off by up to 6 days.
+  - Risk titles print `detected_at[:7]` (a month) for daily anomalies.
+- **Evaluation** (`scripts/evaluate_domains.py`, `domains/generic/evaluation.py`):
+  - `plain_config` is the generic baseline: same data and thresholds, every seasonal option removed.
+  - The seasonal confirmation rule is a sustained (two consecutive weeks) fall of the weekday-aligned year-over-year
+    change of the 7-day total beyond 2σ√k within 4 weeks.
+  - Units are (replay, entity), with a warned-status flip rate.
+  - Results: [SECOND_DOMAIN_CASE_STUDY.md](SECOND_DOMAIN_CASE_STUDY.md).
+- **us-unemployment** keeps its v1.2 config. Its synthetic golden (`tests/domains/test_generic_golden.py`, written
+  before this work) is byte-identical.
+  - A rolling replay of the served forecast over 2005–2026 (monthly issue times) gives:
+    - v1.2 trio: median relative MAE vs naive 0.993, below 1 on 10 of 17 series, 80 % coverage 0.69.
+    - With drift and theta added: 0.986, again 10 of 17, coverage 0.69.
+  - That gain is too small to change what is served. The monthly forecasts are still essentially naive.
 
 ### Early-warning decision (`early_warning_level`, policy `ewl-1.0.0`)
 One decision per situation: `series:<id>` (trend, change point, anomalies, forecast and risks naming the series) or

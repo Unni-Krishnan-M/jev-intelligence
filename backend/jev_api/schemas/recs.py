@@ -67,6 +67,9 @@ class RecommendationResponse(BaseModel):
     profile: dict[str, int]
     cached: bool = False
     intelligence: RecIntelligence | None = None
+    # Phase 2: request_id is fresh on every response; a cache hit names the request that generated the
+    # list (its recommendation_ids belong to that request). Null when the list was generated now.
+    source_request_id: str | None = None
 
 
 class SimpleRecItem(BaseModel):

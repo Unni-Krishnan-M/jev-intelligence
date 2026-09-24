@@ -80,6 +80,8 @@ class IntelRun(Base):
     # PipelineResult.to_dict() (~0.5 MB): deferred, so listing runs never loads it
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON, deferred=True)
     created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    # WS1 (migration 0007): the events the run read (max event id / ingested_at, as_of, knowledge time)
+    event_watermark: Mapped[dict[str, Any] | None] = mapped_column(JSON)
 
 
 def run_mode(requested_as_of: datetime | None) -> str:

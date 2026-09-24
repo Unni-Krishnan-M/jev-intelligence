@@ -31,7 +31,7 @@ import numpy as np
 
 from jev_ml.core.common import clip01, evidence, fnum, period_str, stable_id
 from jev_ml.core.config import SEVERITIES, CoreConfig, severity_rank
-from jev_ml.core.series import Series
+from jev_ml.core.series import Series, seasonal_baseline_rows
 
 
 def suppression(key: str, severity: str, suppressed: dict[str, str]) -> str | None:
@@ -91,13 +91,19 @@ def scan_series(
     out: list[dict[str, Any]] = []
     tf = np.log1p if (s.is_count and not change) else (lambda a: a)
     min_volume = s.min_volume if s.min_volume is not None else cfg.anomaly_min_volume
+    classes = s.anomaly_classes(months) if s.anomaly_basis == "seasonal" else np.zeros(0, dtype=np.int64)
     for i in range(max(0, n - scan), n):
         x = values[i]
         if not np.isfinite(x):
             continue
-        lo = max(0, i - cfg.anomaly_baseline_months)
-        base_raw = values[lo:i]
-        base_cnt = counts[lo:i]
+        if s.anomaly_basis == "seasonal":  # WS4b hook: baseline = earlier periods of the same season class
+            rows = seasonal_baseline_rows(classes, i, cfg.anomaly_baseline_months)
+            base_raw = values[rows]
+            base_cnt = counts[rows] if len(counts) == n else counts[:0]
+        else:
+            lo = max(0, i - cfg.anomaly_baseline_months)
+            base_raw = values[lo:i]
+            base_cnt = counts[lo:i]
         ok = np.isfinite(base_raw)
         if ok.sum() < cfg.anomaly_min_baseline_months:
             continue

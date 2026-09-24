@@ -34,8 +34,14 @@ log = logging.getLogger(__name__)
 class ALSRecommender(Recommender):
     name = "als"
 
-    def __init__(self, factors: int = 64, regularization: float = 0.05, alpha: float = 10.0,
-                 iterations: int = 15, seed: int = 42) -> None:
+    def __init__(
+        self,
+        factors: int = 64,
+        regularization: float = 0.05,
+        alpha: float = 10.0,
+        iterations: int = 15,
+        seed: int = 42,
+    ) -> None:
         self.factors = factors
         self.regularization = regularization
         self.alpha = alpha
@@ -124,19 +130,32 @@ class ALSRecommender(Recommender):
         wy = np.linalg.solve(a, self.item_factors[item])  # W_u y_i  (W_u symmetric)
         contrib = (self.item_factors[profile.items] @ wy) * c
         order = np.argsort(-contrib)[:3]
-        return [Contribution(kind="item", item=int(profile.items[j]), value=float(contrib[j]))
-                for j in order if contrib[j] > 0]
+        return [
+            Contribution(kind="item", item=int(profile.items[j]), value=float(contrib[j]))
+            for j in order
+            if contrib[j] > 0
+        ]
 
     def params(self) -> dict[str, Any]:
-        return {"factors": self.factors, "regularization": self.regularization, "alpha": self.alpha,
-                "iterations": self.iterations, "seed": self.seed}
+        return {
+            "factors": self.factors,
+            "regularization": self.regularization,
+            "alpha": self.alpha,
+            "iterations": self.iterations,
+            "seed": self.seed,
+        }
 
     def save(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(path / "als_factors.npz", user_factors=self.user_factors.astype(np.float32),
-                            item_factors=self.item_factors.astype(np.float32))
-        self._write_json(path / "als.json", {**self.params(), "loss_history": self.loss_history,
-                                             "train_seconds": self.train_seconds})
+        np.savez_compressed(
+            path / "als_factors.npz",
+            user_factors=self.user_factors.astype(np.float32),
+            item_factors=self.item_factors.astype(np.float32),
+        )
+        self._write_json(
+            path / "als.json",
+            {**self.params(), "loss_history": self.loss_history, "train_seconds": self.train_seconds},
+        )
 
     @classmethod
     def load(cls, path: Path) -> ALSRecommender:

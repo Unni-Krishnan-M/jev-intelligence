@@ -38,7 +38,14 @@ export const SYSTEM_NAV: NavItem[] = [
   { href: "/intel/audit", label: "Audit log" },
 ];
 
-const FLAT = [...CONSOLE_NAV.flatMap((i) => [i, ...(i.children ?? [])]), ...SYSTEM_NAV];
+/** Phase 2 operations: the event log, the model lifecycle and online experiments (admin). */
+export const OPS_NAV: NavItem[] = [
+  { href: "/intel/ops/events", label: "Events" },
+  { href: "/intel/ops/models", label: "Model lifecycle" },
+  { href: "/intel/ops/experiments", label: "Experiments" },
+];
+
+const FLAT = [...CONSOLE_NAV.flatMap((i) => [i, ...(i.children ?? [])]), ...OPS_NAV, ...SYSTEM_NAV];
 
 function isActive(href: string, pathname: string) {
   if (href === "/intel") return pathname === "/intel";
@@ -111,6 +118,10 @@ function Shell({ children }: { children: React.ReactNode }) {
               {t.children?.map((c) => <RailLink key={c.href} item={c} pathname={pathname} nested />)}
             </li>
           ))}
+        </ul>
+        <p className="eyebrow mb-1.5 mt-5">Operations</p>
+        <ul className="border-l hairline">
+          {OPS_NAV.map((t) => <li key={t.href}><RailLink item={t} pathname={pathname} /></li>)}
         </ul>
         <p className="eyebrow mb-1.5 mt-5">System</p>
         <ul className="border-l hairline">

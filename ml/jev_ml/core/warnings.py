@@ -18,7 +18,9 @@ carries that decision's id (``decision_id``) and level (``early_warning_level``)
 Keys an operator dismissed are dropped unless the severity escalated. One warning per key (the most
 severe, then highest observed value), sorted by severity, confidence, key; at most ``max_warnings``.
 ``confidence`` is carried from the source (risk confidence, the anomaly's normalised strength, or the
-decision's margin) and is labelled ``confidence_kind: "margin"``: evidence strength, not a probability.
+decision's margin) together with the source's ``confidence_kind`` (core-1.1.0: a risk-sourced warning
+takes the risk's kind, ``rule`` / ``margin`` / ``evidence``; anomaly and situation warnings are
+``margin``). None of them is a probability.
 """
 
 from __future__ import annotations
@@ -68,7 +70,8 @@ def _risk_warning(r: dict[str, Any], cfg: CoreConfig) -> dict[str, Any]:
         ),
         "severity": r["level"],
         "confidence": r["confidence"],
-        "confidence_kind": "margin",
+        # core-1.1.0: the risk's own confidence kind (was always "margin")
+        "confidence_kind": r.get("confidence_kind") or "evidence",
         "trigger": {
             "rule": f"risk.level>={cfg.warning_min_severity}",
             "condition": f"score {r['score']:.1f} >= {thr}",

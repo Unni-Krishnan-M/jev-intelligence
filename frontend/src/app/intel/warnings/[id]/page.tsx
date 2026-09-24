@@ -1,6 +1,6 @@
 "use client";
 
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, Bot } from "lucide-react";
 import { useParams } from "next/navigation";
 import { useState } from "react";
 import { toast } from "sonner";
@@ -13,6 +13,7 @@ import { EvidenceList } from "@/components/jev/intel/evidence-list";
 import { LevelBadge, LevelScale } from "@/components/jev/intel/level-scale";
 import { FeedbackButtons } from "@/components/jev/intel/feedback-buttons";
 import { IntelError } from "@/components/jev/intel/states";
+import { LineageViewer } from "@/components/jev/ops/lineage-viewer";
 import { EmptyState } from "@/components/jev/states";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -20,6 +21,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { api, ApiError, errorMessage } from "@/lib/api";
 import { isEarlyWarningDecision, isEarlyWarningLevel, LEVEL_LABEL } from "@/lib/decisions";
 import { fmtAnswer, fmtValue, sourceHref, TRANSITIONS, useIntelRevalidate } from "@/lib/intel";
+import { isAutoResolve } from "@/lib/ops";
 import type { DecisionRecord, IntelWarning, WarningStatus } from "@/lib/intel-types";
 
 const ACTION_LABEL: Record<WarningStatus, string> = {
@@ -190,6 +192,7 @@ export default function WarningDetailPage() {
           <Panel title="Evidence">
             <EvidenceList items={w.evidence} />
           </Panel>
+          <LineageViewer path={dq(`/intel/warnings/${w.id}/lineage`)} />
         </div>
 
         <div className="space-y-4">
@@ -229,6 +232,9 @@ export default function WarningDetailPage() {
                         <span className="font-medium">{m.label}</span>
                       </p>
                       <p className="font-mono text-xs text-muted-foreground">{fmtDate(h.at)} · {h.actor}</p>
+                      {isAutoResolve(h) && (
+                        <p className="mt-1 inline-flex items-center gap-1.5 rounded border hairline px-1.5 py-0.5 text-xs"><Bot className="size-3.5 text-muted-foreground" aria-hidden /> Resolved automatically by JEV</p>
+                      )}
                       {h.note && <p className="mt-1 text-sm text-ink-2">{h.note}</p>}
                     </li>
                   );

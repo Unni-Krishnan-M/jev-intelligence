@@ -1,12 +1,24 @@
 from __future__ import annotations
 
-from typing import Literal
+from collections.abc import Callable
+from datetime import datetime
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import delete, func, or_, select
+from fastapi import APIRouter, Header, HTTPException, Query, Request, status
+from sqlalchemy import func, or_, select
 
 from jev_api.deps import DB, MAX_COUNT, MAX_PAGE, AdminUser, CurrentUser, Engine, IdPath, OptionalUser
-from jev_api.models import Favorite, Genre, Movie, MovieGenre, Rating, User, WatchHistory
+from jev_api.models import (
+    DEFAULT_DOMAIN,
+    Favorite,
+    Genre,
+    Movie,
+    MovieGenre,
+    Rating,
+    User,
+    WatchHistory,
+    utcnow,
+)
 from jev_api.schemas import (
     FavoriteRequest,
     InteractionResult,
@@ -16,6 +28,8 @@ from jev_api.schemas import (
     MoviePage,
     RateRequest,
 )
+from jev_api.schemas.events import IDEMPOTENCY_KEY_PATTERN
+from jev_api.services import events
 
 router = APIRouter(tags=["movies"])
 
@@ -27,12 +41,6 @@ def _get_movie(db: DB, movie_id: int) -> Movie:
     if movie is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "movie not found")
     return movie
-
-
-def _bump(db: DB, user: User) -> int:
-    user.profile_version += 1
-    db.commit()
-    return user.profile_version
 
 
 @router.get("/genres", response_model=list[dict])
@@ -142,42 +150,115 @@ def get_movie(movie_id: IdPath, db: DB, user: OptionalUser, engine: Engine) -> M
     return detail
 
 
+# --- member writes: an event first, the current-state row is its projection (services/events.py) ---------
+IdempotencyKeyHeader = Annotated[
+    str | None,
+    Header(
+        alias="Idempotency-Key",
+        min_length=1,
+        max_length=200,
+        pattern=IDEMPOTENCY_KEY_PATTERN,
+        description="optional: a retry with the same key returns the first response and writes nothing",
+    ),
+]
+
+
+def _interaction(
+    request: Request,
+    db: DB,
+    user: User,
+    key: str | None,
+    route: str,
+    body: dict[str, Any],
+    work: Callable[[datetime], dict[str, Any]],
+) -> InteractionResult:
+    fp = events.fingerprint(request.method, route, body)
+
+    def run() -> dict[str, Any]:
+        now = utcnow()
+        out = work(now)
+        user.profile_version += 1
+        out["profile_version"] = user.profile_version
+        return out
+
+    try:
+        response, replayed = events.idempotent(db, events.user_scope(user), key, fp, run)
+    except events.IdempotencyMismatchError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    if not replayed:
+        events.refresher_for(request.app).mark_dirty(DEFAULT_DOMAIN)
+    return InteractionResult(**response)
+
+
 @router.post("/movies/{movie_id}/rate", response_model=InteractionResult)
-def rate_movie(movie_id: IdPath, body: RateRequest, user: CurrentUser, db: DB) -> InteractionResult:
+def rate_movie(
+    movie_id: IdPath,
+    body: RateRequest,
+    user: CurrentUser,
+    db: DB,
+    request: Request,
+    key: IdempotencyKeyHeader = None,
+) -> InteractionResult:
     _get_movie(db, movie_id)
-    r = db.scalar(select(Rating).where(Rating.user_id == user.id, Rating.movie_id == movie_id))
-    if r is None:
-        db.add(Rating(user_id=user.id, movie_id=movie_id, rating=body.rating))
-    else:
-        r.rating = body.rating
-    return InteractionResult(movie_id=movie_id, rating=body.rating, profile_version=_bump(db, user))
+
+    def work(now: datetime) -> dict[str, Any]:
+        events.apply_member_event(db, user, "rating", movie_id, value=body.rating, key=key, now=now)
+        return {"movie_id": movie_id, "rating": body.rating}
+
+    return _interaction(request, db, user, key, f"/movies/{movie_id}/rate", body.model_dump(), work)
 
 
 @router.delete("/movies/{movie_id}/rate", response_model=InteractionResult)
-def unrate_movie(movie_id: IdPath, user: CurrentUser, db: DB) -> InteractionResult:
-    db.execute(delete(Rating).where(Rating.user_id == user.id, Rating.movie_id == movie_id))
-    return InteractionResult(movie_id=movie_id, rating=None, profile_version=_bump(db, user))
+def unrate_movie(
+    movie_id: IdPath, user: CurrentUser, db: DB, request: Request, key: IdempotencyKeyHeader = None
+) -> InteractionResult:
+    def work(now: datetime) -> dict[str, Any]:
+        if db.get(Movie, movie_id) is not None:  # an unknown movie has no rating: nothing to record
+            events.apply_member_event(db, user, "rating_removed", movie_id, key=key, now=now)
+        return {"movie_id": movie_id, "rating": None}
+
+    return _interaction(request, db, user, key, f"/movies/{movie_id}/rate", {}, work)
 
 
 @router.post("/movies/{movie_id}/favorite", response_model=InteractionResult)
 def favorite_movie(
-    movie_id: IdPath, user: CurrentUser, db: DB, body: FavoriteRequest | None = None
+    movie_id: IdPath,
+    user: CurrentUser,
+    db: DB,
+    request: Request,
+    body: FavoriteRequest | None = None,
+    key: IdempotencyKeyHeader = None,
 ) -> InteractionResult:
     _get_movie(db, movie_id)
     want = True if body is None else body.favorite
-    existing = db.scalar(select(Favorite).where(Favorite.user_id == user.id, Favorite.movie_id == movie_id))
-    if want and existing is None:
-        db.add(Favorite(user_id=user.id, movie_id=movie_id))
-    elif not want and existing is not None:
-        db.delete(existing)
-    return InteractionResult(movie_id=movie_id, is_favorite=want, profile_version=_bump(db, user))
+
+    def work(now: datetime) -> dict[str, Any]:
+        etype = "favorite" if want else "unfavorite"
+        events.apply_member_event(db, user, etype, movie_id, key=key, now=now)
+        return {"movie_id": movie_id, "is_favorite": want}
+
+    return _interaction(request, db, user, key, f"/movies/{movie_id}/favorite", {"favorite": want}, work)
 
 
 @router.post("/movies/{movie_id}/watch", response_model=InteractionResult)
-def watch_movie(movie_id: IdPath, user: CurrentUser, db: DB) -> InteractionResult:
+def watch_movie(
+    movie_id: IdPath, user: CurrentUser, db: DB, request: Request, key: IdempotencyKeyHeader = None
+) -> InteractionResult:
+    """Watches are additive. A keyless watch identical to one recorded in the last
+    events_watch_dedupe_seconds is a client retry: it returns the current state and appends nothing."""
     _get_movie(db, movie_id)
-    db.add(WatchHistory(user_id=user.id, movie_id=movie_id))
-    return InteractionResult(movie_id=movie_id, watched=True, profile_version=_bump(db, user))
+    if key is None:
+        window = request.app.state.settings.events_watch_dedupe_seconds
+        if events.recent_watch(db, user.id, movie_id, window, utcnow()):
+            events.count_ingest(db, DEFAULT_DOMAIN, utcnow().date(), duplicates=1)
+            db.commit()
+            return InteractionResult(movie_id=movie_id, watched=True, profile_version=user.profile_version)
+
+    def work(now: datetime) -> dict[str, Any]:
+        events.apply_member_event(db, user, "watch", movie_id, key=key, now=now)
+        return {"movie_id": movie_id, "watched": True}
+
+    return _interaction(request, db, user, key, f"/movies/{movie_id}/watch", {}, work)
 
 
 @router.post("/movies", response_model=MovieDetail, status_code=status.HTTP_201_CREATED)

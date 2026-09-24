@@ -13,8 +13,8 @@ actual score). Additive platform fields: ``severity`` (= level), ``contributing_
 Generic families (``CoreConfig.generic_risks``), for series that declare an adverse direction:
 
 * ``adverse_trend``: the trend moves in the adverse direction (Mann–Kendall p < alpha, Theil–Sen CI
-  excluding 0) and survives the FDR (q <= trend_fdr). likelihood = 1 - p; confidence = share of
-  window periods with data x (1 - q).
+  excluding 0) and survives the FDR (q <= trend_fdr), and is not reversing (core-1.1.0,
+  ``trend.recent_move``). likelihood = 1 - p; confidence = share of window periods with data x (1 - q).
 * ``adverse_forecast``: the selected forecast model beats naive in its backtest (skill =
   1 - MASE / naive MASE > 0) and the mean of the next horizon moves >= forecast_risk_min_change
   (relative) against the last horizon, in the adverse direction. likelihood = share of forecast
@@ -44,6 +44,18 @@ from jev_ml.core.common import clip01, evidence, fnum, stable_id
 from jev_ml.core.config import CoreConfig
 from jev_ml.core.quality import quality_evidence
 from jev_ml.core.series import Series
+from jev_ml.core.trends import is_reversing
+
+# confidence_kind of a risk's ``confidence`` factor (core-1.1.0; decisions.CONFIDENCE_KINDS): "rule"
+# for deterministic checks and exact counts, "margin" for backtest skill, "evidence" (a strength of
+# support in [0, 1] from a test or from data coverage) otherwise. Never a probability.
+RISK_CONFIDENCE_KINDS = {
+    "data_quality": "rule",
+    "data_staleness": "rule",
+    "adverse_trend": "evidence",
+    "adverse_forecast": "margin",
+    "adverse_anomaly": "evidence",
+}
 
 
 def level_of(score: float, cfg: CoreConfig) -> str:
@@ -70,6 +82,7 @@ def make_risk(
     as_of_key: str,
     series_id: str | None = None,
     id_part: str | None = None,
+    confidence_kind: str | None = None,
 ) -> dict[str, Any]:
     lik, imp, conf, qual = clip01(likelihood), clip01(impact), clip01(confidence), clip01(data_quality)
     score = 100.0 * lik * imp * conf * qual
@@ -97,6 +110,7 @@ def make_risk(
         "impact": fnum(imp, 4),
         "exposure": fnum(lik * imp, 4),
         "confidence": fnum(conf, 4),
+        "confidence_kind": confidence_kind or RISK_CONFIDENCE_KINDS.get(kind, "evidence"),
         "data_quality": fnum(qual, 4),
         "score": fnum(score, 2),
         "level": level,
@@ -190,7 +204,7 @@ def recent_from(last_complete: str | None, n_periods: int, freq: str = "M") -> s
         return None
     if freq == "M":
         return (pd.Period(last_complete[:7], freq="M") - (n_periods - 1)).strftime("%Y-%m-01")
-    p = pd.Period(last_complete, freq="W") - (n_periods - 1)
+    p = pd.Period(last_complete, freq=freq) - (n_periods - 1)  # W or D
     return p.start_time.strftime("%Y-%m-%d")
 
 
@@ -210,6 +224,8 @@ def trend_risks(
     for t in trends:
         s = series_by_id.get(t["series_id"])
         if s is None or t["direction"] == "flat" or not is_adverse(t["direction"], s.adverse_direction):
+            continue
+        if is_reversing(t):  # core-1.1.0: the last periods already reverse the trend (core.trends)
             continue
         q = t["q_value"] if t["q_value"] is not None else 1.0
         if q > cfg.trend_fdr:
@@ -377,12 +393,13 @@ def anomaly_risks(
         n_base = int(a.get("baseline_points") or 0)
         conf = min(1.0, n_base / cfg.anomaly_baseline_months)
         what = "spike" if a["kind"] == "series_spike" else "drop"
+        when = a["detected_at"][:7] if s.freq == "M" else a["detected_at"][:10]  # month, or the full date
         out.append(
             make_risk(
                 "adverse_anomaly",
                 s.entity_type,
                 s.entity,
-                f"{s.entity} {s.metric} {what} in {a['detected_at'][:7]} (adverse)",
+                f"{s.entity} {s.metric} {what} in {when} (adverse)",
                 float(a["anomaly_score"] or 0.0),
                 imp[0],
                 conf,

@@ -14,7 +14,8 @@ and excluded (negative-feedback) movies from ``load_user_state``, plus the membe
 Strategy verdicts judge the decision, not a recommendation, so they are never an acceptance event.
 
 The strategy decision is cached per member (profile version, model version, feedback marker), so a
-cache hit on /recommendations costs two indexed aggregate queries and a cache read.
+cache hit on /recommendations costs two indexed aggregate queries and a cache read. Every freshly taken
+decision is also persisted in ``member_decisions`` (Phase 2, gap P1 #7), so its id stays resolvable.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from jev_api.cache import Cache
 from jev_api.config import get_settings
 from jev_api.metrics import metrics
 from jev_api.models import RecommendationFeedback, User, UserIntelFeedback, utcnow
+from jev_api.services.experiments import persist_decision
 from jev_api.services.feedback import CLICK
 from jev_api.services.profile import UserState, build_ml_profile, load_user_state
 from jev_ml.domains.movie.user_intel import decay_profile, engine_with_overrides, strategy_for
@@ -161,6 +163,9 @@ def strategy_choice(
         profile=profile,
     )
     choice = StrategyChoice(intelligence_block(dec), dict(pk), dict(co))
+    # P1 #7: persist the decision so decision ids on recommendation and feedback rows resolve after the
+    # cache expires (member_decisions; never fails the request)
+    persist_decision(db, user, dec, engine.version, "recommendations")
     metrics.observe("strategy_decision_ms", "all", 1000 * (time.perf_counter() - t0))
     metrics.inc("strategy_decisions", "abstained" if dec.get("abstained") else str(dec.get("answer")))
     metrics.inc("strategy_served", choice.served)

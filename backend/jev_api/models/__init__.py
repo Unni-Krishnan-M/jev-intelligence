@@ -11,7 +11,7 @@ experiments.py, security.py, ...), then append ONE import line in the block belo
 
 from __future__ import annotations
 
-from jev_api.models import events, experiments, governance, security  # noqa: F401 - WS placeholders
+from jev_api.models import events, experiments, governance, security  # noqa: F401 - Phase-2 modules
 from jev_api.models.audit import AuditLog
 from jev_api.models.base import Base, TimestampMixin, domain_column, in_, nullable_in, utcnow
 from jev_api.models.catalog import Genre, Movie, MovieGenre
@@ -38,6 +38,7 @@ from jev_api.models.enums import (
     WARNING_OPEN_STATUSES,
     WARNING_STATUSES,
 )
+from jev_api.models.governance import DatasetSnapshot, GovernanceLock, ModelGovernance, TrainingJob
 from jev_api.models.intel import (
     _OPEN_WARNING,
     _VERDICT_MATCHES_TARGET,
@@ -69,6 +70,7 @@ from jev_api.models.recs import (
     UserIntelFeedback,
 )
 from jev_api.models.users import User, UserGenrePreference
+from jev_api.models.security import RevokedToken, ServiceToken
 
 # the pre-split private helper names, kept importable
 _in = in_
@@ -106,10 +108,12 @@ __all__ = [
     "_WITH_REC",
     "AuditLog",
     "Base",
+    "DatasetSnapshot",
     "EvaluationMetric",
     "Experiment",
     "Favorite",
     "Genre",
+    "GovernanceLock",
     "IntelAnomalyRow",
     "IntelDecision",
     "IntelEvaluationRun",
@@ -123,6 +127,7 @@ __all__ = [
     "IntelTrendRow",
     "IntelWarning",
     "IntelWarningEvent",
+    "ModelGovernance",
     "ModelVersion",
     "Movie",
     "MovieGenre",
@@ -130,6 +135,7 @@ __all__ = [
     "Recommendation",
     "RecommendationFeedback",
     "TimestampMixin",
+    "TrainingJob",
     "User",
     "UserGenrePreference",
     "UserIntelFeedback",
@@ -142,4 +148,6 @@ __all__ = [
     "nullable_in",
     "run_mode",
     "utcnow",
+    "RevokedToken",
+    "ServiceToken",
 ]

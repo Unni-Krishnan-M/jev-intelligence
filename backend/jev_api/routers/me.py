@@ -19,6 +19,7 @@ from jev_api.metrics import metrics
 from jev_api.models import Movie, Recommendation, UserIntelFeedback
 from jev_api.schemas import MeFeedbackIn, MeFeedbackOut, MeScenarioRequest
 from jev_api.services import audit
+from jev_api.services.experiments import decision_out, persist_decision, resolve_decision
 from jev_api.services.profile import load_user_state
 from jev_api.services.user_intel import (
     DECISION_ID,
@@ -76,8 +77,22 @@ def my_intelligence(
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     metrics.observe("me_intelligence_ms", "all", 1000 * (time.perf_counter() - t0))
+    if isinstance(out.get("strategy"), dict):  # P1 #7: the decision shown here resolves later too
+        persist_decision(db, user, out["strategy"], engine.version, "me_intelligence")
     cache.set(key, out, request.app.state.settings.recommendation_cache_seconds)
     return out
+
+
+@router.get("/intelligence/decisions/{decision_id}")
+def my_decision(decision_id: str, user: CurrentUser, db: DB) -> dict[str, Any]:
+    """One of the caller's persisted recommendation-strategy decisions (the decision_id on their
+    recommendation rows, /recommendations responses and /me/intelligence), newest state first."""
+    if not DECISION_ID.fullmatch(decision_id):
+        raise HTTPException(422, "decision_id is a decision id (dec-…)")
+    row = resolve_decision(db, decision_id, user.id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "decision not found for this member")
+    return decision_out(row)
 
 
 @router.post("/intelligence/scenarios")
@@ -143,7 +158,7 @@ def my_feedback(
             .where(Recommendation.user_id == user.id, Recommendation.decision_id == tid)
             .limit(1)
         )
-        known = served is not None
+        known = served is not None or resolve_decision(db, tid, user.id) is not None
         engine = request.app.state.engines.engine
         if not known and engine is not None:
             choice, _, _ = strategy_choice(db, cache, engine, user)

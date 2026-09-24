@@ -5,6 +5,8 @@ model's recorded experiment protocol and evaluated on the TEST split; see jev_ml
 
 --model VERSION   model version to calibrate (default: the active one in models/registry.json)
 --k N             list length scored per user (default 50; ranks beyond it get no confidence)
+--method M        isotonic | logistic (per stratum, the lower validation cross-fit log-loss of
+                  isotonic and logistic is served; see jev_ml/calibration.py)
 --dry-run         compute and print the metrics without writing the file
 """
 
@@ -14,9 +16,11 @@ import argparse
 import json
 import logging
 
-from jev_ml.calibration import DEFAULT_K, calibrate_model
+from jev_ml.calibration import DEFAULT_K, METHODS, calibrate_model
 from jev_ml.paths import MODELS_DIR
 from jev_ml.registry import active_version
+
+DEFAULT_METHOD = "isotonic"
 
 
 def main() -> None:
@@ -25,13 +29,14 @@ def main() -> None:
     )
     parser.add_argument("--model", default=None, help="model version (default: active)")
     parser.add_argument("--k", type=int, default=DEFAULT_K)
+    parser.add_argument("--method", choices=METHODS, default=DEFAULT_METHOD)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     version = args.model or active_version(MODELS_DIR)
     if not version:
         raise SystemExit("no active model; pass --model VERSION")
-    out = calibrate_model(version, MODELS_DIR, k=args.k, write=not args.dry_run)
+    out = calibrate_model(version, MODELS_DIR, k=args.k, write=not args.dry_run, method=args.method)
     print(
         json.dumps(
             {
@@ -43,10 +48,11 @@ def main() -> None:
                         "name": st["name"],
                         "applies_to": st["applies_to"],
                         "feature": st["feature"],
+                        "serving_method": st.get("serving_method", "isotonic"),
                         "selection": st["selection"]["candidates"],
                         "validation_base_rate": st["base_rate"],
                         "test": {
-                            k: st["test"].get(k)
+                            k: st.get("test_served", st["test"]).get(k)
                             for k in (
                                 "n",
                                 "observed_rate",

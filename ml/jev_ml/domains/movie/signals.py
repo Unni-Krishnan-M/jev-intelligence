@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from jev_ml.core.common import evidence, fnum, iso
+from jev_ml.core.common import evidence, fnum, iso, iso_from_epoch
 from jev_ml.core.signals import make_signal
 from jev_ml.domains.movie.config import IntelConfig
 from jev_ml.domains.movie.ingest import Prepared
@@ -38,7 +38,7 @@ def movie_signals(
                 1 - live["p_value"],
                 "up" if d > 0 else "down" if d < 0 else "flat",
                 "app",
-                iso(prep.now),
+                iso_from_epoch(prep.event_clock_ts) if prep.event_clock_ts is not None else iso(prep.now),
                 f"last {cfg.live_recent_days} d vs prior {cfg.live_prior_days} d",
                 0.0,
                 [evidence("test", "two-proportion z", fnum(live["z"], 3), f"p {live['p_value']:.4f}")],

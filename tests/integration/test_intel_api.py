@@ -127,7 +127,8 @@ def test_run_is_persisted(client, intel, admin):
 
 def test_list_endpoints_filters_and_pagination(client, intel, admin):
     sig = client.get("/intel/signals?limit=3", headers=admin).json()
-    assert set(sig) == {"items", "total", "limit", "offset", "run_id", "as_of", "domain"}
+    assert set(sig) == {"items", "total", "limit", "offset", "run_id", "as_of", "domain", "mode"}
+    assert sig["mode"] == "live"
     assert len(sig["items"]) == 3 and sig["total"] > 3 and sig["limit"] == 3 and sig["run_id"]
     page2 = client.get("/intel/signals?limit=3&offset=3", headers=admin).json()
     assert {s["id"] for s in page2["items"]}.isdisjoint({s["id"] for s in sig["items"]})
@@ -407,6 +408,7 @@ def test_status_shape(client, intel, admin):
         "health",
         "domain",  # v1.2
         "domain_info",
+        "mode",  # P2.4: which runs "latest" meant
     }
     assert st["latest_run"]["status"] == "succeeded" and st["summary"]["status"] in (
         "nominal",

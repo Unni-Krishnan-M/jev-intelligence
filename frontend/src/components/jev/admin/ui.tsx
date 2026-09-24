@@ -56,6 +56,7 @@ export function fmtNum(v: number | null | undefined, digits = 4): string {
 }
 
 export function fmtDate(iso: string): string {
-  const d = new Date(iso);
+  // the API is UTC throughout; a timestamp without a zone (SQLite-backed rows) is UTC, not local time
+  const d = new Date(/T\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(iso) ? `${iso}Z` : iso);
   return Number.isNaN(d.getTime()) ? iso : d.toISOString().slice(0, 16).replace("T", " ");
 }

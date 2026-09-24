@@ -23,6 +23,10 @@ x-api-env: &api-env
   # when an edge proxy in front of web OVERWRITES X-Forwarded-For with the socket peer, set
   # JEV_FORWARDED_ALLOW_IPS to web's address (JEV_WEB_IP). See docs/deployment.md.
   FORWARDED_ALLOW_IPS: ${JEV_FORWARDED_ALLOW_IPS:-127.0.0.1}
+  # Per-client rate limits behind web: web signs the client address into x-jev-client with
+  # JEV_PROXY_SECRET (frontend/src/proxy.ts) and the API verifies it with the same value. Unset =
+  # the header is ignored and every request shares web's rate-limit bucket (docs/SECURITY_AUDIT_PHASE2.md).
+  JEV_SECURITY_PROXY_SECRET: ${JEV_PROXY_SECRET:-}
   JEV_LOG_LEVEL: ${JEV_LOG_LEVEL:-INFO}
   JEV_RATE_LIMIT_PER_MINUTE: ${JEV_RATE_LIMIT_PER_MINUTE:-240}
   JEV_AUTH_RATE_LIMIT_PER_MINUTE: ${JEV_AUTH_RATE_LIMIT_PER_MINUTE:-20}
@@ -95,6 +99,10 @@ services:
       # read at runtime by frontend/src/proxy.ts: HSTS + upgrade-insecure-requests; set true only
       # when the site is served over HTTPS
       JEV_HTTPS: ${JEV_HTTPS:-false}
+      # the same value as the API's JEV_SECURITY_PROXY_SECRET (one .env variable feeds both)
+      JEV_PROXY_SECRET: ${JEV_PROXY_SECRET:-}
+      # optional: a header an edge proxy OVERWRITES with the socket peer (e.g. X-Real-IP)
+      JEV_CLIENT_IP_HEADER: ${JEV_CLIENT_IP_HEADER:-}
     ports: ["${WEB_PORT:-3000}:3000"]
     depends_on:
       api: { condition: service_healthy }
@@ -112,7 +120,9 @@ services:
       - ./models:/app/models
       - ./experiments:/app/experiments
       - ./data:/app/data
-    # download → preprocess → train (+ recommendation-confidence calibration) → intelligence evaluation
+    # bootstrap: download → preprocess → train (+ recommendation-confidence calibration) → intelligence evaluation
+    # train_models.py activates only the bootstrap model of an empty registry; once a model serves,
+    # it registers a candidate. Retrain with feedback via the retrain service below (governance).
     command:
       - sh
       - -c
@@ -121,6 +131,47 @@ services:
         python scripts/preprocess_data.py &&
         python scripts/train_models.py --calibrate $${TRAIN_ARGS} &&
         python scripts/evaluate_intelligence.py
+
+  # one-shot governed retrain: snapshot (MovieLens + app feedback) → candidate → gate (never activates)
+  #   docker compose --profile train run --rm retrain
+  retrain:
+    profiles: [train]
+    build: { context: ., dockerfile: docker/api.Dockerfile }
+    user: "${JEV_UID:-1000}:${JEV_GID:-1000}"
+    environment:
+      <<: *api-env
+      HOME: /tmp
+      RETRAIN_ARGS: ${RETRAIN_ARGS:---quick}  # --full tunes hyper-parameters (minutes)
+    volumes:
+      - ./models:/app/models
+      - ./experiments:/app/experiments
+      - ./data:/app/data
+    depends_on:
+      db: { condition: service_healthy }
+    command: ["sh", "-c", "python scripts/retrain.py run $${RETRAIN_ARGS}"]
+
+  # the scheduler loop: retrains when the latest live retrain_model decision says yes (at most every
+  # JEV_GOVERNANCE_SCHEDULE_INTERVAL_MINUTES), one job at a time (PostgreSQL advisory lock). Opt-in:
+  #   docker compose --profile scheduler up -d scheduler
+  scheduler:
+    profiles: [scheduler]
+    build: { context: ., dockerfile: docker/api.Dockerfile }
+    user: "${JEV_UID:-1000}:${JEV_GID:-1000}"
+    environment:
+      <<: *api-env
+      HOME: /tmp
+      JEV_GOVERNANCE_SCHEDULE_ENABLED: "true"
+      JEV_GOVERNANCE_SCHEDULE_INTERVAL_MINUTES: ${JEV_GOVERNANCE_SCHEDULE_INTERVAL_MINUTES:-1440}
+      JEV_GOVERNANCE_SCHEDULE_REQUIRE_DECISION: ${JEV_GOVERNANCE_SCHEDULE_REQUIRE_DECISION:-true}
+      JEV_GOVERNANCE_AUTO_PROMOTE: ${JEV_GOVERNANCE_AUTO_PROMOTE:-false}
+    volumes:
+      - ./models:/app/models
+      - ./experiments:/app/experiments
+      - ./data:/app/data
+    depends_on:
+      db: { condition: service_healthy }
+    command: ["python", "scripts/retrain.py", "schedule"]
+    restart: unless-stopped
 
 networks:
   default:

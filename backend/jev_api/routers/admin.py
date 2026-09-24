@@ -28,6 +28,7 @@ from jev_api.schemas import (
     ModelVersionOut,
 )
 from jev_api.services import audit
+from jev_api.services import governance as gov
 from jev_api.services.feedback import feedback_counts
 from jev_api.services.ml import engine_calibration
 from jev_api.services.sync import sync_experiments, sync_model_versions
@@ -118,14 +119,24 @@ def get_model(model_id: IdPath, _: AdminUser, db: DB, request: Request) -> dict[
 
 @router.post("/models/{model_id}/activate", response_model=ModelVersionOut)
 def activate_model(model_id: IdPath, user: AdminUser, db: DB, request: Request) -> ModelVersion:
+    """Phase 2: gate-enforced. Re-activating the serving version reloads it; any other version must
+    have passed the promotion gate against the current active model (409 with the blockers
+    otherwise). There is no force here: use POST /governance/models/{version}/promote with
+    force + reason (docs/RETRAINING_AND_MODEL_GOVERNANCE.md)."""
     mv = db.get(ModelVersion, model_id)
     if mv is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "model version not found")
     previous = request.app.state.engines.engine
-    try:
-        request.app.state.engines.activate(mv.version)
-    except (OSError, ValueError) as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, "model artifacts failed to load") from exc
+    if previous is not None and previous.version == mv.version:
+        try:
+            request.app.state.engines.activate(mv.version)  # reload the serving version
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, "model artifacts failed to load") from exc
+    else:
+        try:
+            gov.get_service(request.app).promote(db, mv.version, user, force=False)
+        except gov.GovernanceError as exc:
+            raise gov.http_error(exc) from exc
     for other in db.scalars(select(ModelVersion)).all():
         other.is_active = other.id == mv.id
     audit.record(
@@ -138,6 +149,7 @@ def activate_model(model_id: IdPath, user: AdminUser, db: DB, request: Request) 
     )
     db.commit()
     request.app.state.cache.delete_prefix("rec:")
+    db.refresh(mv)
     return mv
 
 

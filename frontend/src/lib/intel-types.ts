@@ -243,7 +243,7 @@ export interface Risk {
   impact: number;
   exposure: number;
   confidence: number;
-  /** not in the contract's Risk; honoured if the backend adds it */
+  /** P2.4: what the confidence means (a risk score's confidence is not a probability) */
   confidence_kind?: ConfidenceKind;
   data_quality: number;
   /** 0..100 = 100 * likelihood * impact, shrunk by (confidence * data_quality) */
@@ -374,6 +374,8 @@ export interface Page<T> {
   offset: number;
   run_id: string | null;
   as_of: string | null;
+  /** P2.4: the mode of the run the page was read from */
+  mode?: "live" | "replay";
 }
 
 export interface Run {
@@ -393,6 +395,10 @@ export interface Run {
   error: string | null;
   /** v1.2 */
   domain?: string;
+  /** Phase 2 (WS1): the newest event the run could see; null when it predates the event log */
+  event_watermark?: import("./ops-types").EventWatermark | null;
+  /** Phase 2 (P2.4): "replay" when the run was asked for an explicit as_of */
+  mode?: "live" | "replay";
 }
 
 /** GET /intel/runs. The contract names the endpoint but not its envelope; a list page is assumed. */
@@ -667,6 +673,10 @@ export interface WarningOutcomeCounts {
   false_positive_rate: number | null;
   recall: number | null;
   base_rate: number | null;
+  /** core-1.1.0: precision / base rate (1.0 = no better than flagging at random at the same rate) */
+  lift?: number | null;
+  /** core-1.1.0: share of observable units warned */
+  flag_rate?: number | null;
 }
 
 export interface DecisionConsistency {

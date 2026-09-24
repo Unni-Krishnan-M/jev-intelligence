@@ -67,6 +67,8 @@ class Recommendation:
     # or beyond the calibrated rank range (see jev_ml/calibration.py)
     confidence: float | None = None
     confidence_kind: str | None = None  # "probability" when confidence is set
+    # hybrid weighting that produced this item: "adaptive" or a cold stage name (HybridConfig.cold_stages)
+    weight_strategy: str | None = None
 
 
 class RecommendationEngine:
@@ -159,7 +161,7 @@ class RecommendationEngine:
     def _to_rec(self, r: RankedItem, profile: UserProfile, rank: int) -> Recommendation:
         ex = explain(r, profile, lambda i: str(self._titles[i]), lambda i: int(self._ids[i]))
         conf = (
-            self._calibrator.predict(r.score, rank, profile.n_interactions)
+            self._calibrator.predict(r.score, rank, profile.n_interactions, signals=r.signals)
             if self._calibrator is not None
             else None
         )
@@ -175,6 +177,7 @@ class RecommendationEngine:
             rank=rank,
             confidence=None if conf is None else round(conf, 4),
             confidence_kind=None if conf is None else "probability",
+            weight_strategy=self.ranker.weight_strategy(profile),
         )
 
     def recommend(

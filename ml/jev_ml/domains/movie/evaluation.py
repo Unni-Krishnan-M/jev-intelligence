@@ -329,6 +329,10 @@ def evaluate_series_anomalies(series: list[Series], cfg: IntelConfig) -> dict[st
 
 
 def evaluate_change_points(series: list[Series], cfg: IntelConfig, n_trials: int = 400) -> dict[str, Any]:
+    """Synthetic AR(1) study of the deployed change-point test (and, for comparison, of the pre-1.1
+    in-window phi estimate). Each trial draws ``change_point_history_max`` periods of history plus
+    one trend window from the same stationary AR(1) process; the history feeds the null's phi
+    exactly as ``trend_of`` does."""
     vol = next(s for s in series if s.id == "volume:all")
     _, v, _ = vol.complete()
     y = np.log1p(v[-60:])
@@ -338,25 +342,34 @@ def evaluate_change_points(series: list[Series], cfg: IntelConfig, n_trials: int
     sigma_e = float(np.median(np.abs(innov - np.median(innov))) / 0.6745)
     sigma = sigma_e / np.sqrt(1 - phi**2)
     n, m = cfg.trend_window_months, cfg.change_point_min_segment
+    n_hist = cfg.change_point_history_max
     rng = np.random.default_rng(cfg.seed + 11)
     det = fa = n_shift = n_null = 0
+    fa_window = det_window = 0
     loc_err: list[float] = []
     by: dict[str, list[int]] = {"1_sigma": [0, 0], "2_sigma": [0, 0]}
     for t in range(n_trials):
-        e = np.zeros(n)
+        e = np.zeros(n_hist + n)
         e[0] = rng.normal(0, sigma)
-        for i in range(1, n):
+        for i in range(1, n_hist + n):
             e[i] = phi * e[i - 1] + rng.normal(0, sigma_e)
-        x = e + float(np.median(y))
+        full = e + float(np.median(y))
+        hist, x = full[:n_hist], full[n_hist:].copy()
         shifted = t % 2 == 1
         k_true = int(rng.integers(m, n - m + 1))
         mag = 1.0 if t % 4 == 1 else 2.0
         if shifted:
             x[k_true:] += mag * sigma
-        cp = change_point(x, m, cfg.change_point_permutations, cfg.seed + 100 + t)
+        seed = cfg.seed + 100 + t
+        cp = change_point(
+            x, m, cfg.change_point_permutations, seed, history=hist, history_min=cfg.change_point_history_min
+        )
         hit = cp is not None and cp["p_value"] < cfg.change_point_alpha
+        cpw = change_point(x, m, cfg.change_point_permutations, seed)
+        hit_w = cpw is not None and cpw["p_value"] < cfg.change_point_alpha
         if shifted:
             n_shift += 1
+            det_window += int(hit_w)
             key = f"{mag:g}_sigma"
             by[key][1] += 1
             if hit:
@@ -366,20 +379,25 @@ def evaluate_change_points(series: list[Series], cfg: IntelConfig, n_trials: int
         else:
             n_null += 1
             fa += int(hit)
+            fa_window += int(hit_w)
     return {
         "protocol": (
-            f"Synthetic AR(1) series of {n} months, phi = {phi:.2f} and innovation sd = {sigma_e:.3f} "
-            "estimated from the "
-            "real log1p(volume:all) over the last 60 months; half the trials carry a mean shift of 1 or "
-            "2 marginal "
-            f"sigmas at a random month (>= {m} from each end). Detection = change-point p < "
-            f"{cfg.change_point_alpha} (permutation or AR(1) null, as deployed)."
+            f"Synthetic AR(1) series: {n_hist} periods of history + a {n}-month window, phi = {phi:.2f} and "
+            f"innovation sd = {sigma_e:.3f} estimated from the real log1p(volume:all) over the last 60 "
+            "months; half the trials carry a mean shift of 1 or 2 marginal sigmas at a random window "
+            f"month (>= {m} from each end). Detection = change-point p < {cfg.change_point_alpha} "
+            "(permutation or AR(1) null with phi from the history, as deployed since core-1.1.0)."
         ),
         "detection_rate": fnum(det / n_shift, 4) if n_shift else None,
         "detection_by_magnitude": {k: fnum(a / b, 4) if b else None for k, (a, b) in by.items()},
         "false_alarm_rate": fnum(fa / n_null, 4) if n_null else None,
         "mean_abs_location_error_months": fnum(np.mean(loc_err), 3) if loc_err else None,
         "n_trials": n_trials,
+        # the pre-1.1 null (phi estimated inside the 24-point window) on the same trials
+        "window_phi": {
+            "false_alarm_rate": fnum(fa_window / n_null, 4) if n_null else None,
+            "detection_rate": fnum(det_window / n_shift, 4) if n_shift else None,
+        },
     }
 
 

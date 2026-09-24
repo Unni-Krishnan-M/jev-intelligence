@@ -1,7 +1,8 @@
 """DECIDE (early warning): ``early_warning_level``, one decision per situation (contract section 4).
 
 Question: "Should this situation trigger an early warning?" -> NO_ACTION | MONITOR | WARNING |
-URGENT_ACTION (``choice``, confidence kind ``margin``). Policy ``ewl-1.0.0``.
+URGENT_ACTION (``choice``, confidence kind ``margin``). Policy ``ewl-1.1.0`` (1.1: a trend or change
+point whose series is already reversing, ``trend.recent_move.reversing``, earns 0 points).
 
 Situations. Evidence computed upstream is grouped by subject:
 
@@ -66,6 +67,7 @@ from jev_ml.core.config import EWL_LEVELS, EWL_POLICY_VERSION, SEVERITIES, CoreC
 from jev_ml.core.decisions import DecisionSpec, margin
 from jev_ml.core.risk import recent_from
 from jev_ml.core.series import Series
+from jev_ml.core.trends import is_reversing
 
 KEY = "early_warning_level"
 SPEC = DecisionSpec(
@@ -266,10 +268,18 @@ def build_situations(
         if s is None:
             continue
         cp = t.get("change_point")
+        # ewl-1.1.0: a trend whose last periods already reverse it is not a live adverse condition
+        reversing = is_reversing(t)
+        rev_note = (
+            f"; reversing: last {t['recent_move']['periods']} periods moved {t['recent_move']['change']:+g} "
+            f"(z {t['recent_move']['z']:+.2f}) against it"
+            if reversing
+            else ""
+        )
         if t["direction"] != "flat":
             adv = is_adverse(t["direction"], s.adverse_direction)
             q = t["q_value"] if t["q_value"] is not None else 1.0
-            pts = context_points(1.0 - q, cfg) if adv else 0.0
+            pts = context_points(1.0 - q, cfg) if adv and not reversing else 0.0
             for_series(s.id).components.append(
                 _comp(
                     "trend",
@@ -283,23 +293,27 @@ def build_situations(
                         else "not adverse"
                         if adv is False
                         else "no adverse direction declared"
-                    ),
+                    )
+                    + rev_note,
                     f"{s.entity} {s.metric} trend {t['direction']}",
                     direction=t["direction"],
                     q_value=q,
+                    reversing=reversing,
                 )
             )
         if cp:
             up = (cp["after_mean"] or 0) > (cp["before_mean"] or 0)
             adv = is_adverse("up" if up else "down", s.adverse_direction)
-            pts = context_points(1.0 - (cp["p_value"] or 1.0), cfg) if adv else 0.0
+            cp_rev = reversing and (t["direction"] == ("up" if up else "down"))
+            pts = context_points(1.0 - (cp["p_value"] or 1.0), cfg) if adv and not cp_rev else 0.0
             for_series(s.id).components.append(
                 _comp(
                     "change_point",
                     "trend",
                     t["id"],
                     pts,
-                    f"mean shift {'up' if up else 'down'} in {cp['date'][:7]} (p {cp['p_value']})",
+                    f"mean shift {'up' if up else 'down'} in {cp['date'][:7]} (p {cp['p_value']})"
+                    + (rev_note if cp_rev else ""),
                     f"{s.entity} {s.metric} shifted {'up' if up else 'down'}",
                 )
             )
@@ -398,7 +412,7 @@ def situation_state(sit: Situation) -> dict[str, Any]:
 
 
 def decide(sit_d: dict[str, Any], cfg: CoreConfig, as_of_key: str) -> dict[str, Any]:
-    """The ewl-1.0.0 policy for one situation (``situation_state`` form)."""
+    """The ewl-1.1.0 policy for one situation (``situation_state`` form)."""
     sit = Situation(**sit_d)
     policy = {
         "level_points": dict(cfg.ewl_level_points),

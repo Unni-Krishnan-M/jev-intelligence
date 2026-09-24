@@ -8,20 +8,14 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from jev_ml.core.pipeline import PipelineResult, run_domain
-from jev_ml.domains.movie.adapter import MovieAdapter
+from jev_ml.core.pipeline import PipelineResult
 from jev_ml.domains.movie.config import IntelConfig
 from jev_ml.domains.movie.ingest import PipelineInputs, load_default_inputs
+from jev_ml.domains.movie.scenario import run_movie_pipeline
 
 
 def run_pipeline(inputs: PipelineInputs, config: IntelConfig | None = None) -> PipelineResult:
-    return run_domain(
-        MovieAdapter(inputs),
-        as_of=inputs.as_of,
-        now=inputs.now,
-        suppressed_keys=inputs.suppressed_keys,
-        config=config or IntelConfig(),
-    )
+    return run_movie_pipeline(inputs, config)
 
 
 def run_default(

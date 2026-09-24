@@ -115,7 +115,14 @@ Resource use for training: quick training peaks at about 620 MB RSS.
 - Run several API workers (`uvicorn --workers N`). Each worker loads the model (about 60 MB RSS). Rate limits and the
   intelligence-run limit need Redis when there is more than one worker. The one-run lock is per process, so trigger
   runs from a single worker, or keep `JEV_INTEL_RUN_ON_STARTUP` on for only one of them.
-- Retrain by running the trainer (it also writes `calibration.json`), then activate the new version from
-  `/admin/models` (or `models/registry.json`). The API swaps it in without a restart. Run
-  `scripts/evaluate_intelligence.py` after data changes so `/intel/evaluation` stays current.
-- Open warnings are never auto-resolved. Someone has to triage the queue (`/intel/warnings`).
+- Retrain through governance: `docker compose --profile train run --rm retrain` (or `POST /governance/retrain`)
+  builds a snapshot with app feedback, trains a candidate and runs the promotion gate; it never activates.
+  Promote a passing candidate with `POST /governance/models/{version}/promote` (or the Ops → Models page), roll
+  back with `POST /governance/models/rollback` and a reason. The API swaps models without a restart
+  (docs/RETRAINING_AND_MODEL_GOVERNANCE.md). Run `scripts/evaluate_intelligence.py` after data changes so
+  `/intel/evaluation` stays current.
+- Stale open warnings are auto-resolved after K live runs without the key, up to
+  `JEV_INTEL_AUTO_RESOLVE_MAX_SEVERITY` (default medium); high and critical warnings still need an operator
+  (`/intel/warnings`, docs/EARLY_WARNING_SYSTEM.md).
+- Per-client rate limits behind the web proxy need `JEV_PROXY_SECRET` in `.env` (compose passes it to web and
+  api); unset, all clients share one bucket.
