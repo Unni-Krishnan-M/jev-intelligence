@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useState } from "react";
 import useSWR from "swr";
@@ -8,6 +7,7 @@ import useSWR from "swr";
 import { Panel, SpecRows } from "@/components/jev/admin/ui";
 import { DirectionIcon, SeverityBadge } from "@/components/jev/intel/badges";
 import { TableView, TimeSeriesChart } from "@/components/jev/intel/charts";
+import Link, { useIntelDomain } from "@/components/jev/intel/domain-context";
 import { HistoryTimeline } from "@/components/jev/intel/history-timeline";
 import { PageHeader } from "@/components/jev/intel/page-header";
 import { IntelError } from "@/components/jev/intel/states";
@@ -31,7 +31,8 @@ function decodeParam(v: string | string[] | undefined): string {
 export default function SeriesPage() {
   const params = useParams<{ id: string }>();
   const id = decodeParam(params.id);
-  const { data, error, mutate } = useSWR<SeriesDetail>(id ? `/intel/series/${encodeURIComponent(id)}` : null);
+  const { q: dq } = useIntelDomain();
+  const { data, error, mutate } = useSWR<SeriesDetail>(id ? dq(`/intel/series/${encodeURIComponent(id)}`) : null);
   const [showForecast, setShowForecast] = useState(true);
 
   if (error instanceof ApiError && error.status === 404) {

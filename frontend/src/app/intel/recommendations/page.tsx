@@ -8,16 +8,20 @@
  * Without a calibration file the page says so instead of drawing anything.
  */
 
-import Link from "next/link";
 import useSWR from "swr";
 
 import { fmtDate, fmtNum, Panel, SpecRows, StatTile } from "@/components/jev/admin/ui";
-import { CountBars, DailyBars, ReliabilityDiagram, TableView } from "@/components/jev/intel/charts";
+import { ActionsBoard } from "@/components/jev/intel/actions-board";
+import { CountBars, DailyBars, NamedBars, ReliabilityDiagram, TableView } from "@/components/jev/intel/charts";
+import Link, { CapabilityNotice, useIntelDomain } from "@/components/jev/intel/domain-context";
 import { PageHeader } from "@/components/jev/intel/page-header";
-import { IntelError, PanelsSkeleton } from "@/components/jev/intel/states";
+import { IntelError, PanelsSkeleton, RowsSkeleton } from "@/components/jev/intel/states";
 import { EmptyState, SectionHeader } from "@/components/jev/states";
+import { Button } from "@/components/ui/button";
+import { qs } from "@/lib/api";
+import { strategyLabel } from "@/lib/decisions";
 import { calibrationView, fmtPct, humanize } from "@/lib/intel";
-import type { RecommenderMonitoring } from "@/lib/intel-types";
+import type { Action, Page, RecommenderMonitoring } from "@/lib/intel-types";
 
 /** Below this many served recommendations a reason code's positive rate is too noisy to rank by. */
 const MIN_SERVED = 20;
@@ -179,6 +183,21 @@ function Monitoring({ m }: { m: RecommenderMonitoring }) {
         </div>
       </section>
 
+      {m.strategies && Object.keys(m.strategies).length > 0 && (
+        <section aria-labelledby="rec-strategy">
+          <SectionHeader id="rec-strategy" kicker="JEV decisions · recommendation strategy" title="Which strategy each list was served under" />
+          <NamedBars
+            rows={Object.entries(m.strategies)
+              .sort((a, b) => b[1] - a[1])
+              .map(([k, v]) => ({ name: k === "unrecorded" ? "unrecorded (before v1.2)" : strategyLabel(k), value: v }))}
+            format={(v) => v.toLocaleString()}
+          />
+          <p className="mt-2 text-xs text-muted-foreground">
+            Served rows per strategy. Each member&apos;s list is downstream of their recommendation-strategy decision; an abstention is served as standard.
+          </p>
+        </section>
+      )}
+
       <section aria-labelledby="rec-reasons">
         <SectionHeader id="rec-reasons" index={3} kicker="explanations" title="Which reasons land?" />
         {codes.length === 0 ? (
@@ -241,7 +260,7 @@ function Monitoring({ m }: { m: RecommenderMonitoring }) {
         ) : (
           <>
             <div className="overflow-x-auto rounded-lg border bg-card">
-              <table className="w-full min-w-[760px] text-sm">
+              <table className="w-full min-w-[860px] text-sm">
                 <caption className="sr-only">Recently served recommendations</caption>
                 <thead>
                   <tr className="border-b hairline text-left text-xs text-muted-foreground">
@@ -251,6 +270,7 @@ function Monitoring({ m }: { m: RecommenderMonitoring }) {
                     <th className="px-2 py-2.5 text-right font-normal">Rank</th>
                     <th className="px-2 py-2.5 text-right font-normal">Score</th>
                     <th className="px-2 py-2.5 text-right font-normal" title="Calibrated P(rated 4★+ among the member's next 5 ratings)">Confidence</th>
+                    <th className="px-2 py-2.5 font-normal">Strategy</th>
                     <th className="px-4 py-2.5 font-normal">Reason</th>
                   </tr>
                 </thead>
@@ -263,6 +283,7 @@ function Monitoring({ m }: { m: RecommenderMonitoring }) {
                       <td className="num px-2 py-2 text-right">{r.rank}</td>
                       <td className="num px-2 py-2 text-right text-ink-2">{r.score.toFixed(3)}</td>
                       <td className="num px-2 py-2 text-right">{r.confidence === null || r.confidence === undefined ? <span className="text-muted-foreground">—</span> : fmtPct(r.confidence, 1)}</td>
+                      <td className="px-2 py-2 text-xs" title={r.decision_id ?? undefined}>{r.strategy ? strategyLabel(r.strategy) : <span className="text-muted-foreground">—</span>}</td>
                       <td className="px-4 py-2 text-xs text-ink-2">
                         <span className="eyebrow block">{humanize(r.reason_code)}</span>
                         {r.reason}
@@ -280,21 +301,69 @@ function Monitoring({ m }: { m: RecommenderMonitoring }) {
   );
 }
 
-export default function RecommenderPage() {
-  const { data, error, mutate } = useSWR<RecommenderMonitoring>("/intel/recommendations");
+/** For domains without a recommender: JEV's recommended actions, each with its evidence. */
+function RecommendedActions() {
+  const { q: dq } = useIntelDomain();
+  const { data, error, mutate } = useSWR<Page<Action>>(dq(`/intel/actions${qs({ limit: 100 })}`));
+  const items = data?.items ?? [];
+  if (error) return <IntelError error={error} retry={() => mutate()} />;
+  if (!data) return <RowsSkeleton rows={5} />;
+  if (!items.length) return <EmptyState title="No recommended actions" body="Nothing in the latest run for this domain calls for an action." />;
   return (
-    <div>
-      <PageHeader
-        eyebrow="review"
-        title="Recommender"
-        description={`How the member-facing recommender is doing: its calibration, what it served, and how people responded.${data?.model_version ? ` Model ${data.model_version}.` : ""}`}
-      />
+    <>
+      <p className="mb-6 font-mono text-xs text-muted-foreground">
+        {items.length.toLocaleString()} action{items.length === 1 ? "" : "s"}{data.as_of ? ` · as of ${fmtDate(data.as_of)}` : ""}
+      </p>
+      <ActionsBoard items={items} />
+    </>
+  );
+}
+
+function RecommenderMonitoringView() {
+  const { q: dq } = useIntelDomain();
+  const { data, error, mutate } = useSWR<RecommenderMonitoring>(dq("/intel/recommendations"));
+  return (
+    <>
+      {data?.model_version && <p className="-mt-4 mb-6 font-mono text-xs text-muted-foreground">model {data.model_version}</p>}
       {error ? (
         <IntelError error={error} retry={() => mutate()} runBacked={false} what="recommender monitoring (GET /intel/recommendations)" />
       ) : !data ? (
         <PanelsSkeleton n={6} />
       ) : (
         <Monitoring m={data} />
+      )}
+    </>
+  );
+}
+
+export default function RecommendationsPage() {
+  const { can, name } = useIntelDomain();
+  const recommender = can("recommendation");
+  const perUser = can("user_intelligence");
+
+  return (
+    <div>
+      <PageHeader
+        eyebrow="recommend"
+        title={recommender.available ? "Recommendations" : "Recommended actions"}
+        description={
+          recommender.available
+            ? "How the member-facing recommender is doing: its calibration, what it served and how people responded. Each member's list is produced under a JEV strategy decision."
+            : `What JEV recommends doing about the ${name} situation: actions ranked by priority, downstream of its decisions, warnings and risks, each with the evidence behind it.`
+        }
+        action={
+          recommender.available && perUser.available ? (
+            <Button asChild variant="outline" size="sm"><Link href="/me/intelligence">Per-user intelligence →</Link></Button>
+          ) : undefined
+        }
+      />
+      {recommender.available ? (
+        <RecommenderMonitoringView />
+      ) : (
+        <>
+          <CapabilityNotice cap="recommendation" className="mb-6" />
+          <RecommendedActions />
+        </>
       )}
     </div>
   );

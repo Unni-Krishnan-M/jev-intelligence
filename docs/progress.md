@@ -307,3 +307,32 @@ See [roadmap.md](roadmap.md#next-steps-ordered-by-value-from-what-11-measured):
 6. rater-detector budget;
 7. client-address attribution behind the web proxy (and `chmod 0644` on the registry write);
 8. scheduled retraining with app interactions.
+
+---
+
+# Platform migration: JEV as a domain-flexible engine (v1.2, started 2026-09-24)
+
+Contract: [platform.md](platform.md). Goal: make JEV itself the reusable decision and early-warning engine, with the
+movie recommender as the first domain adapter and a generic structured-dataset adapter as the second.
+
+## Audit (before any change)
+- Baseline green:
+  - pytest 174 passed / 1 skipped; ruff, format and mypy clean;
+  - frontend typegen, tsc, lint, Vitest (65) and build clean.
+- The intelligence pipeline (`ml/jev_ml/intel`, about 5.6k lines) is movie-coupled:
+  - ingest validates ratings;
+  - series are hard-wired to genres and platform;
+  - raters, lapse, model governance and genre-programming decisions are inline;
+  - warnings come straight from risk and anomaly levels, not from a decision.
+- Generic already: robust-z series anomalies, trends and change points, forecasting, scenarios, the decision
+  framework (confidence kinds, abstention, batches), the warning lifecycle, feedback, evidence and audit
+  persistence.
+- Missing: core/domain separation, a second domain, an early-warning decision gating warnings, preference drift,
+  recommendations downstream of a decision, per-user intelligence and scenarios, and a platform-first UI.
+
+## Status
+- [x] Core extraction + movie adapter + generic adapter (FRED unemployment) + early-warning decision + evaluation: golden tests pass (synthetic + real); movie ≈1 s, unemployment ≈0.2 s
+- [x] Preference drift + recommendation strategy + user scenarios + drift evaluation: 37 tests; detector precision 0.92, recall 0.29 (splice 20); adaptation not proven (7 users) → policy serves standard
+- [x] Frontend platform restructure (identity, nav, domain switcher, /me/intelligence): Vitest 88, tsc/lint/build clean (signed-in pages await the backend)
+- [x] Backend: domain dimension (migration 0005, SQLite + PostgreSQL 17), /intel/domains, /me/intelligence*, recommendations intelligence block: 276 passed; acceptance 69/69; strategy step p50 0.37 ms cached, ~5.5 ms uncached
+- [ ] Integration, end-to-end demo, docs, final report

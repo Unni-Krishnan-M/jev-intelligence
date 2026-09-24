@@ -1,12 +1,12 @@
 "use client";
 
 import { ChevronRight } from "lucide-react";
-import Link from "next/link";
 import { useState } from "react";
 import useSWR from "swr";
 
 import { fmtDate } from "@/components/jev/admin/ui";
 import { ConfidenceBadge, SeverityBadge, WarningStatusBadge } from "@/components/jev/intel/badges";
+import Link, { useIntelDomain } from "@/components/jev/intel/domain-context";
 import { PageHeader } from "@/components/jev/intel/page-header";
 import { FilterRow, IntelError, Pagination, RowsSkeleton } from "@/components/jev/intel/states";
 import { EmptyState } from "@/components/jev/states";
@@ -28,8 +28,9 @@ export default function WarningsPage() {
   const [status, setStatus] = useState("new");
   const [severity, setSeverity] = useState("all");
   const [offset, setOffset] = useState(0);
+  const { q: dq } = useIntelDomain();
   const { data, error, mutate, isValidating } = useSWR<Page<IntelWarning>>(
-    `/intel/warnings${qs({ status: status === "all" ? null : status, severity: severity === "all" ? null : severity, limit: LIMIT, offset })}`,
+    dq(`/intel/warnings${qs({ status: status === "all" ? null : status, severity: severity === "all" ? null : severity, limit: LIMIT, offset })}`),
   );
 
   return (
@@ -37,7 +38,7 @@ export default function WarningsPage() {
       <PageHeader
         eyebrow="anticipate"
         title="Early warnings"
-        description="One open warning per key: a repeat updates the existing one instead of duplicating it. Work the queue from new to resolved, or dismiss a false alarm."
+        description="Warnings are downstream of JEV's early-warning decision: one is raised only when that decision answers Warning or Urgent action. One open warning per key; a repeat updates it. Work the queue from new to resolved, or dismiss a false alarm."
       />
 
       <div className="mb-5 flex flex-col gap-2.5">
@@ -64,7 +65,7 @@ export default function WarningsPage() {
                   <span className="order-2 md:order-none"><SeverityBadge severity={w.severity} /></span>
                   <span className="order-1 col-span-2 min-w-0 md:order-none md:col-span-1">
                     <span className="block">{w.title}</span>
-                    <span className="block truncate font-mono text-xs text-muted-foreground">{w.key}</span>
+                    <span className="block truncate font-mono text-xs text-muted-foreground">{w.key}{w.early_warning_level ? ` · level ${w.early_warning_level}` : ""}{w.decision_id ? ` · from ${w.decision_id}` : ""}</span>
                   </span>
                   <span className="order-3 md:order-none"><WarningStatusBadge status={w.status} /></span>
                   <span className="order-4 md:order-none"><ConfidenceBadge value={w.confidence} kind={w.confidence_kind} /></span>

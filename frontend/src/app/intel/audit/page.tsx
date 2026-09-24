@@ -8,11 +8,11 @@
  */
 
 import { CheckCircle2, Info, LogIn, Search, X, XCircle } from "lucide-react";
-import Link from "next/link";
 import { useEffect, useState } from "react";
 import useSWR from "swr";
 
 import { fmtDate } from "@/components/jev/admin/ui";
+import Link from "@/components/jev/intel/domain-context";
 import { PageHeader } from "@/components/jev/intel/page-header";
 import { FilterRow, IntelError, Pagination, RowsSkeleton } from "@/components/jev/intel/states";
 import { EmptyState } from "@/components/jev/states";

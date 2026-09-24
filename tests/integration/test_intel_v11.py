@@ -167,7 +167,7 @@ def test_normalised_rows_match_run_json(client, intel, admin):
 
 def test_evidence_endpoint(client, intel, admin):
     page = client.get("/intel/evidence?limit=5", headers=admin).json()
-    assert set(page) == {"items", "total", "limit", "offset", "run_id", "as_of"}
+    assert set(page) == {"items", "total", "limit", "offset", "run_id", "as_of", "domain"}
     assert len(page["items"]) == 5 and page["total"] > 5 and page["run_id"]
     e = page["items"][0]
     assert set(e) == {
@@ -348,6 +348,8 @@ def test_recommendation_confidence_and_monitoring(client, intel, admin, tiny_mod
         "reason_codes",
         "confidence_histogram",
         "recent",
+        "domain",  # v1.2
+        "strategies",
     }
     assert mon["model_version"] and (mon["calibration"] is None) == uncalibrated
     assert mon["served"]["total"] >= 5 and mon["served"]["per_day"][-1]["count"] >= 5

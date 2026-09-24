@@ -1,11 +1,11 @@
 import { AlertTriangle, ChevronLeft, ChevronRight } from "lucide-react";
-import Link from "next/link";
 
+import { IntelLink } from "@/components/jev/intel/domain-context";
 import { EmptyState } from "@/components/jev/states";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError, errorMessage } from "@/lib/api";
-import { isNoRun, isNotDeployed } from "@/lib/intel";
+import { isDomainUnavailable, isNoRun, isNotDeployed } from "@/lib/intel";
 import { cn } from "@/lib/utils";
 
 export function NoRunState({ detail, className }: { detail?: string; className?: string }) {
@@ -14,18 +14,29 @@ export function NoRunState({ detail, className }: { detail?: string; className?:
       className={className}
       title="No intelligence run yet"
       body={`Run the pipeline from the overview to populate this view.${detail ? ` Server said: “${detail}”.` : ""}`}
-      action={<Button asChild variant="outline"><Link href="/intel">Go to the overview</Link></Button>}
+      action={<Button asChild variant="outline"><IntelLink href="/intel">Go to the overview</IntelLink></Button>}
+    />
+  );
+}
+
+/** 409 on a read: the domain's adapter cannot load on this machine and it has no stored runs. */
+export function DomainUnavailableState({ detail, className }: { detail: string; className?: string }) {
+  return (
+    <EmptyState
+      className={className}
+      title="This domain is not available here"
+      body={`Its data cannot be loaded on this machine and no earlier run is stored, so there is nothing to show. The API said: “${detail}”.`}
     />
   );
 }
 
 /** The API answering does not have this endpoint yet (an older build than the console). */
-export function NotDeployedState({ what, className }: { what: string; className?: string }) {
+export function NotDeployedState({ what, since = "v1.1", className }: { what: string; since?: string; className?: string }) {
   return (
     <EmptyState
       className={className}
-      title="Not available on this API version"
-      body={`The API that answered does not provide ${what} yet. Upgrade the backend to v1.1 or later; nothing is shown rather than guessed.`}
+      title={since === "v1.1" ? "Not available on this API version" : "Not available yet"}
+      body={`The API that answered does not provide ${what} yet. It arrives with backend ${since}; nothing is shown rather than guessed.`}
     />
   );
 }
@@ -35,8 +46,24 @@ export function NotDeployedState({ what, className }: { what: string; className?
  * the empty state instead (pass runBacked={false} for DB-backed lookups where 404 is a real miss).
  * Pass `what` on v1.1 endpoints: a route-miss 404 then reads "not available on this API version".
  */
-export function IntelError({ error, retry, runBacked = true, what, className }: { error: unknown; retry?: () => void; runBacked?: boolean; what?: string; className?: string }) {
-  if (what && isNotDeployed(error)) return <NotDeployedState what={what} className={className} />;
+export function IntelError({
+  error,
+  retry,
+  runBacked = true,
+  what,
+  since,
+  className,
+}: {
+  error: unknown;
+  retry?: () => void;
+  runBacked?: boolean;
+  what?: string;
+  /** backend version that introduces the endpoint, for the "not available" state */
+  since?: string;
+  className?: string;
+}) {
+  if (what && isNotDeployed(error)) return <NotDeployedState what={what} since={since} className={className} />;
+  if (isDomainUnavailable(error)) return <DomainUnavailableState detail={(error as ApiError).message} className={className} />;
   if (runBacked && isNoRun(error)) return <NoRunState className={className} detail={error instanceof ApiError ? error.message : undefined} />;
   const status = error instanceof ApiError ? error.status : null;
   const requestId = error instanceof ApiError ? error.requestId : undefined;

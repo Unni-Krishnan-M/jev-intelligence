@@ -1,7 +1,6 @@
 "use client";
 
 import { ArrowLeft } from "lucide-react";
-import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useState } from "react";
 import { toast } from "sonner";
@@ -9,7 +8,9 @@ import useSWR from "swr";
 
 import { fmtDate, Panel, SpecRows } from "@/components/jev/admin/ui";
 import { ConfidenceBadge, SeverityBadge, WARNING_STATUS_META, WarningStatusBadge } from "@/components/jev/intel/badges";
+import Link, { useIntelDomain } from "@/components/jev/intel/domain-context";
 import { EvidenceList } from "@/components/jev/intel/evidence-list";
+import { LevelBadge, LevelScale } from "@/components/jev/intel/level-scale";
 import { FeedbackButtons } from "@/components/jev/intel/feedback-buttons";
 import { IntelError } from "@/components/jev/intel/states";
 import { EmptyState } from "@/components/jev/states";
@@ -17,8 +18,9 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { api, ApiError, errorMessage } from "@/lib/api";
-import { fmtValue, sourceHref, TRANSITIONS, useIntelRevalidate } from "@/lib/intel";
-import type { IntelWarning, WarningStatus } from "@/lib/intel-types";
+import { isEarlyWarningDecision, isEarlyWarningLevel, LEVEL_LABEL } from "@/lib/decisions";
+import { fmtAnswer, fmtValue, sourceHref, TRANSITIONS, useIntelRevalidate } from "@/lib/intel";
+import type { DecisionRecord, IntelWarning, WarningStatus } from "@/lib/intel-types";
 
 const ACTION_LABEL: Record<WarningStatus, string> = {
   new: "Reopen",
@@ -32,11 +34,12 @@ function Lifecycle({ w, onChanged }: { w: IntelWarning; onChanged: () => Promise
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState<WarningStatus | null>(null);
   const next = TRANSITIONS[w.status] ?? [];
+  const { q: dq } = useIntelDomain();
 
   async function move(to: WarningStatus) {
     setBusy(to);
     try {
-      await api<IntelWarning>(`/intel/warnings/${w.id}`, { method: "PATCH", json: { status: to, note: note.trim() || null } });
+      await api<IntelWarning>(dq(`/intel/warnings/${w.id}`), { method: "PATCH", json: { status: to, note: note.trim() || null } });
       toast.success(`Warning ${WARNING_STATUS_META[to].label.toLowerCase()}`);
       setNote("");
       await onChanged();
@@ -67,9 +70,59 @@ function Lifecycle({ w, onChanged }: { w: IntelWarning; onChanged: () => Promise
   );
 }
 
+/** The early_warning_level decision this warning came from (platform.md §4). */
+function UpstreamDecision({ w }: { w: IntelWarning }) {
+  const { q: dq } = useIntelDomain();
+  const id = w.decision_id ?? null;
+  const { data: d, error } = useSWR<DecisionRecord>(id ? dq(`/intel/decisions/${encodeURIComponent(id)}`) : null, { shouldRetryOnError: false });
+
+  if (!id) {
+    return (
+      <Panel title="Raised by">
+        <p className="text-sm text-ink-2">
+          No JEV decision is linked. This warning was raised before warnings became downstream of the early-warning decision
+          {w.trigger?.rule ? <>, by rule <span className="font-mono text-xs">{w.trigger.rule}</span></> : null}.
+        </p>
+      </Panel>
+    );
+  }
+  const href = `/intel/decisions/${encodeURIComponent(id)}`;
+  const level = d && isEarlyWarningLevel(d.answer) ? d.answer : isEarlyWarningLevel(w.early_warning_level) ? w.early_warning_level : null;
+  return (
+    <Panel title="Raised by JEV decision" action={<Link href={href} className="text-xs text-primary hover:underline">Open decision →</Link>}>
+      <p className="text-sm">
+        This warning exists because the early-warning decision answered{" "}
+        {level ? <strong className="font-semibold">{LEVEL_LABEL[level]}</strong> : "Warning or Urgent action"}. Its severity follows from that level.
+      </p>
+      <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
+        <Link href={href} className="text-primary hover:underline">{id}</Link>
+      </p>
+      <div className="mt-4">
+        {error ? (
+          <p className="text-sm text-muted-foreground">
+            {error instanceof ApiError && error.status === 404 ? "The decision is not in the log for this domain." : `Could not load the decision: ${errorMessage(error)}`}
+          </p>
+        ) : !d ? (
+          <Skeleton className="h-14 w-full" />
+        ) : isEarlyWarningDecision(d) ? (
+          <>
+            <LevelScale decision={d} compact />
+            <p className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              {d.abstained ? "abstained" : <>confidence <ConfidenceBadge value={d.confidence} kind={d.confidence_kind} /></>} · policy {d.policy_version}
+            </p>
+          </>
+        ) : (
+          <p className="text-sm text-muted-foreground">Linked decision: {d.question} ({fmtAnswer(d)}).</p>
+        )}
+      </div>
+    </Panel>
+  );
+}
+
 export default function WarningDetailPage() {
   const { id } = useParams<{ id: string }>();
-  const { data: w, error, mutate } = useSWR<IntelWarning>(id ? `/intel/warnings/${encodeURIComponent(id)}` : null);
+  const { q: dq } = useIntelDomain();
+  const { data: w, error, mutate } = useSWR<IntelWarning>(id ? dq(`/intel/warnings/${encodeURIComponent(id)}`) : null);
   const revalidate = useIntelRevalidate();
 
   const back = (
@@ -106,6 +159,7 @@ export default function WarningDetailPage() {
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <SeverityBadge severity={w.severity} prefix="severity" />
           <WarningStatusBadge status={w.status} />
+          {isEarlyWarningLevel(w.early_warning_level) && <LevelBadge level={w.early_warning_level} />}
           <ConfidenceBadge value={w.confidence} kind={w.confidence_kind} />
           <span className="num text-xs text-muted-foreground">seen ×{w.occurrences}</span>
         </div>
@@ -114,6 +168,7 @@ export default function WarningDetailPage() {
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_340px]">
         <div className="space-y-4">
+          <UpstreamDecision w={w} />
           <Panel title="Trigger condition">
             {tr.condition && <p className="mb-3 text-sm">{tr.condition}</p>}
             <SpecRows

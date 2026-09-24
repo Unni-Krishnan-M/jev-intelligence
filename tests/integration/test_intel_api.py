@@ -127,7 +127,7 @@ def test_run_is_persisted(client, intel, admin):
 
 def test_list_endpoints_filters_and_pagination(client, intel, admin):
     sig = client.get("/intel/signals?limit=3", headers=admin).json()
-    assert set(sig) == {"items", "total", "limit", "offset", "run_id", "as_of"}
+    assert set(sig) == {"items", "total", "limit", "offset", "run_id", "as_of", "domain"}
     assert len(sig["items"]) == 3 and sig["total"] > 3 and sig["limit"] == 3 and sig["run_id"]
     page2 = client.get("/intel/signals?limit=3&offset=3", headers=admin).json()
     assert {s["id"] for s in page2["items"]}.isdisjoint({s["id"] for s in sig["items"]})
@@ -405,6 +405,8 @@ def test_status_shape(client, intel, admin):
         "top_risks",
         "confidence_histogram",
         "health",
+        "domain",  # v1.2
+        "domain_info",
     }
     assert st["latest_run"]["status"] == "succeeded" and st["summary"]["status"] in (
         "nominal",
@@ -433,6 +435,8 @@ def test_evaluation_endpoint(client, intel, admin):
         "available": False,
         "run_dir": None,
         "report": None,
+        "domain": "movie",  # v1.2
+        "platform": None,
     }
     d = TMP_ROOT / "experiments" / "intel-eval-20260101T000000Z"
     d.mkdir(parents=True, exist_ok=True)

@@ -321,11 +321,16 @@ EvaluationReport = {
 
 ## 7. Implementation notes (ML)
 
-Code: `ml/jev_ml/intel/` (`config, common, ingest, series, trends, anomalies, forecast, lapse,
-modelstats, risk, decisions, batches, warnings, actions, signals, scenario, pipeline, evaluation`). Every
-threshold lives in `IntelConfig` (embedded in `run.config`); each default has a one-line reason in
-`config.py`. CLIs: `uv run python scripts/run_intelligence.py [--as-of YYYY-MM-DD] [--out f.json]` and
-`uv run python scripts/evaluate_intelligence.py`. Tests: `tests/intel/`.
+Code (v1.2 platform layout, see [platform.md](platform.md#implementation-notes-platform-core)): the
+domain-independent engines live in `ml/jev_ml/core/` (series, trends, anomalies, forecast, scenario, risk,
+decisions, batches, early_warning, warnings, actions, signals, pipeline) and the movie-specific stages in
+`ml/jev_ml/domains/movie/` (config, ingest, series, raters, lapse, modelstats, risks, decisions, actions,
+signals, evaluation, adapter). `ml/jev_ml/intel/` keeps every v1.1 module name as a re-export, and
+`run_pipeline(inputs)` runs `jev_ml.core.run_domain` with the movie adapter; its output is the v1.1 output plus
+the additive fields below (a golden test guards this). Every threshold lives in `IntelConfig` (a `CoreConfig`
+subclass, embedded in `run.config`); each default has a one-line reason in its config module. CLIs:
+`uv run python scripts/run_intelligence.py [--domain movie] [--as-of YYYY-MM-DD] [--out f.json]` and
+`uv run python scripts/evaluate_intelligence.py`. Tests: `tests/intel/`, `tests/core/`, `tests/domains/`.
 
 ### Public API
 - `PipelineInputs(interactions, movies, app_ratings=None, app_feedback=None, app_served=None,
@@ -347,6 +352,9 @@ threshold lives in `IntelConfig` (embedded in `run.config`); each default has a 
   and `state_hash(state)`. `jev_ml.intel.decisions.build_decision_batches(...)` defines the three batches of a run, and
   `POLICY_VERSIONS` maps each decision key to its policy version.
   `jev_ml.intel.forecast.window_mean_forecast(state, window, cfg)` and `forecast_shares(...)` are also new.
+- v1.2: `jev_ml.intel.run_default(as_of=None, now=None)`; `jev_ml.core.run_domain(adapter, as_of, now,
+  suppressed_keys, config)`; `jev_ml.domains.available()` / `get_adapter(key)`. `forecast_shares` now takes the
+  eligibility share as an argument (`min_share`) and routes by the series spec's `share_forecast` flag.
 
 ### Additions to the contract (fields added, none renamed)
 - `run.last_complete_month`. `data.excluded_after_as_of`. `data.live` (live-feedback test status).
@@ -382,6 +390,23 @@ threshold lives in `IntelConfig` (embedded in `run.config`); each default has a 
   `lapse.status`, `anomaly.injection.baseline_rule`, `attack_types[].{trials, baseline_f1,
   baseline_auc}`, `anomaly.series.{detection_by_magnitude, n_points}`,
   `change_point.detection_by_magnitude`, `config`.
+
+- v1.2 (platform core, additive): every object carries `domain`; `run.domain`, `run.core_version`,
+  `run.frequency`, `run.validation`; `summary.counts.early_warning` (count per level). `decisions` contains one
+  `early_warning_level` decision per situation (key `early_warning_level`, policy `ewl-1.0.0`, `choice` over
+  `NO_ACTION|MONITOR|WARNING|URGENT_ACTION`, confidence kind `margin`, extra fields `situation` and `series_id`,
+  state nested by stage), answered in the `early_warning` batch (which adds `situations_without_points`).
+  `warnings[]`: `decision_id` (the `early_warning_level` decision the warning is downstream of) and
+  `early_warning_level`; the warning set and severities are unchanged for the movie domain. Trends: `magnitude`,
+  `velocity`, `baseline`, `supporting_observations`, `confidence` (= 1 − q, kind `evidence`), `entity_id`,
+  `adverse_direction`. Anomalies: `observed_value`, `expected_value`, `anomaly_score` (the normalised strength
+  that v1.1 used for signals and warning confidence), `confidence(_kind)`, `entity_id`, `source`, `adverse`,
+  `severity_basis`, `baseline_points`, `anomaly_basis`, `level`, `relative_deviation`. Risks: `severity`,
+  `contributing_factors`, `entity_id`, `series_id` (genre risks name their share series), `severity_basis`.
+  Signals: `entity_id`, `baseline`, `change`, `confidence`, `confidence_kind`. Forecasts: `horizon_unit`,
+  `entity_id`, `adverse_direction`. Series: `entity_id`, `adverse_direction`, `frequency`. Sources: MovieLens
+  `license`, `url`, `checksum`; app `sla_days`, `staleness_days`, `stale_response`. `POLICY_VERSIONS` gains
+  `early_warning_level`. Because the batch snapshots now carry these fields, every `state_hash` differs from v1.1.
 
 ### Methods and thresholds
 - **Validation.** Checks are schema, null rate, rating range, 0.5-star grid, unknown movie ids,
@@ -455,6 +480,9 @@ backtested coverage is 0.67–1.00 over 12 origins. Three genres abstain (Advent
 window interval covered only 58 % in the backtest. All three batches have status `ok`.
 In the 2017-07-01 replay, 10 of the 18 slot-share decisions abstain on coverage (0.42–0.58), because the Q2-2017 burst
 breaks the backtest intervals. Model governance abstains as before.
+v1.2 (platform core) keeps both warning sets exactly and adds the `early_warning_level` decisions: 13 as of the
+default (12 MONITOR, 1 WARNING behind the lapse warning, margin 0.98; 55 decisions in total, about 1.05 s per run) and
+18 in the 2017-07-01 replay (17 MONITOR, 1 URGENT_ACTION behind the Horror spike; 62 decisions).
 
 As of 2017-07-01 (replay): status **alert**. **1 warning**: the `share:genre:Horror` spike in 2017-05
 (high), the genre-specific trace of the Q2-2017 burst. `volume:all` itself is *not* flagged: on log

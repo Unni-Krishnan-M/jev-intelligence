@@ -1,11 +1,11 @@
 "use client";
 
-import Link from "next/link";
 import { useState } from "react";
 import useSWR from "swr";
 
 import { fmtDate, fmtNum, Panel, SpecRows, StatTile } from "@/components/jev/admin/ui";
 import { FanChart, ReliabilityDiagram, TableView } from "@/components/jev/intel/charts";
+import Link, { CapabilityNotice, useIntelDomain } from "@/components/jev/intel/domain-context";
 import { FeedbackButtons } from "@/components/jev/intel/feedback-buttons";
 import { PageHeader } from "@/components/jev/intel/page-header";
 import { IntelError, PanelsSkeleton } from "@/components/jev/intel/states";
@@ -17,7 +17,8 @@ import type { Forecast, Lapse, PredictionsResponse, SeriesDetail } from "@/lib/i
 import { cn } from "@/lib/utils";
 
 function ForecastView({ f }: { f: Forecast }) {
-  const { data, error } = useSWR<SeriesDetail>(`/intel/series/${encodeURIComponent(f.series_id)}`);
+  const { q: dq } = useIntelDomain();
+  const { data, error } = useSWR<SeriesDetail>(dq(`/intel/series/${encodeURIComponent(f.series_id)}`));
   const history = (data?.series.points ?? []).slice(-36);
   const b = f.backtest;
   const beats = b.mase !== null && b.naive_mase !== null ? b.mase < b.naive_mase : null;
@@ -177,7 +178,9 @@ function LapseView({ lapse }: { lapse: Lapse }) {
 }
 
 export default function PredictionsPage() {
-  const { data, error, mutate } = useSWR<PredictionsResponse>("/intel/predictions");
+  const { q: dq, can } = useIntelDomain();
+  const lapseCap = can("lapse");
+  const { data, error, mutate } = useSWR<PredictionsResponse>(dq("/intel/predictions"));
   const [picked, setPicked] = useState<string | null>(null);
   const forecasts = data?.forecasts ?? [];
   const current = forecasts.find((f) => f.id === picked) ?? forecasts[0];
@@ -187,7 +190,7 @@ export default function PredictionsPage() {
       <PageHeader
         eyebrow="anticipate"
         title="Predictions"
-        description="Monthly forecasts with 80 % intervals and a rolling-origin backtest, and the audience-lapse model with its calibration. All of these are estimates."
+        description={lapseCap.available ? "Forecasts with 80 % intervals and a rolling-origin backtest, and the audience-lapse model with its calibration. All of these are estimates." : "Forecasts with 80 % intervals and a rolling-origin backtest. All of these are estimates."}
         asOf={data?.as_of}
         runId={data?.run_id}
       />
@@ -262,10 +265,14 @@ export default function PredictionsPage() {
             )}
           </section>
 
-          <section aria-labelledby="lapse-heading">
-            <SectionHeader id="lapse-heading" kicker={data.lapse ? `lapse model · ${data.lapse.horizon_days}-day horizon` : "lapse model"} title="Who may stop rating" />
-            {!data.lapse ? <EmptyState title="No lapse model in this run" /> : <LapseView lapse={data.lapse} />}
-          </section>
+          {lapseCap.available ? (
+            <section aria-labelledby="lapse-heading">
+              <SectionHeader id="lapse-heading" kicker={data.lapse ? `lapse model · ${data.lapse.horizon_days}-day horizon` : "lapse model"} title="Who may stop rating" />
+              {!data.lapse ? <EmptyState title="No lapse model in this run" /> : <LapseView lapse={data.lapse} />}
+            </section>
+          ) : (
+            <CapabilityNotice cap="lapse" />
+          )}
         </div>
       )}
     </div>

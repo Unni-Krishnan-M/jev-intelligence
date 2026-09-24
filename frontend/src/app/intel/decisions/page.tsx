@@ -1,7 +1,6 @@
 "use client";
 
 import { Ban, ChevronRight, Layers, OctagonAlert, X } from "lucide-react";
-import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useState } from "react";
 import useSWR from "swr";
@@ -9,11 +8,14 @@ import useSWR from "swr";
 import { fmtDate } from "@/components/jev/admin/ui";
 import { ConfidenceBadge, CONFIDENCE_EXPLAIN } from "@/components/jev/intel/badges";
 import { OptionScores, ScoreRange } from "@/components/jev/intel/charts";
+import Link, { useIntelDomain } from "@/components/jev/intel/domain-context";
+import { LevelScale } from "@/components/jev/intel/level-scale";
 import { PageHeader } from "@/components/jev/intel/page-header";
 import { IntelError, Pagination, RowsSkeleton } from "@/components/jev/intel/states";
 import { EmptyState } from "@/components/jev/states";
 import { Button } from "@/components/ui/button";
 import { api, qs } from "@/lib/api";
+import { isEarlyWarningDecision } from "@/lib/decisions";
 import { fmtAnswer, groupByBatch, humanize } from "@/lib/intel";
 import type { ConfidenceKind, DecisionBatch, DecisionBatchList, DecisionRecord, Page } from "@/lib/intel-types";
 
@@ -21,9 +23,10 @@ const LIMIT = 30;
 
 /** Batches of every run on this page, keyed by batch id. A missing endpoint just means no metadata. */
 function useBatches(runIds: string[]) {
-  const { data } = useSWR<Map<string, DecisionBatch>>(runIds.length ? ["intel:batches", ...runIds] : null, async (key: string[]) => {
+  const { q: dq } = useIntelDomain();
+  const { data } = useSWR<Map<string, DecisionBatch>>(runIds.length ? ["intel:batches", dq(""), ...runIds] : null, async (key: string[]) => {
     const lists = await Promise.all(
-      key.slice(1).map((id) => api<DecisionBatchList>(`/intel/decisions/batches${qs({ run_id: id })}`).then((r) => r.items ?? []).catch(() => [] as DecisionBatch[])),
+      key.slice(2).map((id) => api<DecisionBatchList>(dq(`/intel/decisions/batches${qs({ run_id: id })}`)).then((r) => r.items ?? []).catch(() => [] as DecisionBatch[])),
     );
     return new Map(lists.flat().map((b) => [b.id, b]));
   });
@@ -54,7 +57,9 @@ function DecisionRow({ d }: { d: DecisionRecord }) {
           )}
         </p>
       </div>
-      {score && d.scale ? (
+      {isEarlyWarningDecision(d) ? (
+        <LevelScale decision={d} compact className="self-center" />
+      ) : score && d.scale ? (
         <ScoreRange value={d.abstained ? null : numeric} interval={d.abstained ? null : d.answer_interval} scale={d.scale} coverage={d.confidence_kind === "interval" ? d.confidence : null} className="self-center" />
       ) : (
         <OptionScores scores={d.option_scores} answer={d.abstained ? null : String(d.answer)} className="self-center" />
@@ -99,7 +104,8 @@ function DecisionLog() {
 
 function DecisionList({ batchId }: { batchId: string | null }) {
   const [offset, setOffset] = useState(0);
-  const { data, error, mutate } = useSWR<Page<DecisionRecord>>(`/intel/decisions${qs({ batch_id: batchId, limit: LIMIT, offset })}`);
+  const { q: dq } = useIntelDomain();
+  const { data, error, mutate } = useSWR<Page<DecisionRecord>>(dq(`/intel/decisions${qs({ batch_id: batchId, limit: LIMIT, offset })}`));
   // an API without the batch filter ignores it, so the filter is applied here as well
   const items = (data?.items ?? []).filter((d) => !batchId || d.batch_id === batchId);
   const runIds = Array.from(new Set(items.filter((d) => d.batch_id).map((d) => d.run_id)));
@@ -155,10 +161,10 @@ export default function DecisionsPage() {
       <PageHeader
         eyebrow="decide"
         title="Decision log"
-        description="Fixed questions with declared answers and a versioned policy. Arithmetic happens in code; the policy only weighs the evidence. When data is thin, JEV abstains. Questions asked together share one hashed input state."
+        description="Fixed questions with declared answers and a versioned policy. Arithmetic happens in code; the policy only weighs the evidence. When data is thin, JEV abstains; questions asked together share one hashed input state. Early warnings are downstream of the early-warning-level decision: NO_ACTION, MONITOR, WARNING or URGENT_ACTION."
       />
 
-      <dl className="mb-6 grid grid-cols-1 gap-3 text-xs sm:grid-cols-2 xl:grid-cols-4">
+      <dl className="mb-6 grid grid-cols-1 gap-3 text-xs sm:grid-cols-2 xl:grid-cols-5">
         {(Object.keys(CONFIDENCE_EXPLAIN) as ConfidenceKind[]).map((k) => (
           <div key={k} className="rounded border hairline px-3 py-2.5">
             <dt className="eyebrow">{k}</dt>

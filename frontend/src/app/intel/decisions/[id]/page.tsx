@@ -1,19 +1,21 @@
 "use client";
 
 import { ArrowLeft, Ban, Layers } from "lucide-react";
-import Link from "next/link";
 import { useParams } from "next/navigation";
 import useSWR from "swr";
 
 import { fmtDate, Panel, SpecRows } from "@/components/jev/admin/ui";
 import { ConfidenceBadge, CONFIDENCE_EXPLAIN } from "@/components/jev/intel/badges";
 import { OptionScores, ScoreRange } from "@/components/jev/intel/charts";
+import Link, { useIntelDomain } from "@/components/jev/intel/domain-context";
 import { EvidenceList } from "@/components/jev/intel/evidence-list";
 import { FeedbackButtons } from "@/components/jev/intel/feedback-buttons";
+import { LevelScale, StateSnapshot } from "@/components/jev/intel/level-scale";
 import { IntelError } from "@/components/jev/intel/states";
 import { EmptyState } from "@/components/jev/states";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError, qs } from "@/lib/api";
+import { isEarlyWarningDecision, isEarlyWarningLevel, LEVEL_LABEL } from "@/lib/decisions";
 import { fmtAnswer, fmtValue, humanize } from "@/lib/intel";
 import type { DecisionBatchList, DecisionRecord, Page, RunList } from "@/lib/intel-types";
 
@@ -38,6 +40,7 @@ function limitations(d: DecisionRecord): string[] {
   if (d.confidence_kind === "rule") out.push("Confidence comes from a deterministic threshold rule; it records that the rule fired, not how likely the answer is to be right.");
   if (d.confidence_kind === "probability") out.push("Confidence is an estimated probability from the data up to as-of; it is not a guarantee.");
   if (d.confidence_kind === "interval") out.push("Confidence is the nominal coverage of the interval around the answer: the range should contain the outcome that often. It is not a probability that the answer itself is right.");
+  if (d.confidence_kind === "evidence") out.push("Confidence is evidence strength (1 − adjusted p) against “no change”; it is not a probability of being right.");
   if (d.kind === "score") out.push("The answer is a recommended number on a bounded scale; values outside the scale are never proposed.");
   out.push(`Only data at or before ${fmtDate(d.as_of)} was used; anything later is invisible to this decision.`);
   if (d.feedback.correct + d.feedback.incorrect === 0) out.push("No operator has judged this decision yet, so its track record is unknown.");
@@ -47,8 +50,9 @@ function limitations(d: DecisionRecord): string[] {
 /** The other questions answered in the same call, against the same hashed state. */
 function BatchPanel({ d }: { d: DecisionRecord }) {
   const batchId = d.batch_id as string;
-  const batches = useSWR<DecisionBatchList>(`/intel/decisions/batches${qs({ run_id: d.run_id })}`, { shouldRetryOnError: false });
-  const siblings = useSWR<Page<DecisionRecord>>(`/intel/decisions${qs({ batch_id: batchId, run_id: d.run_id, limit: 50 })}`);
+  const { q: dq } = useIntelDomain();
+  const batches = useSWR<DecisionBatchList>(dq(`/intel/decisions/batches${qs({ run_id: d.run_id })}`), { shouldRetryOnError: false });
+  const siblings = useSWR<Page<DecisionRecord>>(dq(`/intel/decisions${qs({ batch_id: batchId, run_id: d.run_id, limit: 50 })}`));
   const batch = batches.data?.items.find((b) => b.id === batchId);
   // an API without the batch filter returns everything, so filter here too
   const members = (siblings.data?.items ?? []).filter((x) => x.batch_id === batchId && x.run_id === d.run_id);
@@ -94,8 +98,9 @@ function BatchPanel({ d }: { d: DecisionRecord }) {
 
 export default function DecisionDetailPage() {
   const { id } = useParams<{ id: string }>();
-  const { data: d, error, mutate } = useSWR<DecisionRecord>(id ? `/intel/decisions/${encodeURIComponent(id)}` : null);
-  const runs = useSWR<RunList>(d ? "/intel/runs" : null);
+  const { q: dq } = useIntelDomain();
+  const { data: d, error, mutate } = useSWR<DecisionRecord>(id ? dq(`/intel/decisions/${encodeURIComponent(id)}`) : null);
+  const runs = useSWR<RunList>(d ? dq("/intel/runs") : null);
   const run = runs.data?.items.find((r) => r.run_id === d?.run_id);
   const modelVersion = run?.model_version ?? (d?.entity_type === "model" ? d.entity : null);
 
@@ -119,6 +124,7 @@ export default function DecisionDetailPage() {
   }
 
   const rows = stateRows(d.state);
+  const ewl = isEarlyWarningDecision(d);
 
   return (
     <div>
@@ -135,7 +141,7 @@ export default function DecisionDetailPage() {
             </p>
           ) : (
             <>
-              <p className="text-lg">Answer: <strong className="font-semibold">{fmtAnswer(d)}</strong></p>
+              <p className="text-lg">Answer: <strong className="font-semibold">{ewl && isEarlyWarningLevel(d.answer) ? LEVEL_LABEL[d.answer] : fmtAnswer(d)}</strong></p>
               <ConfidenceBadge value={d.confidence} kind={d.confidence_kind} interval={d.answer_interval} />
             </>
           )}
@@ -145,7 +151,24 @@ export default function DecisionDetailPage() {
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_340px]">
         <div className="space-y-4">
-          {d.kind === "score" && d.scale ? (
+          {ewl ? (
+            <Panel title="Early-warning level">
+              <LevelScale decision={d} />
+              <div className="mt-4 flex flex-wrap items-center gap-2 text-sm">
+                <span className="text-muted-foreground">Confidence</span>
+                {d.abstained ? <span className="text-muted-foreground">— (abstained)</span> : <ConfidenceBadge value={d.confidence} kind={d.confidence_kind} />}
+                <span className="text-xs text-muted-foreground">
+                  {d.confidence_kind === "margin" ? "the gap between the two highest level scores, normalised; not a probability." : CONFIDENCE_EXPLAIN[d.confidence_kind]}
+                </span>
+              </div>
+              <p className="eyebrow mb-2 mt-6">Situation snapshot · the evidence the policy saw</p>
+              <StateSnapshot state={d.state} />
+              <p className="mt-3 text-xs text-muted-foreground">
+                Policy {d.policy_version}: monotone point scores per stage, so more adverse evidence can never lower the level. Warnings are raised from
+                this decision, never around it.
+              </p>
+            </Panel>
+          ) : d.kind === "score" && d.scale ? (
             <Panel title="Answer on its scale">
               <ScoreRange
                 value={d.abstained || typeof d.answer !== "number" ? null : d.answer}
@@ -185,8 +208,12 @@ export default function DecisionDetailPage() {
                 ) : (
                   <p className="text-sm text-muted-foreground">No rationale recorded.</p>
                 )}
-                <p className="eyebrow mb-1 mt-6">State the policy saw</p>
-                {rows.length ? <SpecRows rows={rows} /> : <p className="text-sm text-muted-foreground">Empty snapshot.</p>}
+                {!ewl && (
+                  <>
+                    <p className="eyebrow mb-1 mt-6">State the policy saw</p>
+                    {rows.length ? <SpecRows rows={rows} /> : <p className="text-sm text-muted-foreground">Empty snapshot.</p>}
+                  </>
+                )}
               </div>
               <div>
                 <p className="eyebrow mb-2">Evidence</p>
@@ -211,6 +238,7 @@ export default function DecisionDetailPage() {
                 { label: "Recorded", value: fmtDate(d.created_at) },
                 { label: "Run", value: <span title={d.run_id}>{d.run_id.slice(0, 8)}</span> },
                 { label: "Subject", value: `${d.entity_type} ${d.entity}` },
+                ...(d.domain ? [{ label: "Domain", value: d.domain }] : []),
                 { label: "Decision id", value: <span title={d.id}>{d.id}</span> },
                 ...(d.batch_id ? [{ label: "Batch", value: <Link href={`/intel/decisions${qs({ batch_id: d.batch_id })}`} className="text-primary hover:underline" title={d.batch_id}>{d.batch_id}</Link> }] : []),
               ]}

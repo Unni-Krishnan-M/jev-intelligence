@@ -8,6 +8,7 @@ import useSWR from "swr";
 
 import { fmtDate, Panel } from "@/components/jev/admin/ui";
 import { SLOT_COLORS, TableView, TimeSeriesChart } from "@/components/jev/intel/charts";
+import { CapabilityNotice, useIntelDomain } from "@/components/jev/intel/domain-context";
 import { PageHeader } from "@/components/jev/intel/page-header";
 import { FilterRow, IntelError, RowsSkeleton } from "@/components/jev/intel/states";
 import { EmptyState, SectionHeader } from "@/components/jev/states";
@@ -224,9 +225,10 @@ function ResultView({ out, names }: { out: ScenarioOutput; names: string[] }) {
 function Builder() {
   const params = useSearchParams();
   const preset = params.get("series");
-  const trends = useSWR<Page<Trend>>(`/intel/trends${qs({ limit: 100 })}`);
-  const preds = useSWR<PredictionsResponse>("/intel/predictions");
-  const saved = useSWR<{ items: SavedScenario[]; total: number }>("/intel/scenarios");
+  const { q: dq } = useIntelDomain();
+  const trends = useSWR<Page<Trend>>(dq(`/intel/trends${qs({ limit: 100 })}`));
+  const preds = useSWR<PredictionsResponse>(dq("/intel/predictions"));
+  const saved = useSWR<{ items: SavedScenario[]; total: number }>(dq("/intel/scenarios"));
 
   const options = useMemo(() => {
     const ids = new Set<string>();
@@ -263,7 +265,7 @@ function Builder() {
     setBusy(save ? "save" : "run");
     try {
       const body: ScenarioRequest = { ...input(), save, ...(save ? { title: title.trim() || `${seriesLabel(seriesId)} · ${Math.round(horizon)} m` } : {}) };
-      const out = await api<ScenarioResponse>("/intel/scenarios", { json: body });
+      const out = await api<ScenarioResponse>(dq("/intel/scenarios"), { json: body });
       setResult(out);
       setResultNames(specs.map((s) => s.name.trim()));
       if (save) {
@@ -398,16 +400,22 @@ function Builder() {
 }
 
 export default function ScenariosPage() {
+  const { can } = useIntelDomain();
+  const cap = can("scenarios");
   return (
     <div>
       <PageHeader
-        eyebrow="decide"
+        eyebrow="anticipate"
         title="What-if scenarios"
         description="Bend a series' fitted trend — continue, slow, reverse, or shock its level — and compare the paths with the baseline forecast and its 80 % band. Scenarios move the trend, not the noise."
       />
-      <Suspense fallback={<Skeleton className="h-72 w-full" />}>
-        <Builder />
-      </Suspense>
+      {cap.available ? (
+        <Suspense fallback={<Skeleton className="h-72 w-full" />}>
+          <Builder />
+        </Suspense>
+      ) : (
+        <CapabilityNotice cap="scenarios" />
+      )}
     </div>
   );
 }

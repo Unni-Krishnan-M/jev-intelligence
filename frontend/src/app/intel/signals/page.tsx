@@ -5,6 +5,7 @@ import useSWR from "swr";
 
 import { fmtDate } from "@/components/jev/admin/ui";
 import { DirectionIcon, FreshnessBadge, Meter } from "@/components/jev/intel/badges";
+import { useIntelDomain } from "@/components/jev/intel/domain-context";
 import { EvidenceDisclosure } from "@/components/jev/intel/evidence-list";
 import { HistoryTimeline } from "@/components/jev/intel/history-timeline";
 import { PageHeader } from "@/components/jev/intel/page-header";
@@ -35,7 +36,8 @@ export default function SignalsPage() {
   const [kind, setKind] = useState("all");
   const [entityType, setEntityType] = useState("all");
   const [offset, setOffset] = useState(0);
-  const key = `/intel/signals${qs({ kind: kind === "all" ? null : kind, entity_type: entityType === "all" ? null : entityType, limit: LIMIT, offset })}`;
+  const { q: dq } = useIntelDomain();
+  const key = dq(`/intel/signals${qs({ kind: kind === "all" ? null : kind, entity_type: entityType === "all" ? null : entityType, limit: LIMIT, offset })}`);
   const { data, error, mutate, isValidating } = useSWR<Page<Signal>>(key);
 
   return (

@@ -31,11 +31,16 @@ export function isNoRun(err: unknown): boolean {
 }
 
 /**
- * 404 "Not Found" (FastAPI's route-miss detail) or 405: the endpoint does not exist on this API
- * build. v1.1 views use it to say "not available on this API version" instead of failing.
+ * 404 "Not Found" (FastAPI's route-miss detail), 405 or 501: the endpoint does not exist on this
+ * API build. Newer views use it to say "not available yet" instead of failing.
  */
 export function isNotDeployed(err: unknown): boolean {
-  return err instanceof ApiError && ((err.status === 404 && err.message === "Not Found") || err.status === 405);
+  return err instanceof ApiError && ((err.status === 404 && err.message === "Not Found") || err.status === 405 || err.status === 501);
+}
+
+/** 409 on a console read: the chosen domain cannot load here and has no stored runs (v1.2). */
+export function isDomainUnavailable(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 409;
 }
 
 /** Revalidate every cached /intel/* response (after a run, a status change, feedback…). */

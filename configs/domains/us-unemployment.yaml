@@ -1,0 +1,80 @@
+# US and state unemployment rates (BLS via FRED) for the generic JEV adapter.
+# Data: scripts/download_domain_data.py us-unemployment  ->  data/raw/domains/us-unemployment/ (gitignored)
+key: us-unemployment
+name: US unemployment
+description: >-
+  Monthly seasonally adjusted unemployment rates for the United States and 12 large states (U.S. Bureau
+  of Labor Statistics: Current Population Survey for the US, Local Area Unemployment Statistics for the
+  states), retrieved from FRED. Adverse direction: up.
+frequency: month
+grid_end: last_observation        # a published monthly rate is complete once released
+source:
+  name: fred-bls
+  kind: dataset
+  file: data/raw/domains/us-unemployment/unemployment_long.csv
+  provenance: data/raw/domains/us-unemployment/provenance.json
+  license: >-
+    Public domain: U.S. Bureau of Labor Statistics data (works of the U.S. federal government); FRED
+    lists these series as public-domain, citation requested (Federal Reserve Bank of St. Louis).
+  url: https://fred.stlouisfed.org/
+  expected_update: monthly
+  max_lag_days: 90                # one month + the state release delay (+ slack)
+  # BLS publishes the national rate on the first Friday after the month (<= ~38 days after the
+  # period start) and state rates about two weeks later (~52-55 days). Replays only see a month once
+  # it would have been published.
+  availability_lag_days: {default: 55, US: 38}
+columns:
+  timestamp: date
+  entity: entity
+  value: value
+  entity_type: entity_type
+  groups: [census_region]
+value_range: [0, 100]
+series:
+  - id: "unemployment_rate:{group}"
+    metric: level
+    name: unemployment_rate
+    anomaly_basis: change         # score month-over-month jumps; slow drifts are the trend's job
+    resolution: 0.1               # rates are published to one decimal
+    group_by: entity
+    entity_type: area
+    unit: "% of labour force"
+    adverse_direction: up
+    forecast: true
+    trend_unit: "percentage points/month"
+    count_noun: observations
+  - id: "unemployment_rate:region:{group}"
+    metric: mean
+    name: unemployment_rate
+    anomaly_basis: change
+    resolution: 0.05              # a mean of rates given to one decimal
+    group_by: census_region
+    min_count: 2
+    entity_type: census_region
+    unit: "% (unweighted mean of the region's states in this dataset)"
+    adverse_direction: up
+    forecast: true
+    trend_unit: "percentage points/month"
+thresholds: {}                    # the core defaults (docs/platform.md, implementation notes)
+impact_weights: {}                # none declared: impact is measured from the relative change
+download:
+  kind: fred
+  url_template: "https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}"
+  series:
+    US: UNRATE
+    CA: CAUR
+    TX: TXUR
+    FL: FLUR
+    NY: NYUR
+    PA: PAUR
+    IL: ILUR
+    OH: OHUR
+    GA: GAUR
+    NC: NCUR
+    MI: MIUR
+    NJ: NJUR
+    WA: WAUR
+  entity_type: {US: country, default: state}
+  groups:
+    census_region: {CA: West, WA: West, TX: South, FL: South, GA: South, NC: South, NY: Northeast,
+                    PA: Northeast, NJ: Northeast, IL: Midwest, OH: Midwest, MI: Midwest}

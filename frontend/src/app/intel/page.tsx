@@ -1,7 +1,6 @@
 "use client";
 
 import { Play } from "lucide-react";
-import Link from "next/link";
 import { useState } from "react";
 import { toast } from "sonner";
 import useSWR from "swr";
@@ -12,11 +11,13 @@ import {
   DirectionIcon,
   FreshnessBadge,
   Meter,
+  ModelHealth,
   SEVERITY_META,
   SeverityBadge,
   SYSTEM_META,
 } from "@/components/jev/intel/badges";
 import { CountBars, NamedBars, TableView } from "@/components/jev/intel/charts";
+import Link, { useIntelDomain } from "@/components/jev/intel/domain-context";
 import { PageHeader } from "@/components/jev/intel/page-header";
 import { IntelError, PanelsSkeleton } from "@/components/jev/intel/states";
 import { EmptyState } from "@/components/jev/states";
@@ -25,6 +26,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { api, errorMessage } from "@/lib/api";
+import { DEFAULT_DOMAIN } from "@/lib/domain";
 import { daysBetween, fmtAnswer, fmtDays, fmtMs, fmtPct, humanize, orderStages, SEVERITIES, useIntelRevalidate } from "@/lib/intel";
 import type { IntelStatus, Run } from "@/lib/intel-types";
 
@@ -32,11 +34,13 @@ function RunControl({ lastAsOf }: { lastAsOf?: string | null }) {
   const [asOf, setAsOf] = useState("");
   const [busy, setBusy] = useState(false);
   const revalidate = useIntelRevalidate();
+  const { domain, name } = useIntelDomain();
 
   async function run() {
     setBusy(true);
     try {
-      const r = await api<Run>("/intel/runs", { json: asOf ? { as_of: asOf } : {} });
+      // the domain goes in the body (platform.md §8); the API defaults to movie without it
+      const r = await api<Run>("/intel/runs", { json: asOf ? { domain, as_of: asOf } : { domain } });
       if (r.status === "failed") toast.error(`Run failed${r.error ? `: ${r.error}` : ""}`);
       else toast.success(`Run ${r.status} · as of ${fmtDate(r.as_of)} · ${fmtMs(r.duration_ms)}`);
       await revalidate();
@@ -49,7 +53,7 @@ function RunControl({ lastAsOf }: { lastAsOf?: string | null }) {
 
   return (
     <div className="w-full rounded-lg border bg-card p-4 sm:w-auto sm:min-w-[300px]">
-      <p className="eyebrow">Run the pipeline</p>
+      <p className="eyebrow">Run the pipeline · {name}</p>
       <div className="mt-3 flex flex-wrap items-end gap-2">
         <div className="min-w-0 flex-1 space-y-1">
           <Label htmlFor="replay" className="text-xs font-normal text-muted-foreground">Replay as of (optional)</Label>
@@ -64,22 +68,23 @@ function RunControl({ lastAsOf }: { lastAsOf?: string | null }) {
           ? "Running synchronously; this usually takes a few seconds."
           : asOf
             ? "Uses only data at or before that date, so the run is leak-free."
-            : `Defaults to the last MovieLens event${lastAsOf ? ` (last run: ${fmtDate(lastAsOf)})` : ""}.`}
+            : `Defaults to the latest event in the ${name} data${lastAsOf ? ` (last run: ${fmtDate(lastAsOf)})` : ""}.`}
       </p>
     </div>
   );
 }
 
 export default function IntelOverview() {
-  const { data, error, mutate } = useSWR<IntelStatus>("/intel/status", { refreshInterval: 60000 });
+  const { domain, name, q: dq } = useIntelDomain();
+  const { data, error, mutate } = useSWR<IntelStatus>(dq("/intel/status"), { refreshInterval: 60000 });
   const run = data?.latest_run ?? null;
 
   return (
     <div>
       <PageHeader
-        eyebrow="overview"
+        eyebrow={`overview · ${name}`}
         title="Situation report"
-        description="What the platform's data says right now: the system's status, the evidence behind it and what is waiting for a person."
+        description={`What the ${name} data says right now: the status, the evidence behind it, what JEV decided and what is waiting for a person.`}
         asOf={run?.as_of}
         runId={run?.run_id}
         action={<RunControl lastAsOf={run?.as_of} />}
@@ -94,7 +99,10 @@ export default function IntelOverview() {
           <PanelsSkeleton />
         </div>
       ) : !run ? (
-        <EmptyState title="No intelligence run yet — run the pipeline" body="Use “Run now” above. The first run reads the MovieLens snapshot, the app database and the active model." />
+        <EmptyState
+          title="No intelligence run yet — run the pipeline"
+          body={domain === DEFAULT_DOMAIN ? "Use “Run now” above. The first run reads the MovieLens snapshot, the app database and the active model." : `Use “Run now” above. The first run reads the ${name} dataset through its domain adapter.`}
+        />
       ) : (
         <Overview s={data} run={run} />
       )}
@@ -154,7 +162,7 @@ function Overview({ s, run }: { s: IntelStatus; run: Run }) {
         <span className="eyebrow">Health</span>
         <span className="flex items-center gap-1.5 text-muted-foreground">Database <Status ok={s.health.database === "ok"} label={s.health.database} /></span>
         <span className="flex items-center gap-1.5 text-muted-foreground">Cache <Status ok={s.health.cache === "ok"} label={s.health.cache} /></span>
-        <span className="flex items-center gap-1.5 text-muted-foreground">Model <Status ok={s.health.model === "ok"} label={s.health.model} /></span>
+        <span className="flex items-center gap-1.5 text-muted-foreground">Model <ModelHealth value={s.health.model} /></span>
         <span className="flex items-center gap-1.5 text-muted-foreground">Pipeline <Status ok={s.health.pipeline === "ok"} label={humanize(s.health.pipeline)} /></span>
         <Link href="/intel/health" className="ml-auto text-xs text-primary hover:underline">System health →</Link>
       </section>

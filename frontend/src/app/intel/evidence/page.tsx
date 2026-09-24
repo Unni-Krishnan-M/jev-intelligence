@@ -8,10 +8,10 @@
  */
 
 import { ArrowUpRight, Search } from "lucide-react";
-import Link from "next/link";
 import { useEffect, useState } from "react";
 import useSWR from "swr";
 
+import Link, { useIntelDomain } from "@/components/jev/intel/domain-context";
 import { PageHeader } from "@/components/jev/intel/page-header";
 import { FilterRow, IntelError, Pagination, RowsSkeleton } from "@/components/jev/intel/states";
 import { EmptyState } from "@/components/jev/states";
@@ -80,7 +80,8 @@ export default function EvidencePage() {
     return () => clearTimeout(t);
   }, [text]);
 
-  const key = `/intel/evidence${qs({ owner_type: ownerType === "all" ? null : ownerType, kind: kind === "all" ? null : kind, q, limit: LIMIT, offset })}`;
+  const { q: dq } = useIntelDomain();
+  const key = dq(`/intel/evidence${qs({ owner_type: ownerType === "all" ? null : ownerType, kind: kind === "all" ? null : kind, q, limit: LIMIT, offset })}`);
   const { data, error, mutate, isValidating } = useSWR<Page<EvidenceRow>>(key, { keepPreviousData: true });
   const filtered = ownerType !== "all" || kind !== "all" || Boolean(q);
 

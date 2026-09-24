@@ -20,6 +20,7 @@ BATCH_KEYS = {
     "model_governance": ["retrain_model", "serving_model"],
     "genre_programming": ["genre_programming", "editorial_slot_share"],
     "audience": ["rater_action", "reengagement_campaign"],
+    "early_warning": ["early_warning_level"],  # platform core (docs/platform.md section 4)
 }
 
 

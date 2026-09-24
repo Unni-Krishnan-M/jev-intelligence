@@ -3,6 +3,8 @@
 import useSWR from "swr";
 
 import { fmtDate, Panel, SpecRows, Status } from "@/components/jev/admin/ui";
+import { ModelHealth } from "@/components/jev/intel/badges";
+import { CapabilityNotice, useIntelDomain } from "@/components/jev/intel/domain-context";
 import { PageHeader } from "@/components/jev/intel/page-header";
 import { IntelError, RowsSkeleton } from "@/components/jev/intel/states";
 import { EmptyState } from "@/components/jev/states";
@@ -61,9 +63,11 @@ function metricGroups(m: AdminMetrics): { title: string; rows: { label: string; 
 export default function HealthPage() {
   const health = useSWR<Health>("intel:health", () => tolerant<Health>("/health"), { refreshInterval: 30000 });
   const ml = useSWR<MlHealth>("intel:health-ml", () => tolerant<MlHealth>("/health/ml"), { refreshInterval: 30000 });
-  const status = useSWR<IntelStatus>("/intel/status", { refreshInterval: 60000 });
+  const { q: dq, can } = useIntelDomain();
+  const governance = can("model_governance");
+  const status = useSWR<IntelStatus>(dq("/intel/status"), { refreshInterval: 60000 });
   const metrics = useSWR<AdminMetrics>("/admin/metrics", { refreshInterval: 30000 });
-  const runs = useSWR<RunList>("/intel/runs");
+  const runs = useSWR<RunList>(dq("/intel/runs"));
   const ih = status.data?.health;
 
   return (
@@ -91,7 +95,9 @@ export default function HealthPage() {
           )}
         </Panel>
         <Panel title="Recommendation model">
-          {ml.error ? (
+          {!governance.available ? (
+            <CapabilityNotice cap="model_governance" />
+          ) : ml.error ? (
             <IntelError error={ml.error} retry={() => ml.mutate()} runBacked={false} />
           ) : !ml.data ? (
             <Skeleton className="h-28 w-full" />
@@ -118,7 +124,7 @@ export default function HealthPage() {
               rows={[
                 { label: "Database", value: <Status ok={ih.database === "ok"} label={ih.database} /> },
                 { label: "Cache", value: <Status ok={ih.cache === "ok"} label={ih.cache} /> },
-                { label: "Model", value: <Status ok={ih.model === "ok"} label={ih.model} /> },
+                { label: "Model", value: <ModelHealth value={ih.model} /> },
                 { label: "Pipeline", value: <Status ok={ih.pipeline === "ok"} label={humanize(ih.pipeline)} /> },
               ]}
             />

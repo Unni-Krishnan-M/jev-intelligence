@@ -161,6 +161,7 @@ class Recommendation(Base):
     __table_args__ = (
         Index("ix_rec_user_created", "user_id", "created_at"),
         Index("ix_rec_request", "request_id"),
+        Index("ix_rec_user_decision", "user_id", "decision_id"),
         CheckConstraint(
             "confidence_kind IS NULL OR confidence_kind IN ('probability')", name="ck_rec_confidence_kind"
         ),
@@ -180,6 +181,9 @@ class Recommendation(Base):
     # calibrated P(rating >= 4) from models/<version>/calibration.json; null without a calibration
     confidence: Mapped[float | None] = mapped_column(Float)
     confidence_kind: Mapped[str | None] = mapped_column(String(16))
+    # v1.2: the recommendation_strategy decision the list was served under (docs/platform.md, section 4)
+    decision_id: Mapped[str | None] = mapped_column(String(40))
+    strategy: Mapped[str | None] = mapped_column(String(24))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     movie: Mapped[Movie] = relationship(lazy="joined")
@@ -299,7 +303,11 @@ AUDIT_ACTIONS = (
     "auth.login.success",
     "auth.login.failure",
     "auth.register",
+    "me.feedback",  # v1.2: a member's verdict on a strategy decision or recommendation
 )
+DEFAULT_DOMAIN = "movie"  # v1.2 (docs/platform.md): rows before migration 0005 belong to the movie domain
+ME_FEEDBACK_TARGETS = ("strategy", "recommendation")
+ME_FEEDBACK_VERDICTS = ("accepted", "rejected")
 FEEDBACK_VERDICTS = {
     "decision": ("correct", "incorrect"),
     "warning": ("useful", "not_useful", "false_positive"),
@@ -318,6 +326,10 @@ _VERDICT_MATCHES_TARGET = " OR ".join(
 )
 
 
+def _domain_column() -> Mapped[str]:
+    return mapped_column(String(64), default=DEFAULT_DOMAIN, server_default=DEFAULT_DOMAIN, nullable=False)
+
+
 class IntelRun(Base):
     """One pipeline run: parameters, status, timings, versions, summary and the full result JSON."""
 
@@ -327,10 +339,12 @@ class IntelRun(Base):
         CheckConstraint(_in('"trigger"', INTEL_RUN_TRIGGERS), name="ck_intel_run_trigger"),
         CheckConstraint(_in("status", INTEL_RUN_STATUSES), name="ck_intel_run_status"),
         Index("ix_intel_runs_status_started", "status", "started_at"),
+        Index("ix_intel_runs_domain_started", "domain", "status", "started_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     run_id: Mapped[str] = mapped_column(String(36), unique=True, nullable=False)
+    domain: Mapped[str] = _domain_column()
     trigger: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(16), default="running", nullable=False)
     requested_as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -350,7 +364,8 @@ class IntelRun(Base):
 
 
 class IntelWarning(TimestampMixin, Base):
-    """An early warning with a lifecycle. At most one open warning per key (partial unique index)."""
+    """An early warning with a lifecycle. At most one open warning per (domain, key) (partial unique
+    index; v1.2 made it per domain)."""
 
     __tablename__ = "intel_warnings"
     __table_args__ = (
@@ -363,6 +378,7 @@ class IntelWarning(TimestampMixin, Base):
         CheckConstraint("occurrences >= 1", name="ck_intel_warning_occurrences"),
         Index(
             "uq_intel_warnings_open_key",
+            "domain",
             "key",
             unique=True,
             sqlite_where=text(_OPEN_WARNING),
@@ -371,10 +387,12 @@ class IntelWarning(TimestampMixin, Base):
         Index("ix_intel_warnings_key", "key"),
         Index("ix_intel_warnings_status_severity", "status", "severity"),
         Index("ix_intel_warnings_last_seen", "last_seen_at"),
+        Index("ix_intel_warnings_domain_status", "domain", "status", "severity"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     key: Mapped[str] = mapped_column(String(200), nullable=False)
+    domain: Mapped[str] = _domain_column()
     title: Mapped[str] = mapped_column(String(300), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     severity: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -399,6 +417,9 @@ class IntelWarning(TimestampMixin, Base):
     dismissed_severity: Mapped[str | None] = mapped_column(String(16))
     suppressed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # v1.2: the early_warning_level decision the warning is downstream of, and its answer
+    decision_id: Mapped[str | None] = mapped_column(String(40))
+    early_warning_level: Mapped[str | None] = mapped_column(String(16))
 
     events: Mapped[list[IntelWarningEvent]] = relationship(
         back_populates="warning", cascade="all, delete-orphan", order_by="IntelWarningEvent.id"
@@ -443,11 +464,13 @@ class IntelDecision(Base):
         Index("ix_intel_decisions_decision_id", "decision_id"),
         Index("ix_intel_decisions_key_created", "key", "created_at"),
         Index("ix_intel_decisions_batch", "batch_id"),
+        Index("ix_intel_decisions_domain_key", "domain", "key", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     run_id: Mapped[str] = mapped_column(ForeignKey("intel_runs.run_id", ondelete="CASCADE"), nullable=False)
     decision_id: Mapped[str] = mapped_column(String(40), nullable=False)  # contract id "dec-..."
+    domain: Mapped[str] = _domain_column()
     key: Mapped[str] = mapped_column(String(64), nullable=False)
     spec_id: Mapped[str] = mapped_column(String(64), nullable=False)
     policy_version: Mapped[str] = mapped_column(String(40), nullable=False)
@@ -478,9 +501,11 @@ class IntelScenario(Base):
     """A saved what-if analysis (input spec + output)."""
 
     __tablename__ = "intel_scenarios"
+    __table_args__ = (Index("ix_intel_scenarios_domain", "domain", "created_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
+    domain: Mapped[str] = _domain_column()
     series_id: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
     as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     input: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
@@ -500,9 +525,11 @@ class IntelFeedback(Base):
         CheckConstraint(_VERDICT_MATCHES_TARGET, name="ck_intel_feedback_verdict"),
         Index("ix_intel_feedback_target", "target_type", "target_id"),
         Index("ix_intel_feedback_created", "created_at"),
+        Index("ix_intel_feedback_domain", "domain", "target_type"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    domain: Mapped[str] = _domain_column()
     target_type: Mapped[str] = mapped_column(String(16), nullable=False)
     target_id: Mapped[str] = mapped_column(String(64), nullable=False)
     verdict: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -732,3 +759,29 @@ class IntelEvaluationRun(Base):
     report_sha1: Mapped[str] = mapped_column(String(40), nullable=False)  # re-synced when the file changes
     report: Mapped[dict[str, Any]] = mapped_column(JSON, deferred=True, nullable=False)
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class UserIntelFeedback(TimestampMixin, Base):
+    """A member's verdict (accepted | rejected) on their recommendation-strategy decision or on a
+    recommendation (POST /me/intelligence/feedback). One row per member per target: a repeat is a
+    no-op and a new verdict replaces the old one. Kept apart from recommendation_feedback: it judges
+    the decision layer, and must not silently exclude movies or move the taste profile."""
+
+    __tablename__ = "user_intel_feedback"
+    __table_args__ = (
+        UniqueConstraint("user_id", "target_type", "target_id", name="uq_user_intel_feedback_target"),
+        CheckConstraint(_in("target_type", ME_FEEDBACK_TARGETS), name="ck_user_intel_feedback_target"),
+        CheckConstraint(_in("verdict", ME_FEEDBACK_VERDICTS), name="ck_user_intel_feedback_verdict"),
+        Index("ix_user_intel_feedback_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    target_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    verdict: Mapped[str] = mapped_column(String(16), nullable=False)
+    note: Mapped[str | None] = mapped_column(String(1000))
+    # the strategy decision the target belongs to (the decision itself, or the one a recommendation was
+    # served under), and the movie of a recommendation target
+    decision_id: Mapped[str | None] = mapped_column(String(40))
+    movie_id: Mapped[int | None] = mapped_column(ForeignKey("movies.id", ondelete="CASCADE"))

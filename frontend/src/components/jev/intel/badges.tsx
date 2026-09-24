@@ -14,12 +14,14 @@ import {
   Eye,
   Info,
   Minus,
+  MinusCircle,
   OctagonAlert,
   Package,
   Search,
   TriangleAlert,
 } from "lucide-react";
 
+import { Status } from "@/components/jev/admin/ui";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { fmtConfidence, fmtDays } from "@/lib/intel";
 import type { ConfidenceKind, Direction, Severity, SystemStatus, WarningStatus } from "@/lib/intel-types";
@@ -89,6 +91,7 @@ export const CONFIDENCE_EXPLAIN: Record<ConfidenceKind, string> = {
   margin: "Margin: the normalised evidence gap between the best and second-best option. It is not a probability.",
   rule: "Rule: a deterministic threshold rule. 1 means the rule fired; it says nothing about how likely the answer is to be right.",
   interval: "Interval: the nominal coverage of the range around a numeric answer. It is not a probability that the answer is right.",
+  evidence: "Evidence: 1 − the smallest adjusted p-value of the tests behind it. It measures how strongly the data contradicts “no change”; it is not a probability.",
 };
 
 const SCORE_EXPLAIN = "A 0–1 confidence score from the evidence behind it. It is not a probability.";
@@ -220,4 +223,17 @@ export function EffortBadge({ effort }: { effort: "low" | "medium" | "high" }) {
       {effort} effort
     </span>
   );
+}
+
+/** Model health: "not applicable" (a domain without a recommender) is neutral, never a failure. */
+export function ModelHealth({ value }: { value: string }) {
+  if (value === "not_applicable") {
+    return (
+      <span className="inline-flex items-center gap-1.5 font-sans">
+        <MinusCircle className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+        <span className="text-foreground">not applicable</span>
+      </span>
+    );
+  }
+  return <Status ok={value === "ok"} label={value} />;
 }

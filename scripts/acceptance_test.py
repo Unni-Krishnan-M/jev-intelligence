@@ -13,6 +13,11 @@ decision and a warning (and the summary counts), evaluation, recommender monitor
 and /admin/metrics, plus the 401/403 access rules. It can be re-run against the same database: the
 acknowledged warning is resolved at the end, so the next run reopens it.
 
+Part 3 (skip with --skip-platform) covers the v1.2 platform (docs/platform.md): GET /intel/domains, a
+generic-domain run and replay when its data is present (us-unemployment: scripts/download_domain_data.py),
+domain isolation of warnings, unknown-domain errors, and the member's /me/intelligence, preference
+scenarios, feedback and the `intelligence` block of GET /recommendations.
+
 Exit code 0 only if every check passes.
 """
 
@@ -421,6 +426,108 @@ def intelligence(args: argparse.Namespace, member: Api, adm: Api, login_rid: str
             check("resolve the acknowledged warning (terminal)", r.ok and r.json()["status"] == "resolved")
 
 
+def platform(args: argparse.Namespace, member: Api, adm: Api) -> None:
+    """Part 3: domains and per-member intelligence (see the module docstring)."""
+    print("\n-- platform (v1.2) --")
+    anon = Api(args.base)
+    code = anon.call("GET", "/me/intelligence").status_code
+    check("anonymous gets 401 on /me/intelligence", code == 401, str(code))
+    with step("me/intelligence"):
+        r = member.call("GET", "/me/intelligence")
+        me = r.json()
+        strat = me["strategy"]
+        check(
+            "/me/intelligence: preference history, drift, strategy decision, signals, recommendations",
+            r.ok
+            and {"profile", "preference_history", "drift", "strategy", "signals", "recommendations"}
+            <= set(me)
+            and strat["spec_id"] == "recommendation_strategy"
+            and all(x["decision_id"] == strat["id"] for x in me["recommendations"]),
+            f"drift {me['drift']['status']}, strategy {strat['answer']} "
+            f"(served {strat['state'].get('served_strategy')}), {len(me['recommendations'])} recommendations",
+        )
+        recs = member.call("GET", "/recommendations?limit=10").json()
+        block = recs.get("intelligence") or {}
+        check(
+            "GET /recommendations carries the strategy decision it was served under",
+            block.get("decision_id") == strat["id"]
+            and all(i.get("decision_id") == block["decision_id"] for i in recs["items"]),
+            f"{block.get('decision_id')} served {block.get('served_strategy')}, "
+            f"confidence {block.get('confidence')} ({block.get('confidence_kind')})",
+        )
+    with step("me/intelligence/scenarios"):
+        r = member.call("POST", "/me/intelligence/scenarios", json={"k": 5})
+        sc = r.json()
+        check(
+            "preference scenarios: continue / accelerate / reverse with 80% bands",
+            r.ok and [x["kind"] for x in sc["scenarios"]] == ["continue", "accelerate", "reverse"],
+            sc.get("uncertainty_note", "")[:80] if r.ok else r.text[:200],
+        )
+        code = member.call("POST", "/me/intelligence/scenarios", json={"k": 0}).status_code
+        check("invalid scenario request rejected with 422", code == 422, str(code))
+    with step("me/intelligence/feedback"):
+        body = {"target_type": "strategy", "target_id": strat["id"], "verdict": "accepted", "note": None}
+        a = member.call("POST", "/me/intelligence/feedback", json=body)
+        b = member.call("POST", "/me/intelligence/feedback", json=body)
+        check(
+            "member feedback on the strategy decision (201, deduplicated)",
+            a.status_code == b.status_code == 201 and a.json()["id"] == b.json()["id"],
+            str(a.status_code),
+        )
+    if adm.token is None:
+        check("platform checks need an admin session", False, "admin login failed")
+        return
+
+    def get(path: str, **kw: Any) -> Any:
+        r = adm.call("GET", path, **kw)
+        r.raise_for_status()
+        return r.json()
+
+    domains: dict[str, Any] = {}
+    with step("domains"):
+        domains = {d["key"]: d for d in get("/intel/domains")["items"]}
+        movie = domains.get("movie", {})
+        check(
+            "GET /intel/domains lists the movie domain with its capabilities",
+            movie.get("available") is True
+            and all(
+                movie.get("capabilities", {}).get(c)
+                for c in ("recommendation", "user_intelligence", "lapse", "raters", "model_governance")
+            ),
+            ", ".join(
+                f"{k} ({'available' if d['available'] else 'unavailable'})" for k, d in domains.items()
+            ),
+        )
+        code = adm.call("GET", "/intel/signals?domain=generic:no-such-domain").status_code
+        check("unknown domain rejected with 404", code == 404, str(code))
+    generic = args.generic_domain
+    info = domains.get(generic)
+    if not info or not info.get("available"):
+        print(f"[SKIP] {generic} run: {info.get('reason') if info else 'not registered'}")
+        return
+    with step("generic run"):
+        r = adm.call("POST", "/intel/runs", json={"domain": generic, "as_of": args.generic_as_of})
+        run = r.json()
+        check(
+            f"{generic} replay as of {args.generic_as_of}",
+            r.ok and run["status"] == "succeeded" and run["domain"] == generic,
+            f"{run.get('duration_ms')} ms, {run.get('summary', {}).get('headline')}",
+        )
+        ws = get(f"/intel/warnings?domain={generic}&status=new&limit=200")["items"]
+        movie_keys = {w["key"] for w in get("/intel/warnings?limit=200")["items"]}
+        check(
+            f"{generic} warnings are downstream of early-warning decisions and isolated from movie",
+            all(w["domain"] == generic and w.get("decision_id") for w in ws)
+            and not {w["key"] for w in ws} & movie_keys,
+            f"{len(ws)} open: " + ", ".join(f"{w['entity']} {w['severity']}" for w in ws[:6]),
+        )
+        st = get(f"/intel/status?domain={generic}")
+        check(
+            f"{generic} status reads its own latest run",
+            st["latest_run"]["run_id"] == run["run_id"] and st["health"]["model"] == "not_applicable",
+        )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://localhost:3000/api")
@@ -428,6 +535,11 @@ def main() -> int:
     ap.add_argument("--admin-password", default="admin-pass-123")
     ap.add_argument("--as-of", default="2017-07-01", help="replay date for the intelligence run")
     ap.add_argument("--skip-intel", action="store_true", help="only the recommender checks")
+    ap.add_argument(
+        "--skip-platform", action="store_true", help="no v1.2 domain / member-intelligence checks"
+    )
+    ap.add_argument("--generic-domain", default="generic:us-unemployment")
+    ap.add_argument("--generic-as-of", default="2008-06-01")
     args = ap.parse_args()
 
     api = Api(args.base)
@@ -576,6 +688,8 @@ def main() -> int:
 
     if not args.skip_intel:
         intelligence(args, api, adm, login_rid=lr.headers.get("x-request-id") if lr.ok else None)
+    if not args.skip_platform:
+        platform(args, api, adm)
 
     failed = [n for n, ok, _ in RESULTS if not ok]
     print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

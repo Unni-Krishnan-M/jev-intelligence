@@ -12,9 +12,9 @@ const sans = IBM_Plex_Sans({ variable: "--font-plex-sans", subsets: ["latin"], w
 const mono = IBM_Plex_Mono({ variable: "--font-plex-mono", subsets: ["latin"], weight: ["400", "500"] });
 
 export const metadata: Metadata = {
-  title: { default: "JEV — a film programme that learns you", template: "%s · JEV" },
+  title: { default: "JEV — Intelligent Decision & Early-Warning Engine", template: "%s · JEV" },
   description:
-    "JEV is a hybrid movie recommender: content, collaborative filtering, matrix factorization and popularity, blended and explained.",
+    "JEV turns changing data into signals, trends, anomalies, forecasts and risk, then into typed, explained decisions, early warnings, recommendations and actions. Movies is its first domain.",
 };
 
 export const viewport: Viewport = {
@@ -38,9 +38,9 @@ export default async function RootLayout({ children }: LayoutProps<"/">) {
           <main id="main" className="flex-1">{children}</main>
           <footer className="border-t hairline mt-24">
             <div className="mx-auto flex max-w-[1320px] flex-wrap items-center justify-between gap-3 px-5 py-6 sm:px-8">
-              <p className="eyebrow">JEV · hybrid recommendation engine · {shortVersion()}</p>
+              <p className="eyebrow">JEV · decision &amp; early-warning engine · {shortVersion()}</p>
               <p className="text-xs text-muted-foreground">
-                Ratings: MovieLens (GroupLens, research use). Metadata: Wikidata (CC0). No posters are used; every cover is typeset.
+                Movies: MovieLens (GroupLens, research use) and Wikidata (CC0); every cover is typeset. US unemployment: BLS via FRED (public domain).
               </p>
             </div>
           </footer>

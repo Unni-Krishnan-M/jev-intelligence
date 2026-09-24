@@ -1,11 +1,11 @@
 "use client";
 
-import Link from "next/link";
 import { useState } from "react";
 import useSWR from "swr";
 
 import { DirectionIcon } from "@/components/jev/intel/badges";
 import { Sparkline } from "@/components/jev/intel/charts";
+import Link, { useIntelDomain } from "@/components/jev/intel/domain-context";
 import { PageHeader } from "@/components/jev/intel/page-header";
 import { FilterRow, IntelError, Pagination, RowsSkeleton } from "@/components/jev/intel/states";
 import { EmptyState } from "@/components/jev/states";
@@ -18,7 +18,8 @@ const LIMIT = 25;
 
 /** Sparkline for one row, read from the series endpoint (shared SWR key with the detail page). */
 function RowSpark({ seriesId }: { seriesId: string }) {
-  const { data, error } = useSWR<SeriesDetail>(`/intel/series/${encodeURIComponent(seriesId)}`);
+  const { q: dq } = useIntelDomain();
+  const { data, error } = useSWR<SeriesDetail>(dq(`/intel/series/${encodeURIComponent(seriesId)}`));
   if (error) return <span className="text-xs text-muted-foreground">—</span>;
   if (!data) return <Skeleton className="h-6 w-full" />;
   return <Sparkline values={data.series.points.slice(-36).map((p) => p.v)} />;
@@ -27,7 +28,8 @@ function RowSpark({ seriesId }: { seriesId: string }) {
 export default function TrendsPage() {
   const [direction, setDirection] = useState("all");
   const [offset, setOffset] = useState(0);
-  const { data, error, mutate } = useSWR<Page<Trend>>(`/intel/trends${qs({ direction: direction === "all" ? null : direction, limit: LIMIT, offset })}`);
+  const { q: dq } = useIntelDomain();
+  const { data, error, mutate } = useSWR<Page<Trend>>(dq(`/intel/trends${qs({ direction: direction === "all" ? null : direction, limit: LIMIT, offset })}`));
 
   return (
     <div>

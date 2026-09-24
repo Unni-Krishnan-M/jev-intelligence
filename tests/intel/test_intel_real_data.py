@@ -37,7 +37,7 @@ def test_real_pipeline_runs_fast_and_is_plausible(real_inputs):
     assert d["predictions"]["lapse"]["status"] == "ok"
     assert d["predictions"]["lapse"]["metrics"]["auc"] > d["predictions"]["lapse"]["metrics"]["baseline_auc"]
     batches = {b["name"]: b for b in d["decision_batches"]}
-    assert set(batches) == {"model_governance", "genre_programming", "audience"}
+    assert set(batches) == {"model_governance", "genre_programming", "audience", "early_warning"}
     assert all(b["status"] == "ok" for b in batches.values())
     assert all(x["batch_id"] in {b["id"] for b in batches.values()} for x in d["decisions"])
     slots = [x for x in d["decisions"] if x["key"] == "editorial_slot_share"]

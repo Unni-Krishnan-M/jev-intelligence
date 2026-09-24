@@ -1,47 +1,79 @@
-# JEV — Intelligent Hybrid Recommendation Engine
+# JEV — Intelligent Decision & Early-Warning Engine
 
-**Version 1.1.0** · [Demo walkthrough](docs/demo.md) · [Changelog](CHANGELOG.md) · [Status report](docs/progress.md)
+**Version 1.2.0** · [Platform design](docs/platform.md) · [Demo walkthrough](docs/demo.md) · [Changelog](CHANGELOG.md) · [Status report](docs/progress.md)
 
-*A film programme that learns you.* JEV is a personalised movie recommender. It blends **content-based**,
-**collaborative filtering**, **matrix factorization**, **popularity** and **behavioural** signals into one ranked list,
-explains every pick from the model's actual evidence, and measures itself on a held-out test set.
+JEV is a reusable intelligence engine. It turns changing data into **signals, trends, anomalies, forecasts, risk
+assessments, structured decisions, explanations, recommendations and actions**. Every output carries its evidence and
+an honestly labelled confidence, and every stage is evaluated offline on real data.
 
-On top of the recommender sits an **intelligence and early-warning layer** for the people who run the platform. It
-turns the changing rating stream, live app activity and the recommender's own evaluation into signals, trends,
-anomalies, forecasts, risk scores, typed decisions, early warnings and an action plan. Every output carries its
-evidence and an honest confidence, and the layer evaluates itself offline. See
-[Intelligence & early warnings](#intelligence--early-warnings).
+Domain knowledge lives in **domain adapters**. Two ship today:
+- **Movies**, the first adapter and the reference implementation. It is a full hybrid recommender (popularity,
+  TF-IDF content, item-kNN, implicit ALS, adaptive hybrid with MMR diversity) on MovieLens. JEV watches its audience,
+  catalogue and model, detects each member's preference drift, and decides *how* recommendations should be produced
+  before producing them.
+- **Generic structured dataset**, any time-stamped CSV plus a YAML config. The demo uses monthly US and state
+  unemployment rates (BLS via FRED, public domain). The same engine raises early warnings of rising unemployment
+  when you replay it as of 2008 or 2020.
 
-![Home](docs/screenshots/04-home.png)
+![Situation report](docs/screenshots/14-intel-overview.png)
 
-**See it in five minutes:** [docs/demo.md](docs/demo.md) is a step-by-step walkthrough (commands, URLs, what to click,
-the real numbers you will see), with a 5-minute script.
+**See it in five minutes:** [docs/demo.md](docs/demo.md). Run locally with `npm run dev`.
 
 ## Problem statement
-Single-strategy recommenders fail in predictable ways. Popularity is not personal. Collaborative filtering fails for
-new users and new films. Content similarity keeps suggesting the same director. Latent factors are accurate but opaque.
-JEV combines them in a ranking pipeline whose weights adapt to how much it knows about each user. It is diversified,
-explainable and evaluated under one reproducible protocol.
+Organisations sit on streams of changing data but act on them late. Dashboards show numbers without saying what is
+changing, how surely, what is likely next, how much it matters, or what to do. Single models ("a recommender", "a
+forecaster") answer one narrow question and hide their uncertainty. JEV chains the whole path from observation to
+action:
+
+- it detects what is changing, and whether it is unusual;
+- it predicts where each series is heading, with calibrated uncertainty;
+- it scores the risk;
+- it makes **bounded, typed decisions** from that evidence, including whether a situation deserves an early warning;
+- it turns those decisions into warnings, recommendations and actions;
+- it learns from operator feedback.
+
+The architecture does not depend on the domain, so the same engine serves a film platform and a labour-market
+dataset.
 
 ## At a glance
 | | |
 |---|---|
-| Dataset | MovieLens `ml-latest-small` (9,742 films, 100,836 ratings, 610 users) + Wikidata metadata (directors, cast, themes) |
-| Models | Popularity · TF-IDF content · Item-kNN CF · Implicit ALS · **Hybrid** (6 signals, adaptive weights, MMR diversity) |
-| Best result (test, 592 users) | **Hybrid NDCG@10 0.1214**, Recall@10 0.0990, HitRate@10 0.517: +21% NDCG over the best single model |
-| Stack | FastAPI · SQLAlchemy + Alembic · PostgreSQL · Redis · Next.js 16 + TypeScript · Tailwind v4 · shadcn/ui · Recharts · Docker Compose |
-| Laptop footprint | CPU only, no GPU or torch. Tuned training about 4.5 min, `--quick` training < 1 min, model load 0.1 s, about 25 ms per recommendation request |
+| Engine | Domain-independent core (`ml/jev_ml/core`): series · signals · trends and change points · anomalies · forecasts · risk · JEV decisions · early warnings · actions · scenarios · drift · evaluation |
+| Domains | **Movies**: MovieLens 100,836 ratings, 9,742 films, plus Wikidata; hybrid recommender. **Generic**: any CSV + YAML; demo is monthly unemployment rates for the US (from 1948) and 12 states (from 1976), plus 4 census-region means |
+| Decisions | Typed (`boolean` / `choice` / `score`), versioned policies, confidence labelled `probability`, `margin`, `interval`, `evidence` or `rule`, and explicit abstention |
+| Recommender (test, 592 users) | Hybrid NDCG@10 **0.1214**: +21 % over the best single model |
+| Stack | FastAPI · SQLAlchemy + Alembic · PostgreSQL · Redis · Next.js 16 + TypeScript · Tailwind v4 · Recharts · Docker Compose |
+| Laptop footprint | CPU only. Movie intelligence run ≈ 1 s, unemployment run ≈ 0.2 s, ≈ 25 ms per recommendation request |
 
 ## System architecture
 ```
-Next.js (dark/paper UI) ──/api/*──► FastAPI ──► RecommendationEngine (loads models/<version>)
-                                       │  └──► PostgreSQL (users, ratings, recs, feedback, registry mirror)
-                                       └────► Redis (rec cache, rate limits)
-offline: download → validate → clean → features → split → tune → evaluate → train → register → report
+                 ┌──────────────────────── JEV core (ml/jev_ml/core) ──────────────────────┐
+ data source ──► │ validate → series → signals → trends / change points → anomalies        │
+ (adapter)       │ → forecasts → risk → JEV decisions → early warnings → actions            │
+                 │ → evidence & explanations · scenarios · drift · feedback · evaluation    │
+                 └──────────▲───────────────────────────────────────────▲───────────────────┘
+                            │ observations + series specs                │ domain extras (hooks)
+        ┌───────────────────┴──────────────┐           ┌─────────────────┴──────────────────────────┐
+        │ domains/generic: any CSV + YAML   │           │ domains/movie: MovieLens + app DB,         │
+        │ (US unemployment demo)            │           │ hybrid recommender, raters, lapse, model   │
+        └───────────────────────────────────┘           │ governance, preference drift, strategy     │
+                                                        └────────────────────────────────────────────┘
+Next.js console + member app ──/api/*──► FastAPI (/intel/*, /me/intelligence, /recommendations, …)
+                                            ├──► PostgreSQL (runs, warnings, decisions, evidence, audit, …)
+                                            └──► Redis (cache, rate limits)
 ```
-Details: [ARCHITECTURE.md](ARCHITECTURE.md).
+Details: [ARCHITECTURE.md](ARCHITECTURE.md) · [docs/platform.md](docs/platform.md).
 
-## Recommendation algorithms
+## Domains
+| Domain | Data | What JEV produces |
+|---|---|---|
+| **Movies** (`movie`) | MovieLens ratings, app ratings/feedback, the served-recommendation log, model registry | genre and platform trends; spikes; suspicious raters; audience lapse forecasts; model governance; per-member preference drift → recommendation strategy → recommendations |
+| **Generic** (`generic:<name>`) | any long CSV (time, entity, value, optional groups) + `configs/domains/<name>.yaml` | per-entity trends, change points, anomalies, forecasts, adverse-direction risk, early-warning decisions and warnings |
+
+Adding a domain means writing a YAML file for a generic dataset, or implementing the `DomainAdapter` protocol for
+anything richer ([platform.md §3](docs/platform.md#3-domain-adapter-protocol-jev_mlcoreadapterpy)).
+
+## Movies domain: hybrid recommender
 1. **Popularity**: log like-counts, time-decayed trending, and a Bayesian-average rating.
 2. **Content-based**: separate TF-IDF per field (genres, directors, cast, keywords, tags, title, description, decade),
    field-weighted and cosine-scored, with a signed user taste vector.
@@ -76,7 +108,7 @@ uv run python scripts/train_models.py --quick   # no tuning
 uv run python scripts/generate_recommendations.py --rate 79132=5 109487=5 --genres Sci-Fi
 ```
 
-## Evaluation
+## Movies domain: recommender evaluation
 Per-user temporal split (70/10/20), relevance = held-out rating ≥ 4, full-catalogue ranking with consumed items
 excluded, the same protocol for every model. Numbers from run `jev-hybrid-v1-20260923T095709Z`:
 
@@ -92,10 +124,9 @@ excluded, the same protocol for every model. Numbers from run `jev-hybrid-v1-202
 On the cold-start protocol (3 interactions) popularity still leads (NDCG@10 0.046 vs hybrid 0.035). See
 [docs/evaluation.md](docs/evaluation.md) for the full tables, plots and discussion.
 
-## Intelligence & early warnings
-**Problem.** A recommender that only ranks films cannot tell its operators that part of the audience is about to
-stop rating, that a genre's demand has shifted, that someone is bulk-rating to push a film, or that the model has
-gone stale. The intelligence layer watches the data and the model and reports those things *before* they matter.
+## The intelligence pipeline
+The same stages run for every domain. Movie-only stages (raters, lapse, model governance, preference drift) plug
+in through the adapter's hooks.
 
 ```
 INGEST → VALIDATE → UNDERSTAND → DETECT → PREDICT → ASSESS → DECIDE → ACT/EXPLAIN → FEEDBACK
@@ -126,9 +157,14 @@ sources  quality    monthly     trends,   forecasts, risk    typed      warnings
   - a confidence labelled `probability` (paired bootstrap or calibrated model), `margin` (not a probability) or
     `rule`;
   - an explicit abstention when the data is insufficient.
-- **Early warnings:**
-  - Warnings are raised from risks and anomalies, and each shows its trigger condition (observed vs threshold),
-    evidence and recommended action.
+- **Early-warning decision.** For every situation (a series or an entity with evidence), JEV answers
+  `early_warning_level`: `NO_ACTION | MONITOR | WARNING | URGENT_ACTION`.
+  - It is scored from the situation's structured evidence: signal strength, trend direction and q-value, anomaly
+    score, forecast direction against the domain's adverse direction, and risk.
+  - The policy is monotone and versioned, with a margin confidence.
+- **Early warnings are downstream of that decision.**
+  - A warning is raised only at `WARNING` or `URGENT_ACTION`, and it links its `decision_id`.
+  - Each warning shows its trigger condition (observed vs threshold), evidence and recommended action.
   - They are deduplicated by key. Their lifecycle runs `new → acknowledged → investigating → resolved | dismissed`,
     with an audit trail.
   - A dismissal suppresses the warning unless its severity escalates; a resolved warning that fires again reopens.
@@ -147,6 +183,28 @@ sources  quality    monthly     trends,   forecasts, risk    typed      warnings
 | Shilling detection | synthetic, labelled attack profiles injected into real data | AUC 0.95 random · 0.99 average · 0.92 bandwagon | deviation rule F1 0 |
 | Series anomalies | 756 spikes/drops injected into real series | 50 % detected overall (73–76 % at ≥ 5σ); 2 % false-alarm rate | — |
 | Change points | synthetic AR(1) matched to real volume | 32.5 % detected; 7 % false alarms (nominal 1 %) | — |
+
+**Preference drift and recommendation strategy (movies).**
+- For each member, JEV compares the historical and recent windows on six aspects: genre mix, rating level, activity
+  rate, film age, content similarity and acceptance. Permutation tests work on whole active days, with Holm
+  correction.
+- JEV then decides the `recommendation_strategy` (`standard | adapt_to_recent | explore`), and `/recommendations`
+  serves under that decision. Each list carries the decision id and its evidence.
+- A per-member what-if ranks the real model's recommendations under projected preferences (continue, accelerate,
+  reverse), with 80 % bands from resampling.
+
+**Platform evaluation** (`scripts/evaluate_domains.py`, run `platform-eval-20260924T051637Z`, 6-period horizon;
+`scripts/evaluate_drift.py`, run `drift-eval-20260924T045528Z`):
+
+| Measure | Movies | US unemployment |
+|---|---|---|
+| Forecast median MAE / RMSE | 47.8 / 59.1 ratings | 0.145 / 0.177 points |
+| Forecast MASE vs naive | 0.93 vs 1.15 (better on 21/21) | 1.52 vs 1.41 (no better than naive) |
+| 80 % interval coverage | 0.95 | 0.61 |
+| Warning precision / false-positive rate (monthly leak-free replays) | lapse 18/18, but the base rate is 1.0, so uninformative | 0.36 / 0.39 at base rate 0.30; recall 0.52 |
+| Early-warning decision flip rate between monthly replays | 0.23 (0.026 across the WARNING line) | 0.13 (2006–10) · 0.22 (2019–21) |
+| Drift detector, labelled splices of real histories (20 events) | precision 0.92 · recall 0.29 · false-positive rate 0.026 on preference aspects | — |
+| Drift adaptation effect (NDCG@10, models refitted without test data) | +0.006 [+0.001, +0.013] on only 7 drifting users; nothing measurable on larger groups, so the policy keeps `standard` | — |
 
 A full run over the real data takes about 1 s on a laptop CPU (0.85 s pipeline + persistence). Design, contract and method notes:
 [docs/intelligence.md](docs/intelligence.md).

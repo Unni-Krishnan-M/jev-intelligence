@@ -5,6 +5,11 @@ successful run, or `?run_id=`. DB-backed resources (runs, warnings, decisions, f
 come from the intel_* tables. v1.1 (section 9.3): evidence and history read the normalised tables,
 recommendation monitoring reads recommendations + recommendation_feedback, evaluation runs are
 synced from experiments/intel-eval-*.
+
+v1.2 (docs/platform.md, section 8): every endpoint takes `?domain=` (default "movie"; POST /intel/runs
+also reads it from the body). An unknown key is a 404; a registered domain that cannot load on this
+machine is a 409 with its reason (reads of a domain that already has stored runs keep working).
+Objects addressed by id (runs, warnings, decisions) must belong to the requested domain, else 404.
 """
 
 from __future__ import annotations
@@ -14,12 +19,13 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, HTTPException, Path, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
 from sqlalchemy import case, func, or_, select, text
 from sqlalchemy.orm import Session, selectinload
 
 from jev_api.deps import DB, MAX_OFFSET, AdminUser, IdPath, parse_db_id
 from jev_api.models import (
+    DEFAULT_DOMAIN,
     FEEDBACK_VERDICTS,
     IntelAnomalyRow,
     IntelDecision,
@@ -61,10 +67,13 @@ from jev_api.schemas import (
 from jev_api.services import audit
 from jev_api.services.feedback import feedback_counts, latest_feedback
 from jev_api.services.intel import (
+    DOMAIN_PATTERN,
+    DomainUnavailableError,
     IntelBusyError,
     IntelInputError,
     IntelService,
     InvalidTransitionError,
+    UnknownDomainError,
     decision_out,
     iso,
     parse_as_of,
@@ -89,21 +98,61 @@ def _service(request: Request) -> IntelService:
     return svc
 
 
-def _resolve_run(db: Session, svc: IntelService, run_id: str | None) -> IntelRun:
+DomainQuery = Query(
+    DEFAULT_DOMAIN,
+    min_length=1,
+    max_length=64,
+    pattern=DOMAIN_PATTERN,
+    description='domain adapter key: "movie" (default) or "generic:<name>" (GET /intel/domains)',
+)
+
+
+def unknown_domain(key: str) -> HTTPException:
+    return HTTPException(status.HTTP_404_NOT_FOUND, f"unknown domain {key!r}; see GET /intel/domains")
+
+
+def unavailable_domain(exc: DomainUnavailableError) -> HTTPException:
+    return HTTPException(status.HTTP_409_CONFLICT, f"domain {exc.key!r} is unavailable: {exc.reason}")
+
+
+def read_domain(request: Request, db: DB, domain: str = DomainQuery) -> str:
+    """?domain= of a read: registered (else 404) and loadable here, or with stored runs (else 409)."""
+    svc = _service(request)
+    try:
+        info = svc.domain(domain)
+    except UnknownDomainError as exc:
+        raise unknown_domain(domain) from exc
+    if not info.get("available") and not svc.has_runs(db, domain):
+        raise unavailable_domain(DomainUnavailableError(domain, info.get("reason")))
+    return domain
+
+
+Domain = Annotated[str, Depends(read_domain)]
+
+
+def _resolve_run(db: Session, svc: IntelService, run_id: str | None, domain: str) -> IntelRun:
     if run_id:
-        run = db.scalar(select(IntelRun).where(IntelRun.run_id == run_id))
+        run = db.scalar(select(IntelRun).where(IntelRun.run_id == run_id, IntelRun.domain == domain))
         if run is None or run.status != "succeeded":
             raise HTTPException(status.HTTP_404_NOT_FOUND, "intelligence run not found")
         return run
-    latest = svc.latest_run(db)
+    latest = svc.latest_run(db, domain=domain)
     if latest is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, NO_RUN)
     return latest
 
 
-def _run_and_result(db: Session, svc: IntelService, run_id: str | None) -> tuple[IntelRun, dict[str, Any]]:
-    run = _resolve_run(db, svc, run_id)
+def _run_and_result(
+    db: Session, svc: IntelService, run_id: str | None, domain: str
+) -> tuple[IntelRun, dict[str, Any]]:
+    run = _resolve_run(db, svc, run_id, domain)
     return run, svc.result_for(db, run)
+
+
+def _capability(request: Request, domain: str, capability: str, what: str) -> None:
+    caps = _service(request).domain(domain).get("capabilities") or {}
+    if not caps.get(capability):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"the {domain!r} domain has no {what}")
 
 
 def _page(
@@ -119,23 +168,72 @@ def _page(
         "offset": offset,
         "run_id": run.run_id,
         "as_of": iso(run.as_of),
+        "domain": run.domain,
     }
+
+
+# --- domains (docs/platform.md, sections 8 and 10) ----------------------------------------------------
+@router.get("/domains")
+def list_domains(_: AdminUser, db: DB, request: Request) -> dict[str, Any]:
+    """Every registered domain adapter: info, capabilities (from the adapter's DomainInfo),
+    availability on this machine (+ reason), its latest run (any status) and open-warning count."""
+    svc = _service(request)
+    open_by = svc.open_warnings_by_domain(db)
+    items = []
+    for d in svc.domains():
+        key = d["key"]
+        latest = svc.latest_run(db, status=None, domain=key)
+        if key == DEFAULT_DOMAIN:
+            d = svc.domain(key)  # live availability of the movie inputs
+        items.append(
+            {
+                "key": key,
+                "name": d.get("name"),
+                "description": d.get("description") or "",
+                "entity_types": d.get("entity_types") or [],
+                "frequency": d.get("frequency"),
+                "sources": d.get("sources") or [],
+                "capabilities": d.get("capabilities") or {},
+                "available": bool(d.get("available")),
+                "reason": None if d.get("available") else d.get("reason"),
+                "latest_run": run_out(latest) if latest else None,
+                "warnings_open": open_by.get(key, 0),
+            }
+        )
+    return {"items": items}
 
 
 # --- runs -----------------------------------------------------------------------------------------
 @router.get("/runs", response_model=IntelRunList)
-def list_runs(_: AdminUser, db: DB, limit: int = Limit, offset: int = Offset) -> dict[str, Any]:
+def list_runs(
+    _: AdminUser, db: DB, domain: Domain, limit: int = Limit, offset: int = Offset
+) -> dict[str, Any]:
     runs = db.scalars(
-        select(IntelRun).order_by(IntelRun.started_at.desc(), IntelRun.id.desc()).limit(limit).offset(offset)
+        select(IntelRun)
+        .where(IntelRun.domain == domain)
+        .order_by(IntelRun.started_at.desc(), IntelRun.id.desc())
+        .limit(limit)
+        .offset(offset)
     ).all()
-    return {"items": [run_out(r) for r in runs], "total": db.scalar(select(func.count(IntelRun.id))) or 0}
+    total = db.scalar(select(func.count(IntelRun.id)).where(IntelRun.domain == domain)) or 0
+    return {"items": [run_out(r) for r in runs], "total": total}
 
 
 @router.post("/runs", response_model=IntelRunOut)
-def trigger_run(body: RunTrigger, user: AdminUser, request: Request) -> dict[str, Any]:
-    """Runs synchronously (a few seconds) and returns the finished run; failures come back as a
-    run with status "failed" and its error text. Limited per admin (not per IP, so anonymous
-    traffic behind the same proxy cannot use up an operator's budget) on top of the one-run lock."""
+def trigger_run(
+    body: RunTrigger,
+    user: AdminUser,
+    request: Request,
+    domain: str | None = Query(None, min_length=1, max_length=64, pattern=DOMAIN_PATTERN),
+) -> dict[str, Any]:
+    """Runs one domain synchronously (about a second) and returns the finished run; failures come back
+    as a run with status "failed" and its error text. The domain comes from the body (or `?domain=`;
+    default movie); as_of is validated against that domain's data range. Limited per admin (not per
+    IP, so anonymous traffic behind the same proxy cannot use up an operator's budget) on top of the
+    one-run lock."""
+    if body.domain is not None and domain is not None and body.domain != domain:
+        raise HTTPException(422, "the body and ?domain= name different domains")
+    key = body.domain or domain or DEFAULT_DOMAIN
     window = int(time.time() // 60)
     count = request.app.state.cache.incr_window(f"rl:intel_run:{user.id}:{window}", 60)
     if count > request.app.state.settings.intel_run_rate_limit_per_minute:
@@ -145,7 +243,11 @@ def trigger_run(body: RunTrigger, user: AdminUser, request: Request) -> dict[str
             headers={"Retry-After": str(60 - int(time.time()) % 60)},
         )
     try:
-        run = _service(request).run("manual", body.as_of, user)
+        run = _service(request).run("manual", body.as_of, user, domain=key)
+    except UnknownDomainError as exc:
+        raise unknown_domain(key) from exc
+    except DomainUnavailableError as exc:
+        raise unavailable_domain(exc) from exc
     except IntelBusyError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except IntelInputError as exc:
@@ -154,12 +256,14 @@ def trigger_run(body: RunTrigger, user: AdminUser, request: Request) -> dict[str
 
 
 @router.get("/runs/{run_ref}", response_model=IntelRunOut)
-def get_run(run_ref: Annotated[str, Path(max_length=64)], _: AdminUser, db: DB) -> dict[str, Any]:
+def get_run(
+    run_ref: Annotated[str, Path(max_length=64)], _: AdminUser, db: DB, domain: Domain
+) -> dict[str, Any]:
     pk = parse_db_id(run_ref)
     run = db.scalar(
         select(IntelRun).where(IntelRun.id == pk if pk is not None else IntelRun.run_id == run_ref)
     )
-    if run is None:
+    if run is None or run.domain != domain:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "intelligence run not found")
     return run_out(run)
 
@@ -170,6 +274,7 @@ def signals(
     _: AdminUser,
     db: DB,
     request: Request,
+    domain: Domain,
     run_id: str | None = RunId,
     kind: str | None = Query(None, max_length=32),
     entity_type: str | None = Query(None, max_length=32),
@@ -177,7 +282,7 @@ def signals(
     limit: int = Limit,
     offset: int = Offset,
 ) -> dict[str, Any]:
-    run, res = _run_and_result(db, _service(request), run_id)
+    run, res = _run_and_result(db, _service(request), run_id, domain)
     filters = {"kind": kind, "entity_type": entity_type, "direction": direction}
     return _page(res.get("signals", []), limit, offset, run, filters)
 
@@ -187,6 +292,7 @@ def trends(
     _: AdminUser,
     db: DB,
     request: Request,
+    domain: Domain,
     run_id: str | None = RunId,
     direction: Literal["up", "down", "flat"] | None = None,
     metric: str | None = Query(None, max_length=32),
@@ -194,7 +300,7 @@ def trends(
     limit: int = Limit,
     offset: int = Offset,
 ) -> dict[str, Any]:
-    run, res = _run_and_result(db, _service(request), run_id)
+    run, res = _run_and_result(db, _service(request), run_id, domain)
     filters = {"direction": direction, "metric": metric, "entity": entity}
     return _page(res.get("trends", []), limit, offset, run, filters)
 
@@ -204,6 +310,7 @@ def anomalies(
     _: AdminUser,
     db: DB,
     request: Request,
+    domain: Domain,
     run_id: str | None = RunId,
     kind: str | None = Query(None, max_length=32),
     severity: Severity | None = None,
@@ -212,7 +319,7 @@ def anomalies(
     limit: int = Limit,
     offset: int = Offset,
 ) -> dict[str, Any]:
-    run, res = _run_and_result(db, _service(request), run_id)
+    run, res = _run_and_result(db, _service(request), run_id, domain)
     filters = {"kind": kind, "severity": severity, "entity_type": entity_type, "suppressed": suppressed}
     return _page(res.get("anomalies", []), limit, offset, run, filters)
 
@@ -222,13 +329,14 @@ def risks(
     _: AdminUser,
     db: DB,
     request: Request,
+    domain: Domain,
     run_id: str | None = RunId,
     kind: str | None = Query(None, max_length=40),
     level: Severity | None = None,
     limit: int = Limit,
     offset: int = Offset,
 ) -> dict[str, Any]:
-    run, res = _run_and_result(db, _service(request), run_id)
+    run, res = _run_and_result(db, _service(request), run_id, domain)
     return _page(res.get("risks", []), limit, offset, run, {"kind": kind, "level": level})
 
 
@@ -237,25 +345,37 @@ def actions(
     _: AdminUser,
     db: DB,
     request: Request,
+    domain: Domain,
     run_id: str | None = RunId,
     priority: Literal["P1", "P2", "P3"] | None = None,
     limit: int = Limit,
     offset: int = Offset,
 ) -> dict[str, Any]:
-    run, res = _run_and_result(db, _service(request), run_id)
+    run, res = _run_and_result(db, _service(request), run_id, domain)
     return _page(res.get("actions", []), limit, offset, run, {"priority": priority})
 
 
 @router.get("/predictions")
 def predictions(
-    _: AdminUser, db: DB, request: Request, run_id: str | None = RunId, series_id: str | None = SeriesId
+    _: AdminUser,
+    db: DB,
+    request: Request,
+    domain: Domain,
+    run_id: str | None = RunId,
+    series_id: str | None = SeriesId,
 ) -> dict[str, Any]:
-    run, res = _run_and_result(db, _service(request), run_id)
+    run, res = _run_and_result(db, _service(request), run_id, domain)
     pred = res.get("predictions") or {}
     forecasts = pred.get("forecasts", [])
     if series_id:
         forecasts = [f for f in forecasts if f.get("series_id") == series_id]
-    return {"run_id": run.run_id, "as_of": iso(run.as_of), "forecasts": forecasts, "lapse": pred.get("lapse")}
+    return {
+        "run_id": run.run_id,
+        "as_of": iso(run.as_of),
+        "domain": run.domain,
+        "forecasts": forecasts,
+        "lapse": pred.get("lapse"),
+    }
 
 
 @router.get("/series/{series_id:path}")
@@ -264,10 +384,11 @@ def series(
     _: AdminUser,
     db: DB,
     request: Request,
+    domain: Domain,
     run_id: str | None = RunId,
 ) -> dict[str, Any]:
     """A series with its trend, anomalies and forecast (ids contain colons: volume:genre:Drama)."""
-    run, res = _run_and_result(db, _service(request), run_id)
+    run, res = _run_and_result(db, _service(request), run_id, domain)
     s = next((x for x in res.get("series", []) if x.get("id") == series_id), None)
     if s is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "series not found")
@@ -275,6 +396,7 @@ def series(
     return {
         "run_id": run.run_id,
         "as_of": iso(run.as_of),
+        "domain": run.domain,
         "series": s,
         "trend": next((t for t in res.get("trends", []) if t.get("series_id") == series_id), None),
         "anomalies": [a for a in res.get("anomalies", []) if a.get("series_id") == series_id],
@@ -292,14 +414,16 @@ def _histogram(values: list[float]) -> list[dict[str, Any]]:
 
 
 @router.get("/status")
-def intel_status(_: AdminUser, db: DB, request: Request) -> dict[str, Any]:
+def intel_status(_: AdminUser, db: DB, request: Request, domain: Domain) -> dict[str, Any]:
     svc = _service(request)
-    latest_any = svc.latest_run(db, status=None)
-    latest = svc.latest_run(db)
+    info = svc.domain(domain)
+    latest_any = svc.latest_run(db, status=None, domain=domain)
+    latest = svc.latest_run(db, domain=domain)
     res = svc.result_for(db, latest) if latest else {}
     engine = request.app.state.engines.engine
+    has_model = bool((info.get("capabilities") or {}).get("recommendation"))
     model = None
-    if engine is not None:
+    if engine is not None and has_model:
         m = engine.manifest
         trained = parse_as_of(m.get("created_at")) if m.get("created_at") else None
         now = datetime.now(UTC)
@@ -327,18 +451,25 @@ def intel_status(_: AdminUser, db: DB, request: Request) -> dict[str, Any]:
     pipeline = "never_run"
     finished = db.scalar(
         select(IntelRun.status)
-        .where(IntelRun.status != "running")
+        .where(IntelRun.status != "running", IntelRun.domain == domain)
         .order_by(IntelRun.started_at.desc(), IntelRun.id.desc())
         .limit(1)
     )
     if finished is not None:
         pipeline = "ok" if finished == "succeeded" else "failed"
     return {
+        "domain": domain,
+        "domain_info": {
+            "name": info.get("name"),
+            "available": bool(info.get("available")),
+            "reason": None if info.get("available") else info.get("reason"),
+            "capabilities": info.get("capabilities") or {},
+        },
         "latest_run": run_out(latest_any) if latest_any else None,
         "summary": res.get("summary"),
         "data": res.get("data"),
         "model": model,
-        "warnings_open": svc.open_warning_counts(db),
+        "warnings_open": svc.open_warning_counts(db, domain),
         "recent_decisions": decisions,
         "top_signals": res.get("signals", [])[:5],
         "top_risks": res.get("risks", [])[:5],
@@ -346,7 +477,8 @@ def intel_status(_: AdminUser, db: DB, request: Request) -> dict[str, Any]:
         "health": {
             "database": "ok" if db_ok else "error",
             "cache": "ok" if request.app.state.cache.ping() else "error",
-            "model": "ok" if engine is not None else "unavailable",
+            # a domain without a recommender has no model to be healthy or not
+            "model": ("ok" if engine is not None else "unavailable") if has_model else "not_applicable",
             "pipeline": pipeline,
         },
     }
@@ -357,13 +489,14 @@ def intel_status(_: AdminUser, db: DB, request: Request) -> dict[str, Any]:
 def list_warnings(
     _: AdminUser,
     db: DB,
+    domain: Domain,
     status_: WarningStatus | None = Query(None, alias="status"),
     severity: Severity | None = None,
     key: str | None = Query(None, max_length=200),
     limit: int = Limit,
     offset: int = Offset,
 ) -> dict[str, Any]:
-    q = select(IntelWarning)
+    q = select(IntelWarning).where(IntelWarning.domain == domain)
     if status_:
         q = q.where(IntelWarning.status == status_)
     if severity:
@@ -377,30 +510,30 @@ def list_warnings(
     return {"items": [warning_out(w) for w in rows], "total": total, "limit": limit, "offset": offset}
 
 
-def _warning(db: Session, warning_id: int) -> IntelWarning:
+def _warning(db: Session, warning_id: int, domain: str) -> IntelWarning:
     w = db.scalar(
         select(IntelWarning).options(selectinload(IntelWarning.events)).where(IntelWarning.id == warning_id)
     )
-    if w is None:
+    if w is None or w.domain != domain:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "warning not found")
     return w
 
 
 @router.get("/warnings/{warning_id}", response_model=IntelWarningOut)
-def get_warning(warning_id: IdPath, _: AdminUser, db: DB) -> dict[str, Any]:
-    return warning_out(_warning(db, warning_id), history=True)
+def get_warning(warning_id: IdPath, _: AdminUser, db: DB, domain: Domain) -> dict[str, Any]:
+    return warning_out(_warning(db, warning_id, domain), history=True)
 
 
 @router.patch("/warnings/{warning_id}", response_model=IntelWarningOut)
 def update_warning(
-    warning_id: IdPath, body: WarningUpdate, user: AdminUser, db: DB, request: Request
+    warning_id: IdPath, body: WarningUpdate, user: AdminUser, db: DB, request: Request, domain: Domain
 ) -> dict[str, Any]:
-    w = _warning(db, warning_id)
+    w = _warning(db, warning_id, domain)
     try:
         w = _service(request).update_warning(db, w, body.status, body.note, user)
     except InvalidTransitionError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    return warning_out(_warning(db, w.id), history=True)
+    return warning_out(_warning(db, w.id, domain), history=True)
 
 
 # --- decisions --------------------------------------------------------------------------------------
@@ -421,6 +554,7 @@ def _decision_feedback(db: Session, decision_ids: list[str]) -> dict[str, dict[s
 def list_decisions(
     _: AdminUser,
     db: DB,
+    domain: Domain,
     key: str | None = Query(None, max_length=64),
     run_id: str | None = Query(None, max_length=36),
     entity: str | None = Query(None, max_length=200),
@@ -428,7 +562,7 @@ def list_decisions(
     limit: int = Limit,
     offset: int = Offset,
 ) -> dict[str, Any]:
-    q = select(IntelDecision)
+    q = select(IntelDecision).where(IntelDecision.domain == domain)
     if key:
         q = q.where(IntelDecision.key == key)
     if run_id:
@@ -450,10 +584,10 @@ def list_decisions(
 
 @router.get("/decisions/batches", response_model=DecisionBatchList)
 def decision_batches(
-    _: AdminUser, db: DB, request: Request, run_id: str | None = Query(None, max_length=36)
+    _: AdminUser, db: DB, request: Request, domain: Domain, run_id: str | None = Query(None, max_length=36)
 ) -> dict[str, Any]:
     """The run's multi-question decision calls (section 9.1). Declared before /decisions/{ref}."""
-    run, res = _run_and_result(db, _service(request), run_id)
+    run, res = _run_and_result(db, _service(request), run_id, domain)
     batches = res.get("decision_batches")
     if not isinstance(batches, list):
         # a result without decision_batches: rebuild the groups from the stored batch ids
@@ -485,11 +619,13 @@ def decision_batches(
                 b["keys"].append(key)
             b["policy_versions"][key] = pv
         batches = list(grouped.values())
-    return {"items": batches, "run_id": run.run_id, "as_of": iso(run.as_of)}
+    return {"items": batches, "run_id": run.run_id, "as_of": iso(run.as_of), "domain": run.domain}
 
 
 @router.get("/decisions/{decision_ref}", response_model=IntelDecisionOut)
-def get_decision(decision_ref: Annotated[str, Path(max_length=64)], _: AdminUser, db: DB) -> dict[str, Any]:
+def get_decision(
+    decision_ref: Annotated[str, Path(max_length=64)], _: AdminUser, db: DB, domain: Domain
+) -> dict[str, Any]:
     """By db_id, or by contract id ("dec-…": the most recent run's copy of that decision)."""
     pk = parse_db_id(decision_ref)
     if pk is not None:
@@ -497,11 +633,11 @@ def get_decision(decision_ref: Annotated[str, Path(max_length=64)], _: AdminUser
     else:
         d = db.scalar(
             select(IntelDecision)
-            .where(IntelDecision.decision_id == decision_ref)
+            .where(IntelDecision.decision_id == decision_ref, IntelDecision.domain == domain)
             .order_by(IntelDecision.id.desc())
             .limit(1)
         )
-    if d is None:
+    if d is None or d.domain != domain:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "decision not found")
     return decision_out(d, _decision_feedback(db, [d.decision_id]).get(d.decision_id))
 
@@ -510,6 +646,7 @@ def get_decision(decision_ref: Annotated[str, Path(max_length=64)], _: AdminUser
 def _feedback_out(f: IntelFeedback) -> dict[str, Any]:
     return {
         "id": f.id,
+        "domain": f.domain,
         "target_type": f.target_type,
         "target_id": f.target_id,
         "verdict": f.verdict,
@@ -521,7 +658,11 @@ def _feedback_out(f: IntelFeedback) -> dict[str, Any]:
 
 
 @router.post("/feedback", response_model=IntelFeedbackOut, status_code=status.HTTP_201_CREATED)
-def record_feedback(body: IntelFeedbackIn, user: AdminUser, db: DB, request: Request) -> dict[str, Any]:
+def record_feedback(
+    body: IntelFeedbackIn, user: AdminUser, db: DB, request: Request, domain: Domain
+) -> dict[str, Any]:
+    """The target must belong to `domain` (a decision/warning of that domain, or an action/forecast
+    of its latest run); otherwise 404."""
     if body.verdict not in FEEDBACK_VERDICTS[body.target_type]:
         allowed = ", ".join(FEEDBACK_VERDICTS[body.target_type])
         raise HTTPException(
@@ -534,16 +675,17 @@ def record_feedback(body: IntelFeedbackIn, user: AdminUser, db: DB, request: Req
     if body.target_type == "decision":
         run_id = db.scalar(
             select(IntelDecision.run_id)
-            .where(IntelDecision.decision_id == tid)
+            .where(IntelDecision.decision_id == tid, IntelDecision.domain == domain)
             .order_by(IntelDecision.id.desc())
             .limit(1)
         )
         found = run_id is not None
     elif body.target_type == "warning":
         pk = parse_db_id(tid)
-        found = pk is not None and db.get(IntelWarning, pk) is not None
+        target = db.get(IntelWarning, pk) if pk is not None else None
+        found = target is not None and target.domain == domain
     else:
-        latest = svc.latest_run(db)
+        latest = svc.latest_run(db, domain=domain)
         res = svc.result_for(db, latest) if latest else {}
         if body.target_type == "action":
             ids = {a.get("id") for a in res.get("actions", [])}
@@ -554,6 +696,7 @@ def record_feedback(body: IntelFeedbackIn, user: AdminUser, db: DB, request: Req
     if not found:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"{body.target_type} {tid!r} not found")
     f = IntelFeedback(
+        domain=domain,
         target_type=body.target_type,
         target_id=tid,
         verdict=body.verdict,
@@ -571,7 +714,13 @@ def record_feedback(body: IntelFeedbackIn, user: AdminUser, db: DB, request: Req
         user,
         body.target_type,
         tid,
-        {"feedback_id": f.id, "verdict": body.verdict, "run_id": run_id, "has_note": bool(body.note)},
+        {
+            "feedback_id": f.id,
+            "domain": domain,
+            "verdict": body.verdict,
+            "run_id": run_id,
+            "has_note": bool(body.note),
+        },
     )
     db.commit()
     return _feedback_out(f)
@@ -585,20 +734,21 @@ def _ratio(num: int, den: int) -> float | None:
 def list_feedback(
     _: AdminUser,
     db: DB,
+    domain: Domain,
     target_type: Literal["decision", "warning", "action", "prediction"] | None = None,
     limit: int = Limit,
     offset: int = Offset,
 ) -> dict[str, Any]:
-    q = select(IntelFeedback)
+    q = select(IntelFeedback).where(IntelFeedback.domain == domain)
     if target_type:
         q = q.where(IntelFeedback.target_type == target_type)
     total = db.scalar(select(func.count()).select_from(q.subquery())) or 0
     rows = db.scalars(q.order_by(IntelFeedback.id.desc()).limit(limit).offset(offset)).all()
     counts = {t: dict.fromkeys(v, 0) for t, v in FEEDBACK_VERDICTS.items()}
     for t, verdict, n in db.execute(
-        select(IntelFeedback.target_type, IntelFeedback.verdict, func.count()).group_by(
-            IntelFeedback.target_type, IntelFeedback.verdict
-        )
+        select(IntelFeedback.target_type, IntelFeedback.verdict, func.count())
+        .where(IntelFeedback.domain == domain)
+        .group_by(IntelFeedback.target_type, IntelFeedback.verdict)
     ):
         counts[t][verdict] = int(n)
     dec, warn = counts["decision"], counts["warning"]
@@ -619,20 +769,26 @@ def list_feedback(
 
 # --- scenarios --------------------------------------------------------------------------------------
 @router.post("/scenarios")
-def create_scenario(body: ScenarioRequest, user: AdminUser, db: DB, request: Request) -> dict[str, Any]:
+def create_scenario(
+    body: ScenarioRequest, user: AdminUser, db: DB, request: Request, domain: Domain
+) -> dict[str, Any]:
     spec = body.model_dump(exclude={"save", "title"}, exclude_none=True)
     spec["scenarios"] = [s.model_dump(exclude_none=True) for s in body.scenarios]
     if not spec["scenarios"]:
         spec.pop("scenarios")
-    if body.as_of is None and _service(request).latest_run(db) is None:
+    _capability(request, domain, "scenarios", "scenario engine")
+    if body.as_of is None and _service(request).latest_run(db, domain=domain) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, NO_RUN)
     try:
-        out = _service(request).scenario(db, dict(spec))
+        out = _service(request).scenario(db, dict(spec), domain)
+    except DomainUnavailableError as exc:
+        raise unavailable_domain(exc) from exc
     except ValueError as exc:  # IntelInputError included
         raise HTTPException(422, str(exc)) from exc
     saved_id: int | None = None
     if body.save:
         row = IntelScenario(
+            domain=domain,
             title=(body.title or f"{body.series_id} · {len(out.get('scenarios', []))} scenarios")[:200],
             series_id=body.series_id,
             as_of=parse_as_of(out.get("as_of")),
@@ -648,22 +804,28 @@ def create_scenario(body: ScenarioRequest, user: AdminUser, db: DB, request: Req
             user,
             "intel_scenario",
             row.id,
-            {"title": row.title, "series_id": row.series_id, "n_scenarios": len(out.get("scenarios", []))},
+            {
+                "domain": domain,
+                "title": row.title,
+                "series_id": row.series_id,
+                "n_scenarios": len(out.get("scenarios", [])),
+            },
         )
         db.commit()
         saved_id = row.id
-    return {**out, "id": saved_id}
+    return {**out, "id": saved_id, "domain": domain}
 
 
 @router.get("/scenarios", response_model=SavedScenarioList)
 def list_scenarios(
     _: AdminUser,
     db: DB,
+    domain: Domain,
     series_id: str | None = Query(None, max_length=200),
     limit: int = Limit,
     offset: int = Offset,
 ) -> dict[str, Any]:
-    q = select(IntelScenario)
+    q = select(IntelScenario).where(IntelScenario.domain == domain)
     if series_id:
         q = q.where(IntelScenario.series_id == series_id)
     total = db.scalar(select(func.count()).select_from(q.subquery())) or 0
@@ -671,6 +833,7 @@ def list_scenarios(
     items = [
         {
             "id": s.id,
+            "domain": s.domain,
             "title": s.title,
             "series_id": s.series_id,
             "created_at": iso(s.created_at),
@@ -683,29 +846,85 @@ def list_scenarios(
 
 
 # --- evaluation -------------------------------------------------------------------------------------
-@router.get("/evaluation")
-def evaluation(_: AdminUser, request: Request) -> dict[str, Any]:
-    """The newest experiments/intel-eval-*/report.json (written by scripts/evaluate_intelligence.py)."""
+def _newest_report(request: Request, prefix: str) -> tuple[str | None, dict[str, Any] | None]:
+    """(run_dir, report) of the newest experiments/<prefix>*/report.json; report None when absent or
+    unreadable. NaN/Infinity become null (a JSON response cannot carry them)."""
     base = request.app.state.settings.experiments_dir
-    runs = sorted(
-        (p for p in base.glob("intel-eval-*") if (p / "report.json").is_file()), key=lambda p: p.name
-    )
+    runs = sorted((p for p in base.glob(f"{prefix}*") if (p / "report.json").is_file()), key=lambda p: p.name)
     if not runs:
-        return {"available": False, "run_dir": None, "report": None}
+        return None, None
     latest = runs[-1]
     try:
-        # NaN/Infinity -> null, as in sync_intel_evaluations (a JSON response cannot carry them)
         report = json.loads((latest / "report.json").read_text(), parse_constant=lambda _: None)
     except (OSError, ValueError):
-        request.app.state.log.exception("unreadable intelligence evaluation report")
-        return {"available": False, "run_dir": latest.name, "report": None}
-    return {"available": True, "run_dir": latest.name, "report": report}
+        request.app.state.log.exception(
+            "unreadable evaluation report", extra={"extra_fields": {"dir": latest.name}}
+        )
+        return latest.name, None
+    return latest.name, report if isinstance(report, dict) else None
+
+
+def _platform_section(request: Request, domain: str) -> dict[str, Any] | None:
+    """The domain's section of the newest experiments/platform-eval-*/report.json
+    (scripts/evaluate_domains.py: forecast backtest, warning precision / FPR, decision consistency)."""
+    run_dir, report = _newest_report(request, "platform-eval-")
+    if report is None:
+        return None
+    section = next(
+        (d for d in report.get("domains") or [] if isinstance(d, dict) and d.get("domain") == domain), None
+    )
+    if section is None:
+        return None
+    return {
+        "run_dir": run_dir,
+        "created_at": report.get("created_at"),
+        "horizon": report.get("horizon"),
+        "report": section,
+    }
+
+
+@router.get("/evaluation")
+def evaluation(_: AdminUser, request: Request, domain: Domain) -> dict[str, Any]:
+    """Movie: the newest experiments/intel-eval-*/report.json (scripts/evaluate_intelligence.py), as in
+    v1.1. Every domain: `platform`, its section of the newest platform-eval report (null when none).
+    The intel-eval report covers the movie domain only, so other domains have `available: false`."""
+    platform = _platform_section(request, domain)
+    if domain != DEFAULT_DOMAIN:
+        return {
+            "available": False,
+            "run_dir": None,
+            "report": None,
+            "domain": domain,
+            "reason": "the intelligence-layer evaluation (intel-eval) covers the movie domain; "
+            "see `platform` for this domain's platform evaluation",
+            "platform": platform,
+        }
+    run_dir, report = _newest_report(request, "intel-eval-")
+    return {
+        "available": report is not None,
+        "run_dir": run_dir,
+        "report": report,
+        "domain": domain,
+        "platform": platform,
+    }
+
+
+@router.get("/evaluation/drift")
+def evaluation_drift(_: AdminUser, request: Request, domain: Domain) -> dict[str, Any]:
+    """The newest experiments/drift-eval-*/report.json (scripts/evaluate_drift.py): preference-drift
+    detector precision / recall and the adaptation effect behind the recommendation-strategy policy."""
+    _capability(request, domain, "user_intelligence", "per-user drift evaluation")
+    run_dir, report = _newest_report(request, "drift-eval-")
+    return {"available": report is not None, "run_dir": run_dir, "report": report, "domain": domain}
 
 
 @router.get("/evaluation/runs", response_model=EvaluationRunList)
-def evaluation_runs(_: AdminUser, db: DB, request: Request) -> dict[str, Any]:
+def evaluation_runs(_: AdminUser, db: DB, request: Request, domain: Domain) -> dict[str, Any]:
     """Every offline evaluation run, newest first, with its headline numbers. Synced from
-    experiments/intel-eval-*/report.json on each call (unchanged files are skipped)."""
+    experiments/intel-eval-*/report.json on each call (unchanged files are skipped). These evaluate
+    the movie domain; other domains have none (their platform evaluation is in GET /intel/evaluation)."""
+    if domain != DEFAULT_DOMAIN:
+        return {"items": [], "total": 0}
     try:
         sync_intel_evaluations(db, request.app.state.settings.experiments_dir)
     except OSError:
@@ -753,6 +972,7 @@ def evidence(
     _: AdminUser,
     db: DB,
     request: Request,
+    domain: Domain,
     run_id: str | None = RunId,
     owner_type: EvidenceOwner | None = None,
     owner_id: str | None = Query(None, max_length=200),
@@ -763,7 +983,7 @@ def evidence(
 ) -> dict[str, Any]:
     """Every Evidence item of the latest (or `?run_id=`) run with its owner; `q` searches the label,
     detail and owner title (case-insensitive)."""
-    run = _resolve_run(db, _service(request), run_id)
+    run = _resolve_run(db, _service(request), run_id, domain)
     query = select(IntelEvidenceRow).where(IntelEvidenceRow.run_id == run.id)
     if owner_type:
         query = query.where(IntelEvidenceRow.owner_type == owner_type)
@@ -848,6 +1068,7 @@ def history(
     entity: HistoryEntity,
     _: AdminUser,
     db: DB,
+    domain: Domain,
     key: str = Query(..., min_length=1, max_length=200),
     limit: int = Query(100, ge=1, le=500),
 ) -> dict[str, Any]:
@@ -855,14 +1076,25 @@ def history(
     `key` = signal/anomaly dedup_key, trend series_id, risk key (risk:<kind>:<entity>), or any
     object id of that entity, which resolves to its key."""
     model, key_col, id_col = HISTORY[entity]
+    in_domain = (model.run_id == IntelRun.id, IntelRun.domain == domain)
     resolved = key
-    if db.scalar(select(func.count()).select_from(model).where(key_col == key)) == 0:
-        by_id = db.scalar(select(key_col).where(id_col == key).limit(1))
+    if (
+        db.scalar(
+            select(func.count())
+            .select_from(model)
+            .join(IntelRun, in_domain[0])
+            .where(key_col == key, in_domain[1])
+        )
+        == 0
+    ):
+        by_id = db.scalar(
+            select(key_col).join(IntelRun, in_domain[0]).where(id_col == key, in_domain[1]).limit(1)
+        )
         resolved = by_id if by_id is not None else key
     rows = db.execute(
         select(model, IntelRun)
         .join(IntelRun, model.run_id == IntelRun.id)
-        .where(key_col == resolved, IntelRun.status == "succeeded")
+        .where(key_col == resolved, IntelRun.status == "succeeded", IntelRun.domain == domain)
         .order_by(IntelRun.started_at.desc(), IntelRun.id.desc(), model.id.desc())
         .limit(limit)
     ).all()
@@ -875,7 +1107,7 @@ def history(
         }
         for row, run in reversed(rows)
     ]
-    return {"entity": entity, "key": resolved, "items": items}
+    return {"entity": entity, "key": resolved, "items": items, "domain": domain}
 
 
 # --- v1.1: recommender monitoring (section 9.3) ------------------------------------------------------
@@ -891,10 +1123,12 @@ def _positive_rate(c: dict[str, int]) -> float | None:
 
 @router.get("/recommendations")
 def recommender_monitoring(
-    _: AdminUser, db: DB, request: Request, recent: int = Query(20, ge=0, le=100)
+    _: AdminUser, db: DB, request: Request, domain: Domain, recent: int = Query(20, ge=0, le=100)
 ) -> dict[str, Any]:
     """Serving volume, feedback by reason code, the confidence distribution of served items and the
-    active model's calibration (null until models/<version>/calibration.json exists)."""
+    active model's calibration (null until models/<version>/calibration.json exists). v1.2: served
+    recommendations per strategy (the recommendation_strategy decision). Recommender domains only."""
+    _capability(request, domain, "recommendation", "recommender")
     engine = request.app.state.engines.engine
     since = datetime.now(UTC) - timedelta(days=SERVED_DAYS)
     day = func.date(Recommendation.created_at)
@@ -945,7 +1179,15 @@ def recommender_monitoring(
         if recent
         else []
     )
+    strategies = {
+        str(k or "unrecorded"): int(n)
+        for k, n in db.execute(
+            select(Recommendation.strategy, func.count()).group_by(Recommendation.strategy)
+        )
+    }
     return {
+        "domain": domain,
+        "strategies": strategies,
         "model_version": engine.version if engine is not None else None,
         "calibration": engine_calibration(engine),
         "served": {
@@ -971,6 +1213,8 @@ def recommender_monitoring(
                 "reason": r.reason,
                 "reason_code": r.reason_code,
                 "model_version": r.model_version,
+                "decision_id": r.decision_id,
+                "strategy": r.strategy,
                 "created_at": iso(r.created_at),
             }
             for r in rows

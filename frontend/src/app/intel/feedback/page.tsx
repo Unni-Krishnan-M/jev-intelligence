@@ -1,10 +1,10 @@
 "use client";
 
-import Link from "next/link";
 import { useState } from "react";
 import useSWR from "swr";
 
 import { fmtDate, Panel } from "@/components/jev/admin/ui";
+import Link, { useIntelDomain } from "@/components/jev/intel/domain-context";
 import { PageHeader } from "@/components/jev/intel/page-header";
 import { IntelError, Pagination, PanelsSkeleton, RowsSkeleton } from "@/components/jev/intel/states";
 import { EmptyState } from "@/components/jev/states";
@@ -41,7 +41,8 @@ function targetHref(f: FeedbackRecord): string | null {
 
 export default function FeedbackPage() {
   const [offset, setOffset] = useState(0);
-  const { data, error, mutate } = useSWR<FeedbackList>(`/intel/feedback${qs({ limit: LIMIT, offset })}`);
+  const { q: dq } = useIntelDomain();
+  const { data, error, mutate } = useSWR<FeedbackList>(dq(`/intel/feedback${qs({ limit: LIMIT, offset })}`));
   const s = data?.summary;
 
   return (

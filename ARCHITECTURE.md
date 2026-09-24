@@ -1,5 +1,7 @@
 # JEV Architecture
 
+JEV is a domain-independent decision and early-warning engine (`ml/jev_ml/core`) with domain adapters. The movie recommender is the first adapter. The platform contract is in [docs/platform.md](docs/platform.md).
+
 ```
                  ┌──────────────────────────── browser ─────────────────────────────┐
                  │  Next.js 16 (App Router, TS, Tailwind v4, shadcn/ui, Recharts)    │
@@ -86,7 +88,10 @@ startup when the latest run is older than `JEV_INTEL_MIN_INTERVAL_HOURS`.
 | `ml/jev_ml/training.py` | experiment pipeline, tuning, artifact writing |
 | `ml/jev_ml/registry.py` | model registry (active pointer) |
 | `ml/jev_ml/engine.py` | inference engine |
-| `ml/jev_ml/intel/` | intelligence layer: ingest/validate, series, trends, anomalies, forecast, lapse, risk, decisions, warnings, actions, scenario, signals, pipeline, evaluation |
+| `ml/jev_ml/core/` | JEV core, domain-independent: types, adapter protocol, series builder, trends, anomalies, forecasts, scenarios, risk, decision framework, early-warning decision, warnings, actions, signals, drift tests, `run_domain` |
+| `ml/jev_ml/domains/movie/` | movie adapter: ingest/validation, genre series, raters, lapse, model governance, user intelligence (preference drift, strategy decision, preference scenarios) |
+| `ml/jev_ml/domains/generic/` | generic adapter: any long CSV + `configs/domains/*.yaml` |
+| `ml/jev_ml/intel/` | compatibility layer: `run_pipeline(PipelineInputs)` and re-exports for the movie domain, plus offline evaluation |
 | `backend/jev_api/` | FastAPI app, ORM models, Alembic migrations, routers, services |
 | `frontend/src/` | Next.js pages (`app/`), components (`components/jev`, `components/ui`), API client (`lib/`) |
 | `scripts/` | pipeline entry points, acceptance test, screenshot capture |

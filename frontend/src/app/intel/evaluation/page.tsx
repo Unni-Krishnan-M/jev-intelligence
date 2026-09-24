@@ -1,14 +1,18 @@
 "use client";
 
-import Link from "next/link";
+import { Info } from "lucide-react";
 import useSWR from "swr";
 
 import { fmtDate, fmtNum, Panel, SpecRows, StatTile } from "@/components/jev/admin/ui";
 import { NamedBars, ReliabilityDiagram, TableView } from "@/components/jev/intel/charts";
+import Link, { CapabilityNotice, useIntelDomain } from "@/components/jev/intel/domain-context";
+import { DriftEvaluation } from "@/components/jev/intel/drift-eval";
 import { PageHeader } from "@/components/jev/intel/page-header";
+import { PlatformEvaluationView } from "@/components/jev/intel/platform-eval";
 import { IntelError, NotDeployedState, PanelsSkeleton, RowsSkeleton } from "@/components/jev/intel/states";
 import { EmptyState, SectionHeader } from "@/components/jev/states";
 import { Button } from "@/components/ui/button";
+import { DEFAULT_DOMAIN } from "@/lib/domain";
 import { fmtMs, fmtPct, humanize, isNotDeployed, orderStages, seriesHref, seriesLabel } from "@/lib/intel";
 import type { EvaluationReport, EvaluationResponse, EvaluationRunList } from "@/lib/intel-types";
 import { cn } from "@/lib/utils";
@@ -30,8 +34,12 @@ function VsCell({ v, base, higherIsBetter = true }: { v: number | null; base: nu
 
 function Report({ r }: { r: EvaluationReport }) {
   const fs = r.forecast.summary;
-  const lm = r.lapse.metrics;
-  const inj = r.anomaly.injection;
+  const { can } = useIntelDomain();
+  const lapseCap = can("lapse");
+  const ratersCap = can("raters");
+  // a domain without these stages may omit the blocks entirely
+  const lm = (r.lapse as EvaluationReport["lapse"] | undefined)?.metrics;
+  const inj = (r.anomaly.injection as EvaluationReport["anomaly"]["injection"] | undefined) ?? null;
   const cp = r.change_point;
   const stages = orderStages(r.latency.stage_ms);
 
@@ -85,94 +93,108 @@ function Report({ r }: { r: EvaluationReport }) {
 
       <section aria-labelledby="ev-lapse">
         <SectionHeader id="ev-lapse" index={2} kicker="lapse model · held-out cut-offs" title="Is the lapse model calibrated?" />
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-          <Panel title="Reliability diagram">
-            {r.lapse.calibration.length ? (
-              <>
-                <ReliabilityDiagram bins={r.lapse.calibration} />
-                <TableView
-                  caption="Calibration bins"
-                  head={["bin", "predicted", "observed", "n"]}
-                  rows={r.lapse.calibration.map((c) => [c.bin, c.predicted.toFixed(3), c.observed.toFixed(3), c.n.toLocaleString()])}
-                />
-              </>
-            ) : (
-              <p className="text-sm text-muted-foreground">No calibration bins in the report.</p>
-            )}
-          </Panel>
-          <Panel title="Against baselines">
-            <table className="w-full text-sm">
-              <caption className="sr-only">Lapse model against baselines</caption>
-              <thead>
-                <tr className="border-b hairline text-left text-xs text-muted-foreground">
-                  <th className="py-2 pr-2 font-normal">Model</th>
-                  <th className="px-2 py-2 text-right font-normal">AUC ↑</th>
-                  <th className="py-2 pl-2 text-right font-normal">Brier ↓</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr className="border-b hairline bg-accent/40">
-                  <td className="py-2 pr-2">JEV lapse model</td>
-                  <td className="num px-2 py-2 text-right font-semibold">{fmtNum(lm.auc, 3)}</td>
-                  <td className="num py-2 pl-2 text-right font-semibold">{fmtNum(lm.brier, 3)}</td>
-                </tr>
-                {r.lapse.baselines.map((b) => (
-                  <tr key={b.name} className="border-b hairline last:border-0 text-ink-2">
-                    <td className="py-2 pr-2">{humanize(b.name)}</td>
-                    <td className="num px-2 py-2 text-right">{fmtNum(b.auc, 3)}</td>
-                    <td className="num py-2 pl-2 text-right">{fmtNum(b.brier, 3)}</td>
+        {!lapseCap.available ? (
+          <CapabilityNotice cap="lapse" />
+        ) : !lm ? (
+          <p className="text-sm text-muted-foreground">This report has no lapse-model evaluation.</p>
+        ) : (
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+            <Panel title="Reliability diagram">
+              {r.lapse.calibration.length ? (
+                <>
+                  <ReliabilityDiagram bins={r.lapse.calibration} />
+                  <TableView
+                    caption="Calibration bins"
+                    head={["bin", "predicted", "observed", "n"]}
+                    rows={r.lapse.calibration.map((c) => [c.bin, c.predicted.toFixed(3), c.observed.toFixed(3), c.n.toLocaleString()])}
+                  />
+                </>
+              ) : (
+                <p className="text-sm text-muted-foreground">No calibration bins in the report.</p>
+              )}
+            </Panel>
+            <Panel title="Against baselines">
+              <table className="w-full text-sm">
+                <caption className="sr-only">Lapse model against baselines</caption>
+                <thead>
+                  <tr className="border-b hairline text-left text-xs text-muted-foreground">
+                    <th className="py-2 pr-2 font-normal">Model</th>
+                    <th className="px-2 py-2 text-right font-normal">AUC ↑</th>
+                    <th className="py-2 pl-2 text-right font-normal">Brier ↓</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-            <div className="mt-4">
-              <SpecRows
-                rows={[
-                  { label: "Calibration error (ECE)", value: fmtNum(lm.ece, 3) },
-                  { label: "Base rate", value: fmtPct(lm.base_rate) },
-                  { label: "Train / test rows", value: `${lm.n_train.toLocaleString()} / ${lm.n_test.toLocaleString()}` },
-                  { label: "Test cut-offs", value: lm.test_cutoffs.map((c) => c.slice(0, 7)).join(", ") || "—" },
-                ]}
-              />
-            </div>
-          </Panel>
-        </div>
+                </thead>
+                <tbody>
+                  <tr className="border-b hairline bg-accent/40">
+                    <td className="py-2 pr-2">JEV lapse model</td>
+                    <td className="num px-2 py-2 text-right font-semibold">{fmtNum(lm.auc, 3)}</td>
+                    <td className="num py-2 pl-2 text-right font-semibold">{fmtNum(lm.brier, 3)}</td>
+                  </tr>
+                  {r.lapse.baselines.map((b) => (
+                    <tr key={b.name} className="border-b hairline last:border-0 text-ink-2">
+                      <td className="py-2 pr-2">{humanize(b.name)}</td>
+                      <td className="num px-2 py-2 text-right">{fmtNum(b.auc, 3)}</td>
+                      <td className="num py-2 pl-2 text-right">{fmtNum(b.brier, 3)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="mt-4">
+                <SpecRows
+                  rows={[
+                    { label: "Calibration error (ECE)", value: fmtNum(lm.ece, 3) },
+                    { label: "Base rate", value: fmtPct(lm.base_rate) },
+                    { label: "Train / test rows", value: `${lm.n_train.toLocaleString()} / ${lm.n_test.toLocaleString()}` },
+                    { label: "Test cut-offs", value: lm.test_cutoffs.map((c) => c.slice(0, 7)).join(", ") || "—" },
+                  ]}
+                />
+              </div>
+            </Panel>
+          </div>
+        )}
       </section>
 
       <section aria-labelledby="ev-anom">
         <SectionHeader id="ev-anom" index={3} kicker="anomalies · synthetic injection" title="Would it catch a shilling attack?" />
-        <Protocol text={inj.protocol} />
-        <p className="num mb-3 text-xs text-muted-foreground">{inj.n_genuine.toLocaleString()} genuine raters · {inj.n_injected.toLocaleString()} injected profiles</p>
-        {inj.attack_types.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No attack types evaluated.</p>
+        {!ratersCap.available ? (
+          <CapabilityNotice cap="raters" className="mb-4" />
+        ) : !inj ? (
+          <p className="mb-4 text-sm text-muted-foreground">This report has no rater-injection evaluation.</p>
         ) : (
-          <div className="overflow-x-auto rounded-lg border bg-card">
-            <table className="w-full min-w-[620px] text-sm">
-              <caption className="sr-only">Detection of injected attack profiles against a baseline detector</caption>
-              <thead>
-                <tr className="border-b hairline text-left text-xs text-muted-foreground">
-                  <th className="px-4 py-2.5 font-normal">Attack</th>
-                  <th className="px-2 py-2.5 text-right font-normal">n</th>
-                  <th className="px-2 py-2.5 text-right font-normal">Precision</th>
-                  <th className="px-2 py-2.5 text-right font-normal">Recall</th>
-                  <th className="px-2 py-2.5 text-right font-normal">F1</th>
-                  <th className="px-4 py-2.5 text-right font-normal">AUC</th>
-                </tr>
-              </thead>
-              <tbody>
-                {inj.attack_types.map((a) => (
-                  <tr key={a.type} className="border-b hairline last:border-0">
-                    <td className="px-4 py-2">{humanize(a.type)}</td>
-                    <td className="num px-2 py-2 text-right text-muted-foreground">{a.n}</td>
-                    <VsCell v={a.precision} base={a.baseline_precision} />
-                    <VsCell v={a.recall} base={a.baseline_recall} />
-                    <td className="num px-2 py-2 text-right">{fmtNum(a.f1, 3)}</td>
-                    <td className="num px-4 py-2 text-right">{fmtNum(a.auc, 3)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <>
+            <Protocol text={inj.protocol} />
+            <p className="num mb-3 text-xs text-muted-foreground">{inj.n_genuine.toLocaleString()} genuine raters · {inj.n_injected.toLocaleString()} injected profiles</p>
+            {inj.attack_types.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No attack types evaluated.</p>
+            ) : (
+              <div className="overflow-x-auto rounded-lg border bg-card">
+                <table className="w-full min-w-[620px] text-sm">
+                  <caption className="sr-only">Detection of injected attack profiles against a baseline detector</caption>
+                  <thead>
+                    <tr className="border-b hairline text-left text-xs text-muted-foreground">
+                      <th className="px-4 py-2.5 font-normal">Attack</th>
+                      <th className="px-2 py-2.5 text-right font-normal">n</th>
+                      <th className="px-2 py-2.5 text-right font-normal">Precision</th>
+                      <th className="px-2 py-2.5 text-right font-normal">Recall</th>
+                      <th className="px-2 py-2.5 text-right font-normal">F1</th>
+                      <th className="px-4 py-2.5 text-right font-normal">AUC</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {inj.attack_types.map((a) => (
+                      <tr key={a.type} className="border-b hairline last:border-0">
+                        <td className="px-4 py-2">{humanize(a.type)}</td>
+                        <td className="num px-2 py-2 text-right text-muted-foreground">{a.n}</td>
+                        <VsCell v={a.precision} base={a.baseline_precision} />
+                        <VsCell v={a.recall} base={a.baseline_recall} />
+                        <td className="num px-2 py-2 text-right">{fmtNum(a.f1, 3)}</td>
+                        <td className="num px-4 py-2 text-right">{fmtNum(a.auc, 3)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
         )}
         <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
           <Panel title="Series anomalies (injected spikes)">
@@ -238,7 +260,8 @@ function Report({ r }: { r: EvaluationReport }) {
 
 /** Every synced evaluation report (GET /intel/evaluation/runs), newest first, headline figures only. */
 function EvaluationRuns({ current }: { current: string | null }) {
-  const { data, error, mutate } = useSWR<EvaluationRunList>("/intel/evaluation/runs");
+  const { q: dq } = useIntelDomain();
+  const { data, error, mutate } = useSWR<EvaluationRunList>(dq("/intel/evaluation/runs"));
   return (
     <section aria-labelledby="ev-runs" className="mt-12">
       <SectionHeader id="ev-runs" kicker="history" title="Evaluation runs" />
@@ -299,31 +322,60 @@ function EvaluationRuns({ current }: { current: string | null }) {
 }
 
 export default function EvaluationPage() {
-  const { data, error, mutate } = useSWR<EvaluationResponse>("/intel/evaluation");
+  const { q: dq, can, domain, name } = useIntelDomain();
+  const { data, error, mutate } = useSWR<EvaluationResponse>(dq("/intel/evaluation"));
   const r = data?.report ?? null;
+  const movie = domain === DEFAULT_DOMAIN;
+  const platform = data?.platform ?? null;
+  const drift = can("user_intelligence").available;
 
   return (
     <div>
       <PageHeader
-        eyebrow="review"
-        title="Evaluation"
-        description={r ? `Offline evaluation of the intelligence layer itself · ${r.pipeline_version} · data ${r.data_version} · created ${fmtDate(r.created_at)}.` : "Offline evaluation of the intelligence layer itself: forecasts, the lapse model, anomaly and change-point detection, and latency."}
+        eyebrow={`review · ${name}`}
+        title="Model evaluation"
+        description={
+          r
+            ? `Offline evaluation of the intelligence layer itself · ${r.pipeline_version} · data ${r.data_version} · created ${fmtDate(r.created_at)}.`
+            : movie
+              ? "Offline evaluation of the intelligence layer itself: forecasts, the lapse model, anomaly and change-point detection, and latency, then the platform replays and the drift detector."
+              : `Offline evaluation of the engine on ${name}: warning precision and false-positive rate from leak-free replays, decision consistency and forecast accuracy.`
+        }
         asOf={r?.as_of}
-        action={<Button asChild variant="outline" size="sm"><Link href="/admin/experiments">Recommender metrics →</Link></Button>}
+        action={can("model_governance").available ? <Button asChild variant="outline" size="sm"><Link href="/admin/experiments">Recommender metrics →</Link></Button> : undefined}
       />
       {error ? (
         <IntelError error={error} retry={() => mutate()} runBacked={false} />
       ) : !data ? (
         <PanelsSkeleton n={6} />
-      ) : !data.available || !r ? (
-        <EmptyState
-          title="No evaluation report yet"
-          body={`Run the intelligence evaluation script to produce one; the console reads the latest report from disk.${data.run_dir ? ` Looked in ${data.run_dir}.` : ""}`}
-        />
       ) : (
-        <Report r={r} />
+        <div className="space-y-12">
+          {movie ? (
+            !data.available || !r ? (
+              <EmptyState
+                title="No evaluation report yet"
+                body={`Run the intelligence evaluation script to produce one; the console reads the latest report from disk.${data.run_dir ? ` Looked in ${data.run_dir}.` : ""}`}
+              />
+            ) : (
+              <Report r={r} />
+            )
+          ) : (
+            data.reason && (
+              <p className="flex items-start gap-2 rounded border border-dashed hairline px-3 py-2 text-sm text-muted-foreground">
+                <Info className="mt-0.5 size-4 shrink-0" aria-hidden />
+                <span>Intelligence-layer report not shown: {data.reason}.</span>
+              </p>
+            )
+          )}
+          {platform ? (
+            <PlatformEvaluationView p={platform} index={movie && r ? 5 : 1} />
+          ) : (
+            <EmptyState title="No platform evaluation for this domain yet" body="Run scripts/evaluate_domains.py to replay the engine month by month and score its warnings, decisions and forecasts." />
+          )}
+          {movie && drift && <DriftEvaluation index={r ? 8 : platform ? 4 : 1} />}
+        </div>
       )}
-      {(data || error) && <EvaluationRuns current={data?.run_dir ?? null} />}
+      {movie && (data || error) && <EvaluationRuns current={data?.run_dir ?? null} />}
     </div>
   );
 }

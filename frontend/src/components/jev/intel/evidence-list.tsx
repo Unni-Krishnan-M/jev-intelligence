@@ -1,6 +1,6 @@
 import { ArrowUpRight } from "lucide-react";
-import Link from "next/link";
 
+import Link from "@/components/jev/intel/domain-context";
 import { fmtValue, refHref } from "@/lib/intel";
 import type { Evidence } from "@/lib/intel-types";
 import { cn } from "@/lib/utils";
@@ -14,12 +14,23 @@ const KIND_LABEL: Record<Evidence["kind"], string> = {
 };
 
 /** Evidence rows: kind, label, value, detail; a ref links to the chart or object it came from. */
-export function EvidenceList({ items, className, empty = "No evidence recorded." }: { items: Evidence[] | null | undefined; className?: string; empty?: string }) {
+export function EvidenceList({
+  items,
+  className,
+  empty = "No evidence recorded.",
+  linkRefs = true,
+}: {
+  items: Evidence[] | null | undefined;
+  className?: string;
+  empty?: string;
+  /** false outside the admin console: refs are printed, not linked */
+  linkRefs?: boolean;
+}) {
   if (!items?.length) return <p className={cn("text-sm text-muted-foreground", className)}>{empty}</p>;
   return (
     <ul className={cn("divide-y hairline border-y hairline text-sm", className)}>
       {items.map((e, i) => {
-        const href = refHref(e.ref);
+        const href = linkRefs ? refHref(e.ref) : null;
         return (
           <li key={`${e.label}-${i}`} className="grid grid-cols-1 gap-x-4 gap-y-0.5 py-2 sm:grid-cols-[72px_1fr_auto]">
             <span className="eyebrow pt-0.5">{KIND_LABEL[e.kind] ?? e.kind}</span>
@@ -46,7 +57,7 @@ export function EvidenceList({ items, className, empty = "No evidence recorded."
 }
 
 /** Native disclosure for evidence under a row: keyboard-accessible, no state to manage. */
-export function EvidenceDisclosure({ items, label = "Evidence", className }: { items: Evidence[] | null | undefined; label?: string; className?: string }) {
+export function EvidenceDisclosure({ items, label = "Evidence", className, linkRefs = true }: { items: Evidence[] | null | undefined; label?: string; className?: string; linkRefs?: boolean }) {
   const n = items?.length ?? 0;
   return (
     <details className={cn("group", className)}>
@@ -54,7 +65,7 @@ export function EvidenceDisclosure({ items, label = "Evidence", className }: { i
         <span className="transition-transform group-open:rotate-90" aria-hidden>›</span>
         {label} <span className="num">({n})</span>
       </summary>
-      <EvidenceList items={items} className="mt-2" />
+      <EvidenceList items={items} className="mt-2" linkRefs={linkRefs} />
     </details>
   );
 }

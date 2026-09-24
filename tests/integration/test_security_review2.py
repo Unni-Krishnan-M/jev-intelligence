@@ -297,23 +297,28 @@ def _migration_roundtrip(url: str) -> None:
             movie = Movie(id=1, title="One")
             db.add_all([*users, movie])
             db.flush()
-            recs = [
-                Recommendation(
-                    user_id=users[0].id,
-                    movie_id=1,
-                    request_id=str(uuid.uuid4()),
-                    model_version="v",
-                    rank=r,
-                    score=1.0,
-                    reason="r",
-                    reason_code="c",
-                    signals={},
-                )
+            # core inserts with explicit columns: the ORM model has columns added after 0003 (0005)
+            rec_ids = [
+                db.execute(
+                    insert(Recommendation.__table__)
+                    .values(
+                        user_id=users[0].id,
+                        movie_id=1,
+                        request_id=str(uuid.uuid4()),
+                        model_version="v",
+                        context="feed",
+                        rank=r,
+                        score=1.0,
+                        reason="r",
+                        reason_code="c",
+                        signals={},
+                        created_at=t0,
+                    )
+                    .returning(Recommendation.__table__.c.id)
+                ).scalar_one()
                 for r in (1, 2)
             ]
-            db.add_all(recs)
-            db.flush()
-            u0, u1, r1, r2 = users[0].id, users[1].id, recs[0].id, recs[1].id
+            u0, u1, r1, r2 = users[0].id, users[1].id, rec_ids[0], rec_ids[1]
             rows = [
                 # (user, rec, feedback, minutes after t0)
                 (u0, r1, "dislike", 0),

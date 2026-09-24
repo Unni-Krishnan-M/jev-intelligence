@@ -1,11 +1,11 @@
 "use client";
 
 import { EyeOff } from "lucide-react";
-import Link from "next/link";
 import { useState } from "react";
 import useSWR from "swr";
 
 import { SeverityBadge } from "@/components/jev/intel/badges";
+import Link, { CapabilityNotice, useIntelDomain } from "@/components/jev/intel/domain-context";
 import { EvidenceDisclosure } from "@/components/jev/intel/evidence-list";
 import { PageHeader } from "@/components/jev/intel/page-header";
 import { FilterRow, IntelError, Pagination, RowsSkeleton } from "@/components/jev/intel/states";
@@ -111,11 +111,14 @@ function RaterAnomalies({ items }: { items: Anomaly[] }) {
 }
 
 export default function AnomaliesPage() {
-  const [view, setView] = useState<"series" | "rater">("series");
+  const { can, q: dq } = useIntelDomain();
+  const ratersCap = can("raters");
+  const [picked, setView] = useState<"series" | "rater">("series");
+  const view = ratersCap.available ? picked : "series";
   const [severity, setSeverity] = useState("all");
   const [showSuppressed, setShowSuppressed] = useState(true);
   const [offset, setOffset] = useState(0);
-  const { data, error, mutate } = useSWR<Page<Anomaly>>(`/intel/anomalies${qs({ limit: LIMIT, offset })}`);
+  const { data, error, mutate } = useSWR<Page<Anomaly>>(dq(`/intel/anomalies${qs({ limit: LIMIT, offset })}`));
 
   const all = data?.items ?? [];
   const filtered = all
@@ -130,13 +133,17 @@ export default function AnomaliesPage() {
       <PageHeader
         eyebrow="detect"
         title="Anomalies"
-        description="Months that broke from their robust baseline (median ± MAD), and raters whose behaviour an isolation forest ranks as unusual. Suppressed items stay visible with the reason."
+        description={ratersCap.available ? "Periods that broke from their robust baseline (median ± MAD), and raters whose behaviour an isolation forest ranks as unusual. Suppressed items stay visible with the reason." : "Periods that broke from their robust baseline (median ± MAD). Suppressed items stay visible with the reason."}
         asOf={data?.as_of}
         runId={data?.run_id}
       />
 
       <div className="mb-5 flex flex-col gap-2.5">
-        <FilterRow label="View" value={view} onChange={(v) => setView(v as "series" | "rater")} options={[{ value: "series", label: "Series" }, { value: "rater", label: "Rater behaviour" }]} />
+        {ratersCap.available ? (
+          <FilterRow label="View" value={view} onChange={(v) => setView(v as "series" | "rater")} options={[{ value: "series", label: "Series" }, { value: "rater", label: "Rater behaviour" }]} />
+        ) : (
+          <CapabilityNotice cap="raters" />
+        )}
         <FilterRow label="Severity" value={severity} onChange={setSeverity} options={[{ value: "all", label: "All" }, ...SEVERITIES.map((s) => ({ value: s, label: s }))]} />
         <label className="flex items-center gap-2 text-xs text-muted-foreground">
           <Switch checked={showSuppressed} onCheckedChange={setShowSuppressed} aria-label="Show suppressed anomalies" />

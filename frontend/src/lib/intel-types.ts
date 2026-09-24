@@ -5,8 +5,11 @@
 
 export type Severity = "low" | "medium" | "high" | "critical";
 export type Direction = "up" | "down" | "flat";
-/** `interval` (v1.1): confidence is the nominal coverage of a score decision's answer_interval. */
-export type ConfidenceKind = "probability" | "margin" | "rule" | "interval";
+/**
+ * `interval` (v1.1): confidence is the nominal coverage of a score decision's answer_interval.
+ * `evidence` (v1.2): 1 − an (adjusted) p-value, e.g. trends and preference drift. Not a probability.
+ */
+export type ConfidenceKind = "probability" | "margin" | "rule" | "interval" | "evidence";
 export type SystemStatus = "nominal" | "watch" | "alert";
 
 export interface Evidence {
@@ -94,6 +97,8 @@ export interface Signal {
   window: string | null;
   freshness_days: number | null;
   evidence: Evidence[];
+  /** v1.2 (platform.md §2): the domain adapter that emitted it */
+  domain?: string;
 }
 
 export interface ChangePoint {
@@ -122,6 +127,7 @@ export interface Trend {
   prior_mean: number;
   ratio: number | null;
   change_point: ChangePoint | null;
+  domain?: string;
 }
 
 export type AnomalyKind = "series_spike" | "series_drop" | "rater_behaviour" | "live_feedback";
@@ -144,6 +150,7 @@ export interface Anomaly {
   suppression_reason: string | null;
   features: Record<string, number | string | null>;
   evidence: Evidence[];
+  domain?: string;
 }
 
 export interface ForecastPoint {
@@ -174,6 +181,7 @@ export interface Forecast {
   features_used: string[];
   points: ForecastPoint[];
   backtest: Backtest;
+  domain?: string;
 }
 
 export interface CalibrationBin {
@@ -244,6 +252,7 @@ export interface Risk {
   factors: RiskFactor[];
   evidence: Evidence[];
   recommended_response: string;
+  domain?: string;
 }
 
 export interface Decision {
@@ -275,6 +284,8 @@ export interface Decision {
   scale?: DecisionScale | null;
   /** v1.1, score decisions only: [lo, hi] at `confidence` nominal coverage */
   answer_interval?: [number, number] | null;
+  /** v1.2: the domain adapter the decision was made for */
+  domain?: string;
 }
 
 export type DecisionKind = "boolean" | "choice" | "score";
@@ -334,6 +345,7 @@ export interface Action {
   evidence: Evidence[];
   next_step: string;
   source: ObjectSource;
+  domain?: string;
 }
 
 export interface SummaryCounts {
@@ -379,6 +391,8 @@ export interface Run {
   summary: Summary | null;
   stage_ms: Record<string, number>;
   error: string | null;
+  /** v1.2 */
+  domain?: string;
 }
 
 /** GET /intel/runs. The contract names the endpoint but not its envelope; a list page is assumed. */
@@ -390,7 +404,8 @@ export interface RunList {
 export interface IntelHealth {
   database: "ok" | "error";
   cache: "ok" | "error";
-  model: "ok" | "unavailable";
+  /** v1.2: `not_applicable` for a domain without a recommender */
+  model: "ok" | "unavailable" | "not_applicable";
   pipeline: "ok" | "failed" | "never_run";
 }
 
@@ -406,6 +421,9 @@ export interface IntelStatus {
   /** over the latest run's decisions */
   confidence_histogram: { bin: string; n: number }[];
   health: IntelHealth;
+  /** v1.2 */
+  domain?: string;
+  domain_info?: { name: string; available: boolean; reason: string | null; capabilities: DomainCapabilities } | null;
 }
 
 export type WarningStatus = "new" | "acknowledged" | "investigating" | "resolved" | "dismissed";
@@ -447,6 +465,14 @@ export interface IntelWarning {
   reopened_from: number | null;
   /** detail only */
   history?: WarningEvent[];
+  /**
+   * v1.2 (platform.md §4): the early_warning_level decision this warning is downstream of. Present
+   * only on warnings raised after the migration; older rows have none.
+   */
+  decision_id?: string | null;
+  /** v1.2: the level that decision answered */
+  early_warning_level?: EarlyWarningLevel | null;
+  domain?: string;
 }
 
 export type FeedbackTarget = "decision" | "warning" | "action" | "prediction";
@@ -619,6 +645,159 @@ export interface EvaluationResponse {
   available: boolean;
   run_dir: string | null;
   report: EvaluationReport | null;
+  /** v1.2 */
+  domain?: string;
+  /** v1.2: why `report` is null for this domain */
+  reason?: string | null;
+  /** v1.2: this domain's section of the newest platform-eval report */
+  platform?: PlatformEvaluation | null;
+}
+
+// ---- v1.2 platform evaluation (experiments/platform-eval-*/report.json) ----------------------
+
+export interface WarningOutcomeCounts {
+  units: number;
+  observable: number;
+  warned: number;
+  tp: number;
+  fp: number;
+  fn: number;
+  tn: number;
+  precision: number | null;
+  false_positive_rate: number | null;
+  recall: number | null;
+  base_rate: number | null;
+}
+
+export interface DecisionConsistency {
+  replays?: number;
+  situation_pairs: number;
+  flips: number;
+  flip_rate?: number | null;
+  escalations?: number;
+  de_escalations?: number;
+  warning_boundary_flips: number;
+  warning_boundary_flip_rate?: number | null;
+}
+
+export interface PlatformForecastSeries {
+  series_id: string;
+  model: string;
+  mae: number | null;
+  rmse: number | null;
+  mase: number | null;
+  naive_mae: number | null;
+  naive_mase: number | null;
+  coverage80: number | null;
+  origins: number;
+  selection_origins?: number;
+}
+
+export interface PlatformDomainEvaluation {
+  domain: string;
+  as_of_default?: string | null;
+  forecast: {
+    protocol: string;
+    per_series: PlatformForecastSeries[];
+    summary: {
+      n_series: number;
+      median_mae: number | null;
+      median_rmse: number | null;
+      median_mase: number | null;
+      median_naive_mase: number | null;
+      share_beating_naive: number | null;
+      mean_coverage80: number | null;
+    };
+  };
+  warnings: {
+    per_kind: Record<string, WarningOutcomeCounts>;
+    overall: WarningOutcomeCounts;
+    excluded_kinds?: Record<string, string>;
+    examples?: { as_of: string; kind: string; unit: string; confirmed: boolean; detail: string }[];
+  };
+  /** movie: one consistency block over all replays */
+  consistency?: DecisionConsistency;
+  /** generic: replays in separate windows (e.g. around two recessions) */
+  windows?: { window: [string, string]; warnings: WarningOutcomeCounts; consistency: DecisionConsistency; warnings_per_replay?: number[] }[];
+  consistency_pooled_within_windows?: DecisionConsistency;
+  replays: { as_of?: string[]; n: number; ms_mean: number | null };
+  warnings_per_replay?: number[];
+}
+
+export interface PlatformEvaluation {
+  run_dir: string;
+  created_at: string | null;
+  /** periods ahead a warning is checked against */
+  horizon: number | null;
+  report: PlatformDomainEvaluation;
+}
+
+// ---- v1.2 drift evaluation (experiments/drift-eval-*/report.json) ---------------------------
+
+export interface DetectorMetrics {
+  precision: number | null;
+  recall: number | null;
+  recall_ci95?: [number, number] | null;
+  f1: number | null;
+  fpr_upper_bound: number | null;
+  fpr_ci95?: [number, number] | null;
+  tp: number;
+  fp: number;
+  n_pos: number;
+  n_neg: number;
+}
+
+export interface DetectorSplice {
+  overall_drift_detected: DetectorMetrics;
+  preference_drift: DetectorMetrics;
+  per_aspect: Record<string, DetectorMetrics>;
+}
+
+export interface PairedDelta {
+  delta: number | null;
+  ci95: [number, number] | null;
+  p_better: number | null;
+  n_users: number;
+  n_improved: number;
+  n_worse: number;
+}
+
+export interface AdaptationGroup {
+  mean_ndcg10: Record<string, number | null>;
+  mean_recall10: Record<string, number | null>;
+  vs_standard: Record<string, { ndcg10: PairedDelta; recall10: PairedDelta }>;
+}
+
+export interface DriftEvalReport {
+  run: string;
+  model_version: string | null;
+  dataset_version: string | null;
+  drift_config?: Record<string, unknown>;
+  strategy_config?: Record<string, unknown>;
+  detector: {
+    n_users: number;
+    modes: Record<string, { negatives_tested: number; by_splice_size: Record<string, DetectorSplice> }>;
+    seconds?: number;
+    notes?: string[];
+  };
+  adaptation: {
+    protocol: string;
+    n_users: number;
+    group_sizes: Record<string, number>;
+    settings: Record<string, Record<string, AdaptationGroup>>;
+    seconds?: number;
+  };
+  latency?: Record<string, Record<string, number | string>>;
+  notes?: string[];
+  seconds?: number;
+}
+
+/** GET /intel/evaluation/drift (movie) */
+export interface DriftEvalResponse {
+  available: boolean;
+  run_dir: string | null;
+  report: DriftEvalReport | null;
+  domain?: string;
 }
 
 /** GET /admin/metrics: in-process counters. Only the groups are named by the contract. */
@@ -724,10 +903,16 @@ export interface ServedRecommendation {
   reason: string;
   reason_code: string;
   created_at: string;
+  /** v1.2 */
+  decision_id?: string | null;
+  strategy?: string | null;
 }
 
 /** GET /intel/recommendations: recommender monitoring. */
 export interface RecommenderMonitoring {
+  /** v1.2: served rows per strategy ("unrecorded" for rows from before strategies) */
+  strategies?: Record<string, number>;
+  domain?: string;
   model_version: string | null;
   calibration: RecCalibration | null;
   served: { total: number; per_day: { date: string; count: number }[] };
@@ -772,5 +957,201 @@ export interface EvaluationRunSummary {
 /** GET /intel/evaluation/runs */
 export interface EvaluationRunList {
   items: EvaluationRunSummary[];
+  total: number;
+}
+
+// ---- v1.2: platform domains and user intelligence (platform.md §8–§10) ------------------------
+
+/** What a domain adapter produces. Movie-only stages are false (or absent) for other domains. */
+export interface DomainCapabilities {
+  recommendation?: boolean;
+  user_intelligence?: boolean;
+  lapse?: boolean;
+  raters?: boolean;
+  model_governance?: boolean;
+  scenarios?: boolean;
+}
+
+export type DomainCapability = keyof DomainCapabilities;
+
+export interface DomainSource extends DataSource {
+  license?: string | null;
+  url?: string | null;
+  checksum?: string | null;
+}
+
+/** One adapter in GET /intel/domains. */
+export interface DomainInfo {
+  key: string;
+  name: string;
+  description: string;
+  entity_types: string[];
+  frequency: string;
+  sources: DomainSource[];
+  capabilities: DomainCapabilities;
+  available: boolean;
+  /** why the adapter cannot load on this machine; null when available */
+  reason: string | null;
+  latest_run: Run | null;
+  warnings_open: number;
+}
+
+/** GET /intel/domains */
+export interface DomainList {
+  items: DomainInfo[];
+}
+
+/** The early_warning_level decision's answers, least to most severe (platform.md §4). */
+export type EarlyWarningLevel = "NO_ACTION" | "MONITOR" | "WARNING" | "URGENT_ACTION";
+
+/** recommendation_strategy decision answers (platform.md §4). */
+export type RecommendationStrategy = "standard" | "adapt_to_recent" | "explore";
+
+/** A recommendation downstream of a decision (platform.md §2, §10). */
+export interface EngineRecommendation {
+  item_id: number | string;
+  title?: string | null;
+  rank: number;
+  score: number;
+  reason: string;
+  confidence: number | null;
+  confidence_kind?: ConfidenceKind | null;
+  /** the decision this recommendation is downstream of */
+  decision_id: string | null;
+  strategy?: string | null;
+  evidence: Evidence[];
+}
+
+export interface TimeWindow {
+  start: string | null;
+  end: string | null;
+  n: number;
+}
+
+export interface PreferenceWindow extends TimeWindow {
+  /** "historical", "recent" or a period label */
+  label: string;
+  /** category → share of the window's events (0..1) */
+  shares: Record<string, number>;
+}
+
+export interface PreferenceHistory {
+  categories: string[];
+  windows: PreferenceWindow[];
+}
+
+export type DriftAspectName =
+  | "genre_distribution"
+  | "rating_level"
+  | "activity_rate"
+  | "release_year"
+  | "content_similarity"
+  | "acceptance";
+
+export interface DriftAspect {
+  aspect: DriftAspectName | string;
+  status: "ok" | "insufficient_data";
+  test: string;
+  statistic: number | null;
+  p_value: number | null;
+  /** Holm-adjusted across aspects */
+  p_adjusted: number | null;
+  significant: boolean;
+  effect: Record<string, unknown>;
+  detail: string | null;
+}
+
+export interface DriftReport {
+  status: "ok" | "insufficient_data";
+  drift_detected: boolean;
+  /** 1 − the smallest adjusted p; `confidence_kind` is "evidence", never a probability */
+  confidence: number | null;
+  confidence_kind: "evidence";
+  historical_window: TimeWindow;
+  recent_window: TimeWindow;
+  aspects: DriftAspect[];
+  summary: string;
+  evidence: Evidence[];
+}
+
+/** GET /me/intelligence */
+export interface MeIntelligence {
+  user_id: number;
+  as_of: string;
+  profile: { n_events: number; first_event: string | null; last_event: string | null };
+  preference_history: PreferenceHistory;
+  drift: DriftReport;
+  /** spec_id "recommendation_strategy"; options standard | adapt_to_recent | explore */
+  strategy: Decision;
+  signals: Signal[];
+  recommendations: EngineRecommendation[];
+}
+
+export type PreferenceScenarioKind = "continue" | "accelerate" | "reverse";
+
+export interface PreferenceScenarioSpec {
+  name: string;
+  kind: PreferenceScenarioKind;
+  factor: number;
+}
+
+/** POST /me/intelligence/scenarios body */
+export interface PreferenceScenarioRequest {
+  k: number;
+  scenarios: PreferenceScenarioSpec[];
+}
+
+export interface ProjectedShare {
+  mean: number;
+  lo80: number;
+  hi80: number;
+}
+
+export interface PreferenceScenarioResult {
+  name: string;
+  kind: PreferenceScenarioKind | string;
+  assumptions: string[];
+  projected_shares: Record<string, ProjectedShare>;
+  recommendations: EngineRecommendation[];
+  /** share of the baseline list that is also in this scenario's list (0..1) */
+  overlap_with_baseline: number;
+}
+
+/** POST /me/intelligence/scenarios response */
+export interface PreferenceScenarioResponse {
+  as_of: string;
+  assumptions: string[];
+  uncertainty_note: string;
+  baseline: { shares: Record<string, number>; recommendations: EngineRecommendation[] };
+  scenarios: PreferenceScenarioResult[];
+  evidence: Evidence[];
+}
+
+export type MeFeedbackTarget = "strategy" | "recommendation";
+export type MeVerdict = "accepted" | "rejected";
+
+/** POST /me/intelligence/feedback body */
+export interface MeFeedbackIn {
+  target_type: MeFeedbackTarget;
+  target_id: string;
+  verdict: MeVerdict;
+  note: string | null;
+}
+
+export interface MeFeedbackRecord {
+  id: number;
+  target_type: MeFeedbackTarget;
+  target_id: string;
+  verdict: MeVerdict;
+  note?: string | null;
+  /** the strategy decision the verdict was given under */
+  decision_id?: string | null;
+  created_at: string;
+  updated_at?: string | null;
+}
+
+/** GET /me/intelligence/feedback: the caller's verdicts, newest first */
+export interface MeFeedbackList {
+  items: MeFeedbackRecord[];
   total: number;
 }

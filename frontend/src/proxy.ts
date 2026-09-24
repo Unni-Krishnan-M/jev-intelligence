@@ -12,7 +12,7 @@ import { buildCsp, HSTS, newNonce } from "@/lib/csp";
  * 3. Optimistic route guard: only checks that a session cookie exists. The API still verifies the
  *    JWT on every request, and client pages handle a 401 by sending the user to /login.
  */
-const PROTECTED = ["/home", "/onboarding", "/recommendations", "/profile", "/history", "/favorites", "/admin", "/intel"];
+const PROTECTED = ["/home", "/onboarding", "/recommendations", "/profile", "/history", "/favorites", "/admin", "/intel", "/me"];
 const AUTH_PAGES = ["/login", "/register"];
 const COOKIE = "jev_session";
 

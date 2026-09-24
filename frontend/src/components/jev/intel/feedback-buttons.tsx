@@ -4,6 +4,7 @@ import { Check, Flag, ThumbsDown, ThumbsUp, X } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 
+import { useIntelDomain } from "@/components/jev/intel/domain-context";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { api, errorMessage } from "@/lib/api";
@@ -42,6 +43,7 @@ export function FeedbackButtons({
   const [sent, setSent] = useState<Verdict | null>(null);
   const [note, setNote] = useState("");
   const revalidate = useIntelRevalidate();
+  const { q: dq } = useIntelDomain();
 
   async function send(verdict: Verdict) {
     setSent(verdict);
@@ -54,7 +56,7 @@ export function FeedbackButtons({
       outcome: noteField === "outcome" ? text : null,
     };
     try {
-      await api<FeedbackRecord>("/intel/feedback", { json: body });
+      await api<FeedbackRecord>(dq("/intel/feedback"), { json: body });
       toast.success(`Recorded: ${VERDICT_META[verdict].label.toLowerCase()}`);
       void revalidate();
     } catch (e) {

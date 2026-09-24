@@ -161,6 +161,25 @@ class RecommendationItem(BaseModel):
     # calibrated P(rating >= 4) (docs/intelligence.md, section 9.2); null without a calibration
     confidence: float | None = None
     confidence_kind: Literal["probability"] | None = None
+    # v1.2: the recommendation_strategy decision the item was served under
+    decision_id: str | None = None
+    strategy: str | None = None
+
+
+class RecIntelligence(BaseModel):
+    """GET /recommendations -> intelligence (docs/platform.md, section 10)."""
+
+    decision_id: str
+    # the decision's answer; null when it abstained (then `served_strategy` is "standard")
+    strategy: str | None
+    served_strategy: str
+    confidence: float | None
+    confidence_kind: str
+    abstained: bool
+    drift_detected: bool | None
+    summary: str | None
+    policy_version: str | None = None
+    evidence: list[dict[str, Any]] = []
 
 
 class RecommendationResponse(BaseModel):
@@ -173,6 +192,7 @@ class RecommendationResponse(BaseModel):
     effective_weights: dict[str, float]
     profile: dict[str, int]
     cached: bool = False
+    intelligence: RecIntelligence | None = None
 
 
 class SimpleRecItem(BaseModel):
@@ -293,16 +313,24 @@ class IntelPage(BaseModel):
     offset: int
     run_id: str | None
     as_of: str | None
+    domain: str = "movie"
+
+
+DomainKey = Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9:_-]{0,63}$")]
 
 
 class RunTrigger(BaseModel):
-    # "YYYY-MM-DD" (UTC midnight) or a full ISO timestamp; omitted = the last MovieLens event
+    # v1.2: the domain adapter to run ("movie" when omitted, or ?domain=)
+    domain: DomainKey | None = None
+    # "YYYY-MM-DD" (UTC midnight) or a full ISO timestamp; omitted = the domain's default (movie: the
+    # last MovieLens event; generic: now)
     as_of: str | None = Field(default=None, max_length=40)
 
 
 class IntelRunOut(BaseModel):
     id: int
     run_id: str
+    domain: str = "movie"
     trigger: str
     status: str
     as_of: str | None
@@ -354,6 +382,10 @@ class IntelWarningOut(BaseModel):
     reopened_from: int | None
     suppressed_until: str | None = None
     history: list[WarningEventOut] | None = None
+    # v1.2 (docs/platform.md, section 4)
+    domain: str = "movie"
+    decision_id: str | None = None
+    early_warning_level: str | None = None
 
 
 class IntelWarningList(BaseModel):
@@ -376,6 +408,7 @@ class DecisionFeedbackCounts(BaseModel):
 class IntelDecisionOut(BaseModel):
     id: str
     key: str
+    domain: str = "movie"
     spec_id: str
     policy_version: str
     question: str
@@ -420,6 +453,7 @@ class IntelFeedbackIn(BaseModel):
 
 class IntelFeedbackOut(BaseModel):
     id: int
+    domain: str = "movie"
     target_type: str
     target_id: str
     verdict: str
@@ -461,6 +495,7 @@ class ScenarioRequest(BaseModel):
 
 class SavedScenarioOut(BaseModel):
     id: int
+    domain: str = "movie"
     title: str
     series_id: str
     created_at: str
@@ -499,6 +534,7 @@ class IntelEvidencePage(BaseModel):
     offset: int
     run_id: str | None
     as_of: str | None
+    domain: str = "movie"
 
 
 class HistoryPoint(BaseModel):
@@ -517,12 +553,14 @@ class IntelHistory(BaseModel):
     entity: str
     key: str
     items: list[HistoryPoint]
+    domain: str = "movie"
 
 
 class DecisionBatchList(BaseModel):
     items: list[dict[str, Any]]
     run_id: str
     as_of: str | None
+    domain: str = "movie"
 
 
 class AuditEntryOut(BaseModel):
@@ -556,6 +594,44 @@ class EvaluationRunOut(BaseModel):
 class EvaluationRunList(BaseModel):
     items: list[EvaluationRunOut]
     total: int
+
+
+# --- v1.2: per-member intelligence (docs/platform.md, sections 8 and 10) -----------------------------
+class MeScenarioSpec(BaseModel):
+    # kind-specific factor ranges are validated by user_preference_scenarios (ValueError -> 422)
+    model_config = ConfigDict(extra="ignore")  # unknown keys are dropped, never stored
+
+    name: str | None = Field(default=None, max_length=80)
+    kind: Literal["continue", "accelerate", "reverse"]
+    factor: float | None = Field(default=None, allow_inf_nan=False, ge=-100, le=100)
+
+
+class MeScenarioRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")  # unknown keys are dropped, never stored
+
+    k: int = Field(default=10, ge=1, le=50)
+    scenarios: list[MeScenarioSpec] = Field(default_factory=list, max_length=4)
+
+
+class MeFeedbackIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")  # unknown keys are dropped, never stored
+
+    target_type: Literal["strategy", "recommendation"]
+    # a strategy decision id ("dec-...") or a recommended item (movie) id
+    target_id: str = Field(min_length=1, max_length=64)
+    verdict: Literal["accepted", "rejected"]
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class MeFeedbackOut(BaseModel):
+    id: int
+    target_type: str
+    target_id: str
+    verdict: str
+    note: str | None = None
+    decision_id: str | None = None
+    created_at: str
+    updated_at: str | None = None
 
 
 TokenResponse.model_rebuild()

@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.2.0 — 2026-09-24
+JEV becomes a domain-independent decision and early-warning engine. The movie recommender is now its first domain adapter.
+### Added
+- **JEV core** (`ml/jev_ml/core`), which never imports recommender code: typed records, the `DomainAdapter` protocol,
+  a series builder driven by `SeriesSpec`s, and `run_domain(adapter, as_of, …)`.
+- **Early-warning decision** `early_warning_level` (`NO_ACTION | MONITOR | WARNING | URGENT_ACTION`, policy
+  `ewl-1.0.0`). It is monotone, has a margin confidence and abstains on skipped evidence. Warnings are raised only
+  from it and carry `decision_id`.
+- **Generic structured-dataset adapter**: any long CSV + YAML config. The demo domain `generic:us-unemployment`
+  covers BLS rates via FRED (public domain) and is fetched with checksums by `scripts/download_domain_data.py`.
+  Publication lag is modelled for replays.
+- **Preference drift** (`core/drift.py`): day-level permutation tests across six aspects with Holm correction.
+  - **Per-member recommendation strategy decision:** `standard | adapt_to_recent | explore`. Recommendations are
+    served downstream of it.
+  - **Per-member preference what-if:** real model rankings under projected preferences.
+- **Evaluations**, all with real experiments:
+  - per-domain forecasts (MAE, RMSE, coverage);
+  - warning precision and false-positive rate from monthly leak-free replays;
+  - early-warning decision flip rate;
+  - drift precision and recall on labelled splices of real histories;
+  - drift adaptation effect on NDCG@10.
+- **Web app** reorganised around the engine: platform landing page, Intelligence-first navigation with Movies as one
+  domain, a console domain switcher with capability gating, a four-level early-warning decision view, and a new
+  "My intelligence" page.
+- `npm run dev` starts the API and the web app together.
+### Changed
+- `jev_ml.intel.run_pipeline` is a compatibility shim over `run_domain(MovieAdapter)`. Movie outputs are unchanged
+  (golden tests on synthetic and real data), apart from the additional early-warning decisions and batch.
+
 ## 1.1.0 — 2026-09-23
 ### Added
 - Intelligence & early-warning layer (`ml/jev_ml/intel`), run leak-free as of any date:

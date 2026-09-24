@@ -10,6 +10,11 @@ The pipeline itself (ml/jev_ml/intel) is pure. This module owns everything state
 - a small cache of parsed run results, so list endpoints do not re-read ~0.5 MB of JSON per call.
 
 Pipeline failures are recorded on the run row and never propagate to the API.
+
+v1.2 (docs/platform.md): every run belongs to a domain adapter. The movie domain keeps the input path
+above (processed MovieLens files + the app DB); a generic domain (``generic:<name>``) is loaded by its
+adapter (``jev_ml.domains.get_adapter``) from its configured dataset. Runs, decisions, warnings,
+scenarios and operator feedback carry the domain; warning upserts and suppression are per domain.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -35,6 +41,7 @@ from jev_api.config import Settings
 from jev_api.db import SessionLocal
 from jev_api.metrics import metrics
 from jev_api.models import (
+    DEFAULT_DOMAIN,
     WARNING_OPEN_STATUSES,
     IntelAnomalyRow,
     IntelDecision,
@@ -53,10 +60,18 @@ from jev_api.models import (
 from jev_api.services import audit
 from jev_api.services.feedback import latest_feedback
 from jev_api.services.ml import EngineHolder
+from jev_ml.core import run_domain
+from jev_ml.core.quality import to_epoch
+from jev_ml.core.scenario import run_scenario as core_run_scenario
+from jev_ml.domains import available as registry_available
+from jev_ml.domains import get_adapter
+from jev_ml.domains.movie import INFO as MOVIE_INFO
+from jev_ml.domains.movie import available as movie_available
 from jev_ml.intel import PIPELINE_VERSION, IntelConfig, PipelineInputs, load_default_inputs, run_pipeline
 from jev_ml.intel.config import severity_rank
 from jev_ml.intel.pipeline import PipelineResult
 from jev_ml.intel.scenario import run_scenario
+from jev_ml.paths import ROOT
 
 log = logging.getLogger(__name__)
 
@@ -70,6 +85,8 @@ TRANSITIONS: dict[str, tuple[str, ...]] = {
 }
 RESULT_CACHE_SIZE = 4
 DAY_S = 86400.0
+DOMAIN_CACHE_SECONDS = 30.0  # the registry parses configs/domains/*.yaml; reads re-check this often
+DOMAIN_PATTERN = r"^[a-z0-9][a-z0-9:_-]{0,63}$"
 
 
 class IntelBusyError(Exception):
@@ -82,6 +99,19 @@ class IntelInputError(ValueError):
 
 class InvalidTransitionError(Exception):
     pass
+
+
+class UnknownDomainError(LookupError):
+    """No adapter with this key is registered (HTTP 404)."""
+
+
+class DomainUnavailableError(Exception):
+    """The adapter is registered but cannot load on this machine (HTTP 409, with its reason)."""
+
+    def __init__(self, key: str, reason: str | None) -> None:
+        self.key = key
+        self.reason = reason or "the domain's data is not available"
+        super().__init__(f"domain {key!r} is unavailable: {self.reason}")
 
 
 def iso(dt: datetime | None) -> str | None:
@@ -130,6 +160,7 @@ def run_out(run: IntelRun) -> dict[str, Any]:
     return {
         "id": run.id,
         "run_id": run.run_id,
+        "domain": run.domain,
         "trigger": run.trigger,
         "status": run.status,
         "as_of": iso(run.as_of or run.requested_as_of),
@@ -159,6 +190,7 @@ def warning_out(w: IntelWarning, history: bool = False) -> dict[str, Any]:
     out: dict[str, Any] = {
         "id": w.id,
         "key": w.key,
+        "domain": w.domain,
         "title": w.title,
         "description": w.description,
         "severity": w.severity,
@@ -179,6 +211,9 @@ def warning_out(w: IntelWarning, history: bool = False) -> dict[str, Any]:
         "last_seen_run_id": w.last_seen_run_id,
         "reopened_from": w.reopened_from,
         "suppressed_until": iso(w.suppressed_until),
+        # v1.2 (docs/platform.md, section 4): the early_warning_level decision it is downstream of
+        "decision_id": w.decision_id,
+        "early_warning_level": w.early_warning_level,
     }
     if history:
         out["history"] = [event_out(e) for e in w.events]
@@ -192,6 +227,7 @@ def decision_out(d: IntelDecision, feedback: dict[str, int] | None = None) -> di
     return {
         "id": d.decision_id,
         "key": d.key,
+        "domain": d.domain,
         "spec_id": d.spec_id,
         "policy_version": d.policy_version,
         "question": d.question,
@@ -410,13 +446,64 @@ class IntelService:
         self.engines = engines
         self.cache = cache
         self.config = IntelConfig()
+        # one run at a time across every domain: a run is CPU-bound and short (about 1 s)
         self._lock = threading.Lock()
         self._results_lock = threading.Lock()
         self._results: OrderedDict[str, dict[str, Any]] = OrderedDict()
-        # the latest run's PipelineResult object: scenarios reuse its fitted series and models
-        self._latest_obj: tuple[str, PipelineResult] | None = None
+        # the latest run's PipelineResult per domain: scenarios reuse its fitted series and models
+        self._latest_obj: dict[str, tuple[str, PipelineResult]] = {}
         # replaced in tests with a synthetic dataset; takes the requested as_of (or None)
         self.inputs_factory: Callable[[datetime | None], PipelineInputs] = self._file_inputs
+        # where configs/domains/*.yaml (and the relative dataset paths in them) live; tests point it
+        # at a temporary directory
+        self.domains_root: Path = ROOT
+        self._domains_lock = threading.Lock()
+        self._domains: tuple[float, list[dict[str, Any]]] | None = None
+
+    # ---- domains (docs/platform.md, section 3) ----------------------------------------------------
+    def _movie_availability(self) -> tuple[bool, str | None]:
+        if self.inputs_factory != self._file_inputs:  # an injected dataset (tests, scripts)
+            return True, None
+        return movie_available(self.settings.processed_dir)
+
+    def domains(self, refresh: bool = False) -> list[dict[str, Any]]:
+        """Every registered adapter: DomainInfo fields + available + reason (cached briefly)."""
+        with self._domains_lock:
+            hit = self._domains
+            if not refresh and hit is not None and time.monotonic() - hit[0] < DOMAIN_CACHE_SECONDS:
+                return hit[1]
+        ok, reason = self._movie_availability()
+        items: list[dict[str, Any]] = [{**MOVIE_INFO.to_dict(), "available": ok, "reason": reason}]
+        try:
+            items += [d for d in registry_available(self.domains_root) if d.get("key") != DEFAULT_DOMAIN]
+        except Exception:  # the registry lists broken configs itself; never let it take reads down
+            log.exception("domain registry failed")
+        with self._domains_lock:
+            self._domains = (time.monotonic(), items)
+        return items
+
+    def invalidate_domains(self) -> None:
+        with self._domains_lock:
+            self._domains = None
+
+    def domain(self, key: str) -> dict[str, Any]:
+        for d in self.domains():
+            if d.get("key") == key:
+                return d
+        raise UnknownDomainError(f"unknown domain {key!r}")
+
+    def require_available(self, key: str) -> dict[str, Any]:
+        info = self.domain(key)
+        if key == DEFAULT_DOMAIN:  # re-check: the injected factory may have changed
+            ok, reason = self._movie_availability()
+            info = {**info, "available": ok, "reason": reason}
+        if not info.get("available"):
+            raise DomainUnavailableError(key, info.get("reason"))
+        return info
+
+    def adapter(self, key: str) -> Any:
+        """The generic adapter of `key` (the movie domain runs through gather_inputs instead)."""
+        return get_adapter(key, root=self.domains_root)
 
     # ---- inputs ---------------------------------------------------------------------------------
     def _file_inputs(self, as_of: datetime | None) -> PipelineInputs:
@@ -427,11 +514,13 @@ class IntelService:
             experiments_dir=self.settings.experiments_dir,
         )
 
-    def suppressed_keys(self, db: Session, now: datetime) -> dict[str, str]:
-        """Keys whose latest warning was dismissed and is still inside its suppression window,
-        mapped to the severity at dismissal (a higher severity later counts as an escalation)."""
+    def suppressed_keys(self, db: Session, now: datetime, domain: str = DEFAULT_DOMAIN) -> dict[str, str]:
+        """Keys (of `domain`) whose latest warning was dismissed and is still inside its suppression
+        window, mapped to the severity at dismissal (a higher severity later counts as an escalation)."""
         latest: dict[str, IntelWarning] = {}
-        for w in db.scalars(select(IntelWarning).order_by(IntelWarning.id)):
+        for w in db.scalars(
+            select(IntelWarning).where(IntelWarning.domain == domain).order_by(IntelWarning.id)
+        ):
             latest[w.key] = w
         out: dict[str, str] = {}
         for key, w in latest.items():
@@ -452,7 +541,7 @@ class IntelService:
         inputs.app_feedback = pd.DataFrame(feedback, columns=["feedback", "timestamp"])
         served = db.execute(select(Recommendation.movie_id, Recommendation.created_at)).all()
         inputs.app_served = pd.DataFrame(served, columns=["movie_id", "timestamp"])
-        inputs.suppressed_keys = self.suppressed_keys(db, now)
+        inputs.suppressed_keys = self.suppressed_keys(db, now, DEFAULT_DOMAIN)
         metrics.set("intel_warnings", "suppressed_keys", len(inputs.suppressed_keys))
         return inputs
 
@@ -471,56 +560,103 @@ class IntelService:
             hi = datetime.fromtimestamp(last, UTC).date()
             raise IntelInputError(f"as_of must be between {lo} and {hi} (the MovieLens data range)")
 
+    @staticmethod
+    def check_generic_as_of(adapter: Any, as_of: datetime | None, now: datetime) -> None:
+        """A generic replay date lies between the dataset's first observation and today (a date after
+        the last observation is allowed: the run then reports the source as stale)."""
+        if as_of is None:
+            return
+        if as_of > now:
+            raise IntelInputError("as_of is in the future")
+        column = adapter.cfg.columns["timestamp"]
+        raw = adapter._raw()
+        if column not in raw.columns:
+            raise IntelInputError(f"the {adapter.info.name} dataset has no {column!r} column")
+        ts = to_epoch(raw[column]).dropna()
+        if not len(ts):
+            raise IntelInputError(f"no {adapter.info.name} observations to replay")
+        first = float(ts.min())
+        if as_of.timestamp() < first:
+            lo = datetime.fromtimestamp(first, UTC).date()
+            last = datetime.fromtimestamp(float(ts.max()), UTC).date()
+            raise IntelInputError(
+                f"as_of must be between {lo} and today (the {adapter.info.name} data covers {lo} to {last})"
+            )
+
     # ---- runs -----------------------------------------------------------------------------------
-    def run(self, trigger: str, as_of: str | datetime | None = None, user: User | None = None) -> IntelRun:
-        """Run the pipeline synchronously and persist it. Raises IntelBusyError / IntelInputError only;
-        every other failure is recorded on the returned (failed) run."""
+    def run(
+        self,
+        trigger: str,
+        as_of: str | datetime | None = None,
+        user: User | None = None,
+        domain: str = DEFAULT_DOMAIN,
+    ) -> IntelRun:
+        """Run the pipeline of `domain` synchronously and persist it. Raises IntelBusyError /
+        IntelInputError / UnknownDomainError / DomainUnavailableError only; every other failure is
+        recorded on the returned (failed) run."""
         requested = parse_as_of(as_of)
+        self.require_available(domain)
         if not self._lock.acquire(blocking=False):
             raise IntelBusyError("an intelligence run is already in progress")
         metrics.set("intel_pipeline", "in_progress", True)
         try:
             with SessionLocal() as db:
-                return self._run_locked(db, trigger, requested, user)
+                return self._run_locked(db, trigger, requested, user, domain)
         finally:
             metrics.set("intel_pipeline", "in_progress", False)
             self._lock.release()
 
     def _run_locked(
-        self, db: Session, trigger: str, requested: datetime | None, user: User | None
+        self, db: Session, trigger: str, requested: datetime | None, user: User | None, domain: str
     ) -> IntelRun:
         now = datetime.now(UTC)
         t0 = time.perf_counter()
+        movie = domain == DEFAULT_DOMAIN
+        inputs: PipelineInputs | None = None
+        adapter: Any = None
+        suppressed: dict[str, str] = {}
+        error: str | None = None
+        try:
+            if movie:
+                inputs = self.gather_inputs(db, requested, now)
+                self.check_as_of(inputs, requested, now)
+            else:
+                adapter = self.adapter(domain)
+                self.check_generic_as_of(adapter, requested, now)
+                suppressed = self.suppressed_keys(db, now, domain)
+        except IntelInputError:
+            raise
+        except Exception as exc:
+            log.exception("intelligence inputs failed to load", extra={"extra_fields": {"domain": domain}})
+            error = safe_error(exc, "loading inputs failed")
         run = IntelRun(
             run_id=str(uuid.uuid4()),
+            domain=domain,
             trigger=trigger,
             status="running",
             requested_as_of=requested,
             started_at=now,
-            pipeline_version=PIPELINE_VERSION,
+            pipeline_version=PIPELINE_VERSION if movie else str(getattr(adapter, "pipeline_version", "core")),
             stage_ms={},
             created_by_id=user.id if user else None,
         )
-        inputs: PipelineInputs | None = None
-        error: str | None = None
-        try:
-            inputs = self.gather_inputs(db, requested, now)
-            self.check_as_of(inputs, requested, now)
-        except IntelInputError:
-            raise
-        except Exception as exc:
-            log.exception("intelligence inputs failed to load")
-            error = safe_error(exc, "loading inputs failed")
         load_ms = round(1000 * (time.perf_counter() - t0), 2)
         metrics.inc("intel_pipeline", f"runs_{trigger}")
         db.add(run)
         db.commit()
         result: PipelineResult | None = None
-        if inputs is not None and error is None:
+        if error is None:
             try:
-                result = run_pipeline(inputs, self.config)
+                if movie:
+                    assert inputs is not None
+                    result = run_pipeline(inputs, self.config)
+                else:
+                    result = run_domain(adapter, as_of=requested, now=now, suppressed_keys=suppressed)
             except Exception as exc:
-                log.exception("intelligence pipeline failed", extra={"extra_fields": {"run_id": run.run_id}})
+                log.exception(
+                    "intelligence pipeline failed",
+                    extra={"extra_fields": {"run_id": run.run_id, "domain": domain}},
+                )
                 error = safe_error(exc)
         if result is not None:
             t1 = time.perf_counter()
@@ -534,7 +670,7 @@ class IntelService:
                 self._audit_run(db, run, user, persisted)
                 db.commit()
                 self._record_persisted(persisted)
-                self._remember(run.run_id, data, result)
+                self._remember(run.run_id, data, result, domain)
             except Exception as exc:
                 db.rollback()
                 log.exception(
@@ -557,6 +693,7 @@ class IntelService:
             extra={
                 "extra_fields": {
                     "run_id": run.run_id,
+                    "domain": domain,
                     "trigger": trigger,
                     "status": run.status,
                     "as_of": iso(run.as_of or run.requested_as_of),
@@ -577,6 +714,7 @@ class IntelService:
             "intel_run",
             run.run_id,
             {
+                "domain": run.domain,
                 "trigger": run.trigger,
                 "status": run.status,
                 "requested_as_of": iso(run.requested_as_of),
@@ -597,12 +735,15 @@ class IntelService:
 
     def _record_metrics(self, run: IntelRun) -> None:
         metrics.inc("intel_pipeline", run.status)
+        metrics.inc("intel_runs_by_domain", f"{run.domain}:{run.status}")
         metrics.set("intel_pipeline", "last_status", run.status)
         metrics.set("intel_pipeline", "last_run_id", run.run_id)
+        metrics.set("intel_pipeline", "last_domain", run.domain)
         metrics.set("intel_pipeline", "last_duration_ms", run.duration_ms)
         metrics.set("intel_pipeline", "last_finished_at", iso(run.finished_at))
         if run.duration_ms is not None:
             metrics.observe("intel_pipeline_ms", run.status, run.duration_ms)
+            metrics.observe("intel_pipeline_ms_by_domain", run.domain, run.duration_ms)
         if run.status == "succeeded":
             for stage, ms in (run.stage_ms or {}).items():
                 if isinstance(ms, int | float):
@@ -618,6 +759,8 @@ class IntelService:
         run.as_of = parse_as_of(info["as_of"])
         run.data_version = _cut(info.get("data_version"), 120)
         run.model_version = _cut(info.get("model_version"), 80)
+        if info.get("pipeline_version"):
+            run.pipeline_version = str(info["pipeline_version"])[:40]
         run.summary = data.get("summary")
         run.result = data
         as_of = run.as_of or now
@@ -627,6 +770,7 @@ class IntelService:
             db.add(
                 IntelDecision(
                     run_id=run.run_id,
+                    domain=run.domain,
                     decision_id=str(d["id"])[:40],
                     key=str(d["key"])[:64],
                     spec_id=str(d.get("spec_id") or d["key"])[:64],
@@ -675,21 +819,26 @@ class IntelService:
         w.source = c.get("source") or {}
         w.entity_type = _cut(c.get("entity_type"), 32)
         w.entity = _cut(c.get("entity"), 200)
+        w.decision_id = _cut(c.get("decision_id"), 40)
+        w.early_warning_level = _cut(c.get("early_warning_level"), 16)
 
     def _upsert_warnings(
         self, db: Session, run: IntelRun, candidates: list[dict[str, Any]], now: datetime
     ) -> None:
-        """Lifecycle rules (docs/intelligence.md, section 5):
+        """Lifecycle rules (docs/intelligence.md, section 5), within the run's domain:
         - an open warning with the same key is updated (last_seen, occurrences, severity, evidence),
         - a key dismissed within suppress_days stays quiet unless the severity escalated,
         - a resolved (or expired/escalated dismissed) key that fires again opens a new warning with
           reopened_from pointing at the previous one."""
         as_of = iso(run.as_of)
+        domain = run.domain
         for c in candidates:
             key = str(c["key"])[:200]
             open_w = db.scalar(
                 select(IntelWarning).where(
-                    IntelWarning.key == key, IntelWarning.status.in_(WARNING_OPEN_STATUSES)
+                    IntelWarning.domain == domain,
+                    IntelWarning.key == key,
+                    IntelWarning.status.in_(WARNING_OPEN_STATUSES),
                 )
             )
             if open_w is not None:
@@ -702,7 +851,10 @@ class IntelService:
                 metrics.inc("intel_warnings", "updated")
                 continue
             prev = db.scalar(
-                select(IntelWarning).where(IntelWarning.key == key).order_by(IntelWarning.id.desc()).limit(1)
+                select(IntelWarning)
+                .where(IntelWarning.domain == domain, IntelWarning.key == key)
+                .order_by(IntelWarning.id.desc())
+                .limit(1)
             )
             note = f"detected by run {run.run_id[:8]} (as of {as_of})"
             if prev is not None and prev.status == "dismissed":
@@ -722,6 +874,7 @@ class IntelService:
                 note = f"reopened: warning #{prev.id} was resolved and fired again (run {run.run_id[:8]})"
             w = IntelWarning(
                 key=key,
+                domain=domain,
                 status="new",
                 detected_at=now,
                 last_seen_at=now,
@@ -770,7 +923,14 @@ class IntelService:
             user,
             "intel_warning",
             w.id,
-            {"key": w.key, "from": w.status, "to": status, "note": note, "severity": w.severity},
+            {
+                "domain": w.domain,
+                "key": w.key,
+                "from": w.status,
+                "to": status,
+                "note": note,
+                "severity": w.severity,
+            },
         )
         w.status = status
         if status == "dismissed":
@@ -785,11 +945,20 @@ class IntelService:
 
     # ---- reading runs -------------------------------------------------------------------------------
     @staticmethod
-    def latest_run(db: Session, status: str | None = "succeeded") -> IntelRun | None:
+    def latest_run(
+        db: Session, status: str | None = "succeeded", domain: str | None = DEFAULT_DOMAIN
+    ) -> IntelRun | None:
+        """The newest run of `domain` (None: of any domain) with `status` (None: any status)."""
         q = select(IntelRun)
         if status:
             q = q.where(IntelRun.status == status)
+        if domain is not None:
+            q = q.where(IntelRun.domain == domain)
         return db.scalar(q.order_by(IntelRun.started_at.desc(), IntelRun.id.desc()).limit(1))
+
+    @staticmethod
+    def has_runs(db: Session, domain: str) -> bool:
+        return db.scalar(select(IntelRun.id).where(IntelRun.domain == domain).limit(1)) is not None
 
     def result_for(self, db: Session, run: IntelRun) -> dict[str, Any]:
         with self._results_lock:
@@ -801,33 +970,52 @@ class IntelService:
         self._remember(run.run_id, data)
         return data
 
-    def _remember(self, run_id: str, data: dict[str, Any], obj: PipelineResult | None = None) -> None:
+    def _remember(
+        self,
+        run_id: str,
+        data: dict[str, Any],
+        obj: PipelineResult | None = None,
+        domain: str = DEFAULT_DOMAIN,
+    ) -> None:
         with self._results_lock:
             self._results[run_id] = data
             self._results.move_to_end(run_id)
             while len(self._results) > RESULT_CACHE_SIZE:
                 self._results.popitem(last=False)
             if obj is not None:
-                self._latest_obj = (run_id, obj)
+                self._latest_obj[domain] = (run_id, obj)
 
     # ---- scenarios ----------------------------------------------------------------------------------
-    def scenario(self, db: Session, spec: dict[str, Any]) -> dict[str, Any]:
-        """run_scenario on the latest run (its fitted models when still in memory) or, with
+    def scenario(self, db: Session, spec: dict[str, Any], domain: str = DEFAULT_DOMAIN) -> dict[str, Any]:
+        """run_scenario on the domain's latest run (its fitted models when still in memory) or, with
         spec.as_of, on freshly prepared inputs at that date. ValueError -> 422 in the router."""
         now = datetime.now(UTC)
         as_of = parse_as_of(spec.pop("as_of", None))
-        latest = self.latest_run(db)
+        latest = self.latest_run(db, domain=domain)
         if as_of is None and latest is not None:
-            obj = self._latest_obj
+            obj = self._latest_obj.get(domain)
             if obj is not None and obj[0] == latest.run_id:
-                return run_scenario(obj[1], spec, self.config)
+                return (
+                    core_run_scenario(obj[1], spec)
+                    if domain != DEFAULT_DOMAIN
+                    else run_scenario(obj[1], spec, self.config)
+                )
             as_of = aware(latest.as_of)
-        inputs = self.gather_inputs(db, as_of, now)
-        self.check_as_of(inputs, as_of, now)
-        return run_scenario(inputs, spec, self.config)
+        self.require_available(domain)
+        if domain == DEFAULT_DOMAIN:
+            inputs = self.gather_inputs(db, as_of, now)
+            self.check_as_of(inputs, as_of, now)
+            return run_scenario(inputs, spec, self.config)
+        adapter = self.adapter(domain)
+        self.check_generic_as_of(adapter, as_of, now)
+        result = run_domain(
+            adapter, as_of=as_of, now=now, suppressed_keys=self.suppressed_keys(db, now, domain)
+        )
+        return core_run_scenario(result, spec)
 
     # ---- startup refresh ------------------------------------------------------------------------------
     def start_background_refresh(self) -> threading.Thread | None:
+        """Movie domain only (the other domains run on demand): never blocks startup."""
         if not self.settings.intel_run_on_startup:
             return None
         t = threading.Thread(target=self._startup_refresh, name="intel-startup", daemon=True)
@@ -846,13 +1034,16 @@ class IntelService:
             self.run("startup")
         except IntelBusyError:
             log.info("intelligence run already in progress; startup refresh skipped")
+        except DomainUnavailableError as exc:
+            log.warning("startup intelligence refresh skipped: %s", exc)
         except Exception:
             # never let a background refresh take the API down
             log.exception("startup intelligence refresh failed")
 
     # ---- observability ----------------------------------------------------------------------------------
     def metrics_snapshot(self, db: Session) -> dict[str, Any]:
-        """DB-derived gauges for GET /admin/metrics (the counters come from the registry)."""
+        """DB-derived gauges for GET /admin/metrics (the counters come from the registry). The v1.1
+        gauges describe the movie domain; `intel_domains` has one entry per registered domain."""
         latest = self.latest_run(db)
         decisions: dict[str, dict[str, int]] = {}
         freshness: dict[str, Any] = {}
@@ -873,6 +1064,16 @@ class IntelService:
                     "rows": s.get("rows"),
                 }
         open_by = self.open_warning_counts(db)
+        by_domain = self.open_warnings_by_domain(db)
+        domains: dict[str, Any] = {}
+        for d in self.domains():
+            run = self.latest_run(db, domain=d["key"])
+            domains[d["key"]] = {
+                "available": d.get("available"),
+                "latest_run_id": run.run_id if run else None,
+                "latest_as_of": iso(run.as_of) if run else None,
+                "warnings_open": by_domain.get(d["key"], 0),
+            }
         return {
             "intel_latest_run": {
                 "run_id": latest.run_id if latest else None,
@@ -882,16 +1083,28 @@ class IntelService:
             },
             "intel_decisions_latest_run": decisions,
             "intel_warnings_open": open_by,
+            "intel_domains": domains,
             "data_freshness": freshness,
         }
 
     @staticmethod
-    def open_warning_counts(db: Session) -> dict[str, Any]:
+    def open_warning_counts(db: Session, domain: str | None = None) -> dict[str, Any]:
+        """Open warnings by severity, of one domain (None: all domains)."""
         by = dict.fromkeys(("critical", "high", "medium", "low"), 0)
-        for sev, n in db.execute(
-            select(IntelWarning.severity, func.count())
-            .where(IntelWarning.status.in_(WARNING_OPEN_STATUSES))
-            .group_by(IntelWarning.severity)
-        ):
+        q = select(IntelWarning.severity, func.count()).where(IntelWarning.status.in_(WARNING_OPEN_STATUSES))
+        if domain is not None:
+            q = q.where(IntelWarning.domain == domain)
+        for sev, n in db.execute(q.group_by(IntelWarning.severity)):
             by[sev] = int(n)
         return {"total": sum(by.values()), "by_severity": by}
+
+    @staticmethod
+    def open_warnings_by_domain(db: Session) -> dict[str, int]:
+        return {
+            str(d): int(n)
+            for d, n in db.execute(
+                select(IntelWarning.domain, func.count())
+                .where(IntelWarning.status.in_(WARNING_OPEN_STATUSES))
+                .group_by(IntelWarning.domain)
+            )
+        }

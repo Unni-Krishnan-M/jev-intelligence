@@ -1,3 +1,5 @@
+import type { ConfidenceKind, Evidence } from "./intel-types";
+
 export type SignalName = "content" | "collaborative" | "latent" | "popularity" | "preference" | "recency";
 
 export interface SignalValue {
@@ -66,6 +68,9 @@ export interface RecItem {
   /** v1.1: calibrated P(the member rates this film >= 4); null without a calibration file */
   confidence?: number | null;
   confidence_kind?: "probability" | null;
+  /** v1.2: the strategy decision this item was served under */
+  decision_id?: string | null;
+  strategy?: string | null;
 }
 
 export interface RecResponse {
@@ -78,6 +83,24 @@ export interface RecResponse {
   effective_weights: Record<SignalName, number>;
   profile: { interactions: number; genres: number; excluded: number };
   cached: boolean;
+  /** v1.2 (platform.md §8): the strategy decision this list was produced under; absent on older APIs */
+  intelligence?: RecIntelligence | null;
+}
+
+/** GET /recommendations → intelligence: the recommendation_strategy decision behind the list. */
+export interface RecIntelligence {
+  decision_id: string;
+  /** standard | adapt_to_recent | explore; null when the decision abstained */
+  strategy: string | null;
+  /** what the list was actually produced under (standard when the decision abstained) */
+  served_strategy?: string | null;
+  abstained?: boolean;
+  policy_version?: string | null;
+  confidence: number | null;
+  confidence_kind: ConfidenceKind;
+  drift_detected: boolean | null;
+  summary: string | null;
+  evidence: Evidence[];
 }
 
 export interface SimpleItem {

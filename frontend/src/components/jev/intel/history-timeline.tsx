@@ -3,6 +3,7 @@
 import useSWR from "swr";
 
 import { RunTimeline, TableView } from "@/components/jev/intel/charts";
+import { useIntelDomain } from "@/components/jev/intel/domain-context";
 import { qs } from "@/lib/api";
 import { fmtDay, fmtValue, historyField, humanize, isNotDeployed } from "@/lib/intel";
 import type { HistoryEntity, HistoryResponse } from "@/lib/intel-types";
@@ -30,7 +31,8 @@ export function HistoryTimeline({
   quiet?: boolean;
   className?: string;
 }) {
-  const { data, error } = useSWR<HistoryResponse>(`/intel/history/${entity}${qs({ key: historyKey })}`, { shouldRetryOnError: false, revalidateOnFocus: false });
+  const { q: dq } = useIntelDomain();
+  const { data, error } = useSWR<HistoryResponse>(dq(`/intel/history/${entity}${qs({ key: historyKey })}`), { shouldRetryOnError: false, revalidateOnFocus: false });
   const items = data?.items ?? [];
   const field = historyField(items);
   if (items.length < 2 || !field) {

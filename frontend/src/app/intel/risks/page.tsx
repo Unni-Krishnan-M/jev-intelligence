@@ -5,6 +5,7 @@ import useSWR from "swr";
 import { Panel } from "@/components/jev/admin/ui";
 import { ConfidenceBadge, Meter, SeverityBadge } from "@/components/jev/intel/badges";
 import { RiskMatrix } from "@/components/jev/intel/charts";
+import { useIntelDomain } from "@/components/jev/intel/domain-context";
 import { EvidenceList } from "@/components/jev/intel/evidence-list";
 import { HistoryTimeline } from "@/components/jev/intel/history-timeline";
 import { PageHeader } from "@/components/jev/intel/page-header";
@@ -56,7 +57,8 @@ function Factors({ r }: { r: Risk }) {
 }
 
 export default function RisksPage() {
-  const { data, error, mutate } = useSWR<Page<Risk>>(`/intel/risks${qs({ limit: 100 })}`);
+  const { q: dq } = useIntelDomain();
+  const { data, error, mutate } = useSWR<Page<Risk>>(dq(`/intel/risks${qs({ limit: 100 })}`));
   const risks = [...(data?.items ?? [])].sort((a, b) => b.score - a.score);
 
   return (

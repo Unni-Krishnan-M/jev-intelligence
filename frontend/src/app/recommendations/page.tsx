@@ -11,6 +11,7 @@ import { Poster } from "@/components/jev/poster";
 import { SignalBar } from "@/components/jev/signal-bar";
 import { Container, EmptyState, ErrorState, PageHeader } from "@/components/jev/states";
 import { WhyDialog } from "@/components/jev/why-dialog";
+import { WhyThisList } from "@/components/jev/why-this-list";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
@@ -124,6 +125,8 @@ export default function RecommendationsPage() {
           </label>
         </div>
       </div>
+
+      <WhyThisList intel={data?.[0]?.intelligence} />
 
       <ul className="mb-2 flex flex-wrap gap-x-4 gap-y-1" aria-label="Signal legend">
         {SIGNALS.map((s) => (

@@ -1,10 +1,19 @@
-"""Serving logic shared by the recommendation endpoints: generate → enrich → persist → cache."""
+"""Serving logic shared by the recommendation endpoints: generate → enrich → persist → cache.
+
+v1.2 (docs/platform.md, section 4): GET /recommendations is downstream of the member's
+recommendation_strategy decision. The decision is taken first (cached per member, see
+services/user_intel.py), the list is served under the chosen strategy, the cache key carries the
+decision, and the response gains an `intelligence` block. A failing strategy step never fails the
+request: the list is then served as standard, without the block, and the failure is logged and counted.
+"""
 
 from __future__ import annotations
 
 import copy
 import hashlib
 import json
+import logging
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -14,10 +23,14 @@ from sqlalchemy.orm import Session
 
 from jev_api.cache import Cache
 from jev_api.config import get_settings
+from jev_api.metrics import metrics
 from jev_api.models import Movie, Recommendation, User
 from jev_api.services.profile import build_ml_profile, load_user_state
+from jev_api.services.user_intel import StrategyChoice, serve_engine, serve_profile, strategy_choice
 from jev_ml.engine import RecommendationEngine
 from jev_ml.models.hybrid import RecommendationFilters
+
+log = logging.getLogger(__name__)
 
 DIVERSITY_LAMBDA = {"focused": 1.0, "adventurous": 0.7}  # "balanced" = the model's tuned value
 CONFIDENCE_KINDS = ("probability",)  # recommendations.confidence_kind CHECK
@@ -67,16 +80,37 @@ def personalized(
     settings = get_settings()
     fkey = hashlib.sha256(json.dumps(filters.__dict__, sort_keys=True, default=str).encode()).hexdigest()[:12]
     diversity = (user.recommendation_prefs or {}).get("diversity", "balanced")
+    t0 = time.perf_counter()
+    choice: StrategyChoice | None = None
+    state = profile = None
+    try:
+        choice, state, profile = strategy_choice(db, cache, engine, user)
+    except Exception:
+        db.rollback()
+        metrics.inc("strategy_decisions", "errors")
+        log.exception(
+            "recommendation strategy failed; serving standard", extra={"extra_fields": {"user": user.id}}
+        )
+    strategy_ms = 1000 * (time.perf_counter() - t0)
+    metrics.observe("strategy_overhead_ms", "all", strategy_ms)
+    served = choice.served if choice is not None else "standard"
+    decision_id = choice.block["decision_id"] if choice is not None else None
     key = (
         f"rec:{user.id}:{user.profile_version}:{engine.version}:{diversity}:{context}:{limit}:{offset}:{fkey}"
+        f":{served}:{decision_id or '-'}"
     )
     cached = cache.get(key)
     if cached is not None:
         return {**cached, "cached": True}
 
-    state = load_user_state(db, user)
-    profile = build_ml_profile(engine, state)
+    if state is None:
+        state = load_user_state(db, user)
+    if profile is None:
+        profile = build_ml_profile(engine, state)
     eng = _engine_for_user(engine, user)
+    if choice is not None:
+        profile = serve_profile(profile, choice)
+        eng = serve_engine(eng, choice, user)
     recs = eng.recommend(profile, k=limit, offset=offset, filters=filters)
     movies = movie_briefs(db, [r.movie_id for r in recs])
 
@@ -96,6 +130,8 @@ def personalized(
             signals=r.signals,
             confidence=conf[r.movie_id][0],
             confidence_kind=conf[r.movie_id][1],
+            decision_id=decision_id,
+            strategy=served if choice is not None else None,
         )
         for r in recs
         if r.movie_id in movies
@@ -126,6 +162,8 @@ def personalized(
                 "signals": r.signals,
                 "confidence": conf[r.movie_id][0],
                 "confidence_kind": conf[r.movie_id][1],
+                "decision_id": decision_id,
+                "strategy": served if choice is not None else None,
             }
         )
     response = {
@@ -142,6 +180,7 @@ def personalized(
             "excluded": len(state.excluded),
         },
         "cached": False,
+        "intelligence": choice.block if choice is not None else None,
     }
     cache.set(key, response, settings.recommendation_cache_seconds)
     return response

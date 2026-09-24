@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     # POST /intel/runs costs about 1 s of CPU and a few hundred rows; one run at a time (lock) and
     # at most this many per client per minute
     intel_run_rate_limit_per_minute: int = 10
+    # POST /me/intelligence/scenarios ranks the catalogue once per scenario (about 0.1 s): per member
+    me_scenario_rate_limit_per_minute: int = 30
     admin_email: str | None = None
     admin_password: SecretStr | None = None
     models_dir: Path = MODELS_DIR
